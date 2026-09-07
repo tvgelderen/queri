@@ -40,6 +40,7 @@ pub enum PopupMenuItem {
         icon: Option<Icon>,
         label: SharedString,
         disabled: bool,
+        destructive: bool,
         checked: bool,
         is_link: bool,
         action: Option<Box<dyn Action>>,
@@ -73,6 +74,7 @@ impl PopupMenuItem {
             icon: None,
             label: label.into(),
             disabled: false,
+            destructive: false,
             checked: false,
             action: None,
             is_link: false,
@@ -174,6 +176,17 @@ impl PopupMenuItem {
         self
     }
 
+    /// Use destructive-action colors for a standard [`PopupMenuItem::Item`].
+    pub fn destructive(mut self, destructive: bool) -> Self {
+        if let Self::Item {
+            destructive: value, ..
+        } = &mut self
+        {
+            *value = destructive;
+        }
+        self
+    }
+
     /// Set checked state for the menu item.
     ///
     /// NOTE: If `check_side` is [`Side::Left`], the icon will replace with a check icon.
@@ -217,6 +230,7 @@ impl PopupMenuItem {
             icon: None,
             label: label.into(),
             disabled: false,
+            destructive: false,
             checked: false,
             action: None,
             is_link: true,
@@ -1326,6 +1340,7 @@ impl PopupMenu {
                 label,
                 action,
                 disabled,
+                destructive,
                 is_link,
                 ..
             } => {
@@ -1339,6 +1354,7 @@ impl PopupMenu {
                     }))
                 })
                 .disabled(*disabled)
+                .destructive(*destructive)
                 .h(item_height)
                 .gap_x_1()
                 .children(Self::render_icon(

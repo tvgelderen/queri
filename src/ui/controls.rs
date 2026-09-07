@@ -1,5 +1,4 @@
 use gpui_kit::assets::IconName;
-use gpui_kit::base::TestSupportExt;
 use gpui_kit::component::{
     ActiveTheme, Icon, Sizable, Size,
     button::{Button, ButtonVariants},
@@ -97,41 +96,9 @@ pub fn menu_item(label: impl Into<SharedString>, icon: impl Into<Icon>) -> Popup
 }
 
 pub fn destructive_menu_item(label: impl Into<SharedString>, disabled: bool) -> PopupMenuItem {
-    let label = label.into();
-    PopupMenuItem::element(move |_, cx| {
-        // Reclaim Kit's 8px inset and 20px icon slot so hover fills the native row.
-        // The menu still owns activation, dismissal, and disabled state.
-        h_flex()
-            .id("destructive-menu-item")
-            .test_support()
-            .flex_1()
-            .ml_neg_7()
-            .mr_neg_2()
-            .px_2()
-            .min_h(px(26.))
-            .gap_2()
-            .rounded(cx.theme().radius.min(px(8.)))
-            .text_color(if disabled {
-                cx.theme().muted_foreground
-            } else {
-                cx.theme().button_danger_foreground
-            })
-            .when(!disabled, |row| {
-                row.hover(|style| style.bg(cx.theme().button_danger_hover))
-            })
-            .child(Icon::new(IconName::Trash).xsmall())
-            .child(
-                div()
-                    .id("destructive-menu-label")
-                    .test_support()
-                    .role(Role::Label)
-                    .aria_label(label.clone())
-                    .aria_value(label.clone())
-                    .child(label.clone()),
-            )
-    })
-    .icon(Icon::empty().mr_1())
-    .disabled(disabled)
+    menu_item(label, IconName::Trash)
+        .destructive(true)
+        .disabled(disabled)
 }
 
 pub fn disclosure_button(

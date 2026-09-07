@@ -1,11 +1,11 @@
 use super::{destructive_menu_item, menu_item};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::TestSupportExt;
-use gpui_kit::component::{button::Button, menu::DropdownMenu};
+use gpui_kit::component::{ActiveTheme, button::Button, menu::DropdownMenu};
 use gpui_kit::test::{TestAppContextExt, TestEventExt, TestQueryExt, TestWindowExt};
 use gpui_kit::{
-    AppContext, Context, FocusHandle, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    Render, TestAppContext, Window, WindowOptions, div, point, px,
+    App, AppContext, Background, Context, FocusHandle, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, Render, TestAppContext, Window, WindowOptions, div, point, px,
 };
 use std::time::Duration;
 
@@ -41,6 +41,18 @@ impl Render for MenuFixture {
     }
 }
 
+fn assert_destructive_highlight(window: &mut Window, cx: &mut App) {
+    window.render_frame(cx);
+    let row = window.within("popup-menu").find(0_usize).bounds();
+    let background: Background = cx.theme().button_danger_hover.into();
+    assert!(
+        window.painted_quads().iter().any(|quad| {
+            quad.background == background && quad.bounds == row.scale(window.scale_factor())
+        }),
+        "the destructive highlight must cover the native row"
+    );
+}
+
 #[gpui_kit::test]
 async fn destructive_menu_rows_keep_native_activation_and_disabled_behavior(
     cx: &mut TestAppContext,
@@ -61,19 +73,9 @@ async fn destructive_menu_rows_keep_native_activation_and_disabled_behavior(
         window.click("open-menu", cx);
         assert!(window.find_by_label("Delete database").visible());
         assert_eq!(
-            window.find_by_label("Delete database").value(),
-            Some("Delete database"),
-            "native menu items derive their accessible name from descendant label values"
-        );
-        let row = window.within("popup-menu").find(0_usize).bounds();
-        let background = window
-            .within("popup-menu")
-            .within(0_usize)
-            .find("destructive-menu-item")
-            .bounds();
-        assert_eq!(
-            background, row,
-            "the destructive hover must cover the whole row"
+            window.find_by_label("Delete database").bounds(),
+            window.within("popup-menu").find(0_usize).bounds(),
+            "the native menu row owns its accessible name"
         );
         window.within("popup-menu").click(1_usize, cx);
         assert_eq!(fixture.read(cx).deletions, 0);
@@ -88,6 +90,7 @@ async fn destructive_menu_rows_keep_native_activation_and_disabled_behavior(
             window.within("popup-menu").find(0_usize).selected(),
             Some(true)
         );
+        assert_destructive_highlight(window, cx);
         window.press("enter", cx);
         assert_eq!(fixture.read(cx).deletions, 1);
     })
@@ -102,6 +105,7 @@ async fn destructive_menu_rows_keep_native_activation_and_disabled_behavior(
         let bounds = window.within("popup-menu").find(0_usize).bounds();
         let edge = point(bounds.left() + px(1.), bounds.center().y);
         window.pointer_move(edge, None, cx);
+        assert_destructive_highlight(window, cx);
         window.pointer_down(edge, MouseButton::Left, cx);
         window.pointer_up(edge, MouseButton::Left, cx);
         assert_eq!(fixture.read(cx).deletions, 2);

@@ -72,7 +72,7 @@ impl Fixture {
                         let table = table.then(|| TableRef {
                             schema: "main".into(),
                             name: "items".into(),
-                            kind: "table".into(),
+                            kind: RelationKind::Table,
                         });
                         let mut doc = Document::new(
                             self.services.clone(),

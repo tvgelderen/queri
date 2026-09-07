@@ -1,4 +1,4 @@
-use super::{push_row, validate_original};
+use super::{browse_ordering, push_row, validate_original};
 use crate::{
     model::*,
     sql::{qualified, quote_identifier},
@@ -72,15 +72,16 @@ fn select(conn: &Connection, sql: &str, values: &[Value]) -> Result<ResultSet> {
 
 pub fn tables(conn: &Connection, schema: &str) -> Result<Vec<TableRef>> {
     let mut stmt = conn.prepare(&format!("SELECT name,type FROM {}.sqlite_schema WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name", quote_identifier(schema)?))?;
-    Ok(stmt
-        .query_map([], |row| {
-            Ok(TableRef {
-                schema: schema.into(),
-                name: row.get(0)?,
-                kind: row.get(1)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
+    let mut rows = stmt.query([])?;
+    let mut tables = Vec::new();
+    while let Some(row) = rows.next()? {
+        tables.push(TableRef {
+            schema: schema.into(),
+            name: row.get(0)?,
+            kind: row.get::<_, String>(1)?.parse()?,
+        });
+    }
+    Ok(tables)
 }
 
 fn metadata(conn: &Connection, table: &TableRef) -> Result<TableMetadata> {
@@ -197,32 +198,7 @@ pub fn browse(conn: &Connection, table: &TableRef, options: &BrowseOptions) -> R
         }
         None => String::new(),
     };
-    let sort = match &options.sort {
-        Some((column, descending)) => {
-            ensure!(
-                metadata.columns.iter().any(|item| &item.name == column),
-                "Unknown sort column."
-            );
-            format!(
-                " ORDER BY {} {}",
-                quote_identifier(column)?,
-                if *descending { "DESC" } else { "ASC" }
-            )
-        }
-        None => {
-            let keys = metadata
-                .columns
-                .iter()
-                .filter(|col| col.primary_key)
-                .map(|col| quote_identifier(&col.name))
-                .collect::<Result<Vec<_>>>()?;
-            if keys.is_empty() {
-                String::new()
-            } else {
-                format!(" ORDER BY {}", keys.join(","))
-            }
-        }
-    };
+    let sort = browse_ordering(&metadata, &options.sort)?;
     let total: i64 = conn.query_row(
         &format!("SELECT count(*) FROM {qualified}{filter}"),
         params_from_iter(&values),
@@ -302,7 +278,7 @@ pub fn change_rows(conn: &mut Connection, table: &TableRef, change: RowChange) -
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let metadata = metadata(&tx, table)?;
     ensure!(
-        table.kind == "table",
+        table.is_table(),
         "Views cannot be edited in the row inspector."
     );
     let qualified = qualified(&table.schema, &table.name)?;

@@ -3,7 +3,7 @@ use super::{
     controls::{destructive_menu_item, empty_state, icon_button, menu_item},
     task,
 };
-use crate::model::HistoryEntry;
+use crate::model::{HISTORY_PAGE_SIZE, HistoryEntry};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, Sizable, WindowExt,
@@ -477,39 +477,47 @@ impl Render for History {
                         .child(self.error.clone()),
                 )
             })
-            .when(self.offset > 0 || self.entries.len() >= 100, |view| {
-                view.child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            icon_button(
-                                "history-previous",
-                                IconName::ChevronLeft,
-                                "Previous history page",
+            .when(
+                self.offset > 0 || self.entries.len() >= usize::from(HISTORY_PAGE_SIZE),
+                |view| {
+                    view.child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                icon_button(
+                                    "history-previous",
+                                    IconName::ChevronLeft,
+                                    "Previous history page",
+                                )
+                                .disabled(self.busy || self.offset == 0)
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.offset = this
+                                            .offset
+                                            .saturating_sub(u64::from(HISTORY_PAGE_SIZE));
+                                        this.load(window, cx);
+                                    },
+                                )),
                             )
-                            .disabled(self.busy || self.offset == 0)
-                            .on_click(cx.listener(
-                                |this, _, window, cx| {
-                                    this.offset = this.offset.saturating_sub(100);
-                                    this.load(window, cx);
-                                },
-                            )),
-                        )
-                        .child(
-                            icon_button(
-                                "history-next",
-                                IconName::ChevronRight,
-                                "Next history page",
-                            )
-                            .disabled(self.busy || self.entries.len() < 100)
-                            .on_click(cx.listener(
-                                |this, _, window, cx| {
-                                    this.offset += 100;
-                                    this.load(window, cx);
-                                },
-                            )),
-                        ),
-                )
-            })
+                            .child(
+                                icon_button(
+                                    "history-next",
+                                    IconName::ChevronRight,
+                                    "Next history page",
+                                )
+                                .disabled(
+                                    self.busy
+                                        || self.entries.len() < usize::from(HISTORY_PAGE_SIZE),
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.offset += u64::from(HISTORY_PAGE_SIZE);
+                                        this.load(window, cx);
+                                    },
+                                )),
+                            ),
+                    )
+                },
+            )
     }
 }

@@ -103,9 +103,14 @@ impl Store {
         offset: u64,
     ) -> Result<Vec<HistoryEntry>> {
         let conn = self.connection()?;
-        let mut stmt = conn.prepare("SELECT id,database_name,sql,executed_at,elapsed_ms,affected,error FROM history WHERE connection_id=?1 AND instr(lower(sql),lower(?2))>0 ORDER BY id DESC LIMIT 100 OFFSET ?3")?;
+        let mut stmt = conn.prepare("SELECT id,database_name,sql,executed_at,elapsed_ms,affected,error FROM history WHERE connection_id=?1 AND instr(lower(sql),lower(?2))>0 ORDER BY id DESC LIMIT ?4 OFFSET ?3")?;
         let rows = stmt.query_map(
-            params![connection.to_string(), search, i64::try_from(offset)?],
+            params![
+                connection.to_string(),
+                search,
+                i64::try_from(offset)?,
+                HISTORY_PAGE_SIZE
+            ],
             |row| {
                 Ok(HistoryEntry {
                     id: row.get(0)?,

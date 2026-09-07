@@ -13,6 +13,7 @@ pub(crate) struct MenuItemElement {
     aria_label: Option<SharedString>,
     style: StyleRefinement,
     disabled: bool,
+    destructive: bool,
     selected: bool,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_hover: Option<Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>>,
@@ -28,6 +29,7 @@ impl MenuItemElement {
             aria_label: None,
             style: StyleRefinement::default(),
             disabled: false,
+            destructive: false,
             selected: false,
             on_click: None,
             on_hover: None,
@@ -50,6 +52,11 @@ impl MenuItemElement {
     /// Set the disabled state of the MenuItem.
     pub(crate) fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    pub(crate) fn destructive(mut self, destructive: bool) -> Self {
+        self.destructive = destructive;
         self
     }
 
@@ -91,6 +98,19 @@ impl ParentElement for MenuItemElement {
 
 impl RenderOnce for MenuItemElement {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let (foreground, active_background, active_foreground) = if self.destructive {
+            (
+                cx.theme().button_danger_foreground,
+                cx.theme().button_danger_hover.into(),
+                cx.theme().button_danger_foreground,
+            )
+        } else {
+            (
+                cx.theme().foreground,
+                cx.theme().tokens.accent,
+                cx.theme().accent_foreground,
+            )
+        };
         h_flex()
             .id(self.id)
             .test_support()
@@ -101,7 +121,7 @@ impl RenderOnce for MenuItemElement {
             .py_1()
             .px_2()
             .text_base()
-            .text_color(cx.theme().foreground)
+            .text_color(foreground)
             .relative()
             .items_center()
             .justify_between()
@@ -113,20 +133,16 @@ impl RenderOnce for MenuItemElement {
                 // Not `group_hover` on the item's own group: GPUI styles an
                 // element before registering its group, and that fallback keeps
                 // the pointer's item lit after a key moves the highlight away.
-                this.hover(|this| {
-                    this.bg(cx.theme().tokens.accent)
-                        .text_color(cx.theme().accent_foreground)
-                })
-                .when(self.selected, |this| {
-                    this.bg(cx.theme().tokens.accent)
-                        .text_color(cx.theme().accent_foreground)
-                })
-                .when_some(self.on_click, |this, on_click| {
-                    this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                        cx.stop_propagation();
+                this.hover(|this| this.bg(active_background).text_color(active_foreground))
+                    .when(self.selected, |this| {
+                        this.bg(active_background).text_color(active_foreground)
                     })
-                    .on_click(on_click)
-                })
+                    .when_some(self.on_click, |this, on_click| {
+                        this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_click(on_click)
+                    })
             })
             .when(self.disabled, |this| {
                 this.text_color(cx.theme().muted_foreground)

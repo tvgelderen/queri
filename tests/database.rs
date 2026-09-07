@@ -28,7 +28,7 @@ fn table() -> TableRef {
     TableRef {
         schema: "main".into(),
         name: "items".into(),
-        kind: "table".into(),
+        kind: RelationKind::Table,
     }
 }
 fn page() -> BrowseOptions {
@@ -103,7 +103,21 @@ fn sqlite_metadata_filter_sort_pagination_and_exact_values() -> Result<()> {
                 .iter()
                 .any(|row| row[0].text() == "items_name")
         );
-        assert_eq!(session.tables("main".into()).await?.len(), 1);
+        session
+            .query("CREATE VIEW item_view AS SELECT * FROM items".into())
+            .await?;
+        let relations = session.tables("main".into()).await?;
+        assert_eq!(relations.len(), 2);
+        assert_eq!(relations[0].kind, RelationKind::View);
+        assert!(!relations[0].is_table());
+        assert_eq!(relations[1], table());
+        assert!(
+            !session
+                .browse(relations[0].clone(), page())
+                .await?
+                .metadata
+                .editable(&relations[0])
+        );
         Ok(())
     })
 }
@@ -113,7 +127,7 @@ async fn filter_workflows(session: &Session, schema: &str) -> Result<()> {
     let table = TableRef {
         schema: schema.into(),
         name: "filter\"items".into(),
-        kind: "table".into(),
+        kind: RelationKind::Table,
     };
     let qualified = queri::sql::qualified(schema, &table.name)?;
     session.query(format!(
@@ -485,6 +499,22 @@ fn sqlite_read_only_and_missing_file() -> Result<()> {
 }
 
 #[test]
+fn saved_relation_kinds_keep_the_existing_json_format() -> Result<()> {
+    for (name, kind) in [
+        ("table", RelationKind::Table),
+        ("view", RelationKind::View),
+        ("materialized view", RelationKind::MaterializedView),
+    ] {
+        let saved = serde_json::json!({"schema": "public", "name": "items", "kind": name});
+        let relation: TableRef = serde_json::from_value(saved.clone())?;
+        assert_eq!(relation.kind, kind);
+        assert_eq!(relation.is_table(), kind == RelationKind::Table);
+        assert_eq!(serde_json::to_value(relation)?, saved);
+    }
+    Ok(())
+}
+
+#[test]
 fn persistence_restart_search_and_connection_deletion() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("app.db");
@@ -577,7 +607,14 @@ fn postgres_real_database_workflows() -> Result<()> {
         let session = Session::connect(profile,password).await?;
         let schema = format!("queri_{}", Uuid::new_v4().simple());
         session.query(format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.items(tenant integer,id bigint,name text DEFAULT 'New',amount numeric(38,10),data jsonb,payload bytea,PRIMARY KEY(tenant,id)); INSERT INTO {schema}.items VALUES(1,1,'Alpha',12345678901234567890.1234567890,'{{\"a\":1}}','\\x00ff'),(2,1,'Beta',NULL,NULL,NULL);")).await?;
-        let table = TableRef { schema: schema.clone(), name: "items".into(), kind: "table".into() };
+        let table = TableRef { schema: schema.clone(), name: "items".into(), kind: RelationKind::Table };
+        session.query(format!("CREATE VIEW {schema}.item_view AS SELECT * FROM {schema}.items; CREATE MATERIALIZED VIEW {schema}.materialized_items AS SELECT * FROM {schema}.items")).await?;
+        let relations = session.tables(schema.clone()).await?;
+        assert_eq!(relations.iter().map(|table| table.kind).collect::<Vec<_>>(), vec![RelationKind::View, RelationKind::Table, RelationKind::MaterializedView]);
+        for relation in relations.iter().filter(|relation| !relation.is_table()) {
+            let page = session.browse(relation.clone(), page()).await?;
+            assert!(!page.metadata.editable(relation));
+        }
         let data = session.browse(table.clone(), page()).await?;
         assert_eq!(data.total, 2);
         assert_eq!(data.data.rows[0][3].text(), "12345678901234567890.1234567890");

@@ -441,7 +441,7 @@ impl Workspace {
                                         format!(
                                             "{}{}",
                                             table.name,
-                                            if table.kind == "table" { "" } else { " (view)" }
+                                            if table.is_table() { "" } else { " (view)" }
                                         ),
                                     )
                                 })
@@ -943,26 +943,61 @@ impl Workspace {
         }
         let view = cx.entity();
         window.open_alert_dialog(cx, move |dialog, _, _| {
-            let view = view.clone(); let profile = profile.clone();
-            dialog.title(format!("Remove {}?", profile.name)).child("Its saved connection, SQL drafts, and query history will be removed. The database itself is retained.")
-                .button_props(DialogButtonProps::default().ok_text("Remove connection").show_cancel(true)).on_ok(move |_, window, cx| {
+            let view = view.clone();
+            let profile = profile.clone();
+            dialog
+                .title(format!("Remove {}?", profile.name))
+                .child("Its saved connection, SQL drafts, and query history will be removed. The database itself is retained.")
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Remove connection")
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
                     view.update(cx, |this, cx| {
-                        let store = this.services.store.clone(); let id = profile.id; let postgres = profile.remember_password;
-                        task(&this.services, window, cx, async move { tokio::task::spawn_blocking(move || { if postgres { storage::delete_password(id)?; } store.delete_profile(id) }).await? }, move |this, result, window, cx| {
-                            match result {
-                                Ok(()) => {
-                                    this.profiles.retain(|profile| profile.id != id); this.passwords.remove(&id);
-                                    this.documents.retain(|doc| doc.read(cx).profile.id != id); this.active = 0;
-                                    if this.selected == Some(id) { this.selected = None; this.generation = Uuid::new_v4(); this.connection_state = ConnectionState::Disconnected; this.databases.clear(); this.branches.clear(); this.history = None; this.rebuild_tree(cx); }
-                                    this.status = "Choose a connection to begin".into();
-                                    this.sync_connections(window, cx);
-                                    this.schedule_save(window, cx);
+                        let store = this.services.store.clone();
+                        let id = profile.id;
+                        let remember_password = profile.remember_password;
+                        task(
+                            &this.services,
+                            window,
+                            cx,
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    if remember_password {
+                                        storage::delete_password(id)?;
+                                    }
+                                    store.delete_profile(id)
+                                })
+                                .await?
+                            },
+                            move |this, result, window, cx| {
+                                match result {
+                                    Ok(()) => {
+                                        this.profiles.retain(|profile| profile.id != id);
+                                        this.passwords.remove(&id);
+                                        this.documents.retain(|doc| doc.read(cx).profile.id != id);
+                                        this.active = 0;
+                                        if this.selected == Some(id) {
+                                            this.selected = None;
+                                            this.generation = Uuid::new_v4();
+                                            this.connection_state = ConnectionState::Disconnected;
+                                            this.databases.clear();
+                                            this.branches.clear();
+                                            this.history = None;
+                                            this.rebuild_tree(cx);
+                                        }
+                                        this.status = "Choose a connection to begin".into();
+                                        this.sync_connections(window, cx);
+                                        this.schedule_save(window, cx);
+                                    }
+                                    Err(error) => this.error = format!("{error:#}"),
                                 }
-                                Err(error) => this.error = format!("{error:#}"),
-                            }
-                            cx.notify();
-                        });
-                    }); true
+                                cx.notify();
+                            },
+                        );
+                    });
+                    true
                 })
         });
     }
@@ -1617,7 +1652,7 @@ impl Render for Workspace {
             let object_icon = match view.read(cx).nodes.get(id.as_ref()) {
                 Some(Node::Database(_)) => Some(IconName::Database),
                 Some(Node::Schema { .. }) => Some(IconName::Layers),
-                Some(Node::Table { table, .. }) => Some(if table.kind == "table" {
+                Some(Node::Table { table, .. }) => Some(if table.is_table() {
                     IconName::Table2
                 } else {
                     IconName::Eye

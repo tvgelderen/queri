@@ -1,4 +1,4 @@
-# Dialog backdrop blur patches
+# Local GPUI patches
 
 These are the published crates.io sources for `gpui-pre` **0.3.10**,
 `gpui-pre-wgpu` **0.3.10**, and `gpui-component` **0.8.1**. Queri patches them
@@ -20,6 +20,10 @@ Local changes:
   `Theme::dialog_backdrop_blur`, defaulting to zero. Ordinary dialogs and alerts
   share it, including their closing backdrop. Only the existing overlay owner
   paints the effect, so stacking dialogs does not compound the blur.
+- `gpui-component/src/menu/{popup_menu,menu_item}.rs`: an opt-in destructive
+  style for standard menu items. The menu owns foreground, hover, selected, and
+  disabled styling; Queri's connection, database, and history deletion actions
+  use native rows without duplicating menu geometry.
 
 Queri enables an 8-logical-pixel Gaussian sigma in `src/ui/theme.rs`. These
 patches implement blur on Linux's WGPU renderer (Wayland, X11, and headless).
@@ -32,5 +36,7 @@ real GPU pixel and dialog lifecycle checks. A Vulkan/OpenGL adapter is required;
 Mesa lavapipe works for headless testing. `bash scripts/check.sh` includes it.
 
 Upstream tracking: [GPUI Kit #3598](https://github.com/longbridge/gpui-kit/issues/3598).
-When upstream provides equivalent support, remove all three local patches and
-the corresponding vendored sources together after verifying the rendering tests.
+When upstream provides equivalent backdrop support, remove the three backdrop
+patches together after verifying the rendering tests. Remove the vendored sources
+once upstream also provides destructive menu styling and the menu interaction
+tests pass.

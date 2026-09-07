@@ -701,7 +701,7 @@ impl Document {
         let Some(session) = self.session.clone() else {
             return;
         };
-        if session.read_only() || table.kind != "table" {
+        if session.read_only() || !table.is_table() {
             return;
         }
         let original = if insert {
@@ -881,7 +881,7 @@ impl Document {
                 .session
                 .as_ref()
                 .is_some_and(|session| !session.read_only())
-            && matches!(&self.kind, DocumentKind::Table { table, page: Some(_), .. } if table.kind == "table")
+            && matches!(&self.kind, DocumentKind::Table { table, page: Some(_), .. } if table.is_table())
     }
 
     fn table_body(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -944,7 +944,7 @@ impl Document {
                     .session
                     .as_ref()
                     .is_some_and(|session| session.read_only());
-                let (title, description) = if table.kind != "table" {
+                let (title, description) = if !table.is_table() {
                     (
                         "This view has no rows",
                         "Views show data from their underlying tables. Refresh to check for changes.",
@@ -972,7 +972,7 @@ impl Document {
                                 })),
                         )
                     })
-                    .when(read_only || table.kind != "table", |view| {
+                    .when(read_only || !table.is_table(), |view| {
                         view.child(
                             Button::new("empty-refresh-table")
                                 .icon(IconName::RefreshCw)
@@ -1002,13 +1002,12 @@ impl Document {
                     .session
                     .as_ref()
                     .is_some_and(|session| session.read_only());
-                let (title, description) = if *section == Section::Indexes && table.kind != "table"
-                {
+                let (title, description) = if *section == Section::Indexes && !table.is_table() {
                     (
                         "No indexes",
                         "No indexes are reported for this view. Inspect its underlying tables for index definitions.",
                     )
-                } else if *section == Section::Constraints && table.kind != "table" {
+                } else if *section == Section::Constraints && !table.is_table() {
                     (
                         "No constraints",
                         "No constraints are reported for this view. Inspect its underlying tables for data rules.",
@@ -1684,7 +1683,7 @@ impl Document {
                                     .is_some_and(|session| session.read_only())
                                 {
                                     "Read-only connection"
-                                } else if table.kind != "table" {
+                                } else if !table.is_table() {
                                     "Views are read-only"
                                 } else {
                                     "Editing and deleting rows requires a primary key"

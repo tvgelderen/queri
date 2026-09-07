@@ -239,7 +239,7 @@ impl ListDelegate for Tables {
                         .gap_3()
                         .py_1()
                         .child(
-                            Icon::new(if table.kind == "table" {
+                            Icon::new(if table.is_table() {
                                 IconName::Table2
                             } else {
                                 IconName::Eye

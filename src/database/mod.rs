@@ -2,6 +2,7 @@ mod postgres;
 mod sqlite;
 
 use crate::model::*;
+use crate::sql::quote_identifier;
 use anyhow::{Context, Result, bail};
 use std::{
     sync::{Arc, Mutex},
@@ -238,6 +239,35 @@ pub(super) fn push_row(set: &mut ResultSet, row: Vec<Cell>, bytes: &mut usize, c
         set.rows.push(row);
     } else {
         set.truncated = true;
+    }
+}
+
+fn browse_ordering(metadata: &TableMetadata, sort: &Option<(String, bool)>) -> Result<String> {
+    match sort {
+        Some((column, descending)) => {
+            anyhow::ensure!(
+                metadata.columns.iter().any(|col| &col.name == column),
+                "Unknown sort column."
+            );
+            Ok(format!(
+                " ORDER BY {} {}",
+                quote_identifier(column)?,
+                if *descending { "DESC" } else { "ASC" }
+            ))
+        }
+        None => {
+            let keys = metadata
+                .columns
+                .iter()
+                .filter(|col| col.primary_key)
+                .map(|col| quote_identifier(&col.name))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(if keys.is_empty() {
+                String::new()
+            } else {
+                format!(" ORDER BY {}", keys.join(","))
+            })
+        }
     }
 }
 

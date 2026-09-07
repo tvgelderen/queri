@@ -236,11 +236,40 @@ pub struct QueryOutput {
 pub const MAX_RESULT_ROWS: usize = 10_000;
 pub const MAX_RESULT_BYTES: usize = 32 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RelationKind {
+    #[serde(rename = "table")]
+    Table,
+    #[serde(rename = "view")]
+    View,
+    #[serde(rename = "materialized view")]
+    MaterializedView,
+}
+
+impl std::str::FromStr for RelationKind {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "table" => Ok(Self::Table),
+            "view" => Ok(Self::View),
+            "materialized view" => Ok(Self::MaterializedView),
+            _ => bail!("Unknown relation kind: {value}"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TableRef {
     pub schema: String,
     pub name: String,
-    pub kind: String,
+    pub kind: RelationKind,
+}
+
+impl TableRef {
+    pub fn is_table(&self) -> bool {
+        self.kind == RelationKind::Table
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -262,7 +291,7 @@ pub struct TableMetadata {
 
 impl TableMetadata {
     pub fn editable(&self, table: &TableRef) -> bool {
-        table.kind == "table" && self.columns.iter().any(|column| column.primary_key)
+        table.is_table() && self.columns.iter().any(|column| column.primary_key)
     }
 }
 
@@ -320,6 +349,8 @@ pub enum DatabaseAction {
         force: bool,
     },
 }
+
+pub const HISTORY_PAGE_SIZE: u16 = 100;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryEntry {

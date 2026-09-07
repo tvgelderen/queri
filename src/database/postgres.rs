@@ -1,4 +1,4 @@
-use super::{AsyncMutex, push_row, validate_original};
+use super::{AsyncMutex, browse_ordering, push_row, validate_original};
 use crate::{
     model::*,
     sql::{qualified, quote_identifier},
@@ -131,7 +131,16 @@ pub async fn names(
 }
 
 pub async fn tables(client: &Client, schema: &str) -> Result<Vec<TableRef>> {
-    Ok(client.query("SELECT c.relname, CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' ELSE 'table' END FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind IN ('r','p','v','m','f') ORDER BY c.relname", &[&schema]).await?.iter().map(|row| TableRef { schema: schema.into(), name: row.get(0), kind: row.get(1) }).collect())
+    let rows = client.query("SELECT c.relname, CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' ELSE 'table' END FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind IN ('r','p','v','m','f') ORDER BY c.relname", &[&schema]).await?;
+    rows.iter()
+        .map(|row| {
+            Ok(TableRef {
+                schema: schema.into(),
+                name: row.get(0),
+                kind: row.get::<_, &str>(1).parse()?,
+            })
+        })
+        .collect()
 }
 
 async fn metadata(client: &impl GenericClient, table: &TableRef) -> Result<TableMetadata> {
@@ -239,32 +248,7 @@ pub async fn browse(
         }
         None => String::new(),
     };
-    let sort = match &options.sort {
-        Some((column, descending)) => {
-            ensure!(
-                metadata.columns.iter().any(|col| &col.name == column),
-                "Unknown sort column."
-            );
-            format!(
-                " ORDER BY {} {}",
-                quote_identifier(column)?,
-                if *descending { "DESC" } else { "ASC" }
-            )
-        }
-        None => {
-            let keys = metadata
-                .columns
-                .iter()
-                .filter(|col| col.primary_key)
-                .map(|col| quote_identifier(&col.name))
-                .collect::<Result<Vec<_>>>()?;
-            if keys.is_empty() {
-                String::new()
-            } else {
-                format!(" ORDER BY {}", keys.join(","))
-            }
-        }
-    };
+    let sort = browse_ordering(&metadata, &options.sort)?;
     let count: i64 = client
         .query_one(
             &format!("SELECT count(*) FROM {table_name}{filter}"),
@@ -345,7 +329,7 @@ pub async fn change_rows(client: &mut Client, table: &TableRef, change: RowChang
     let tx = client.transaction().await?;
     let metadata = metadata(&tx, table).await?;
     ensure!(
-        table.kind == "table",
+        table.is_table(),
         "Views cannot be edited in the row inspector."
     );
     let table_name = qualified(&table.schema, &table.name)?;
