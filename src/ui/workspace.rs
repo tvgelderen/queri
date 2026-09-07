@@ -1,5 +1,5 @@
 use super::{
-    Services,
+    ConnectionState, Services,
     admin::{AdminAction, AdminEvent, DatabaseAdmin},
     connection_form::{ConnectionForm, SavedConnection},
     connection_picker::{ConnectionPicker, ConnectionPickerEvent},
@@ -60,14 +60,6 @@ enum Node {
     Database(String),
     Schema { database: String, schema: String },
     Table { database: String, table: TableRef },
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum ConnectionState {
-    Disconnected,
-    Connecting,
-    Ready,
-    Failed,
 }
 
 struct DatabaseBranch {
@@ -313,6 +305,7 @@ impl Workspace {
     fn sync_connections(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.connection_picker.update(cx, |picker, cx| {
             picker.set_profiles(&self.profiles, self.selected, window, cx);
+            picker.set_state(self.connection_state, cx);
         });
     }
 
@@ -332,7 +325,7 @@ impl Workspace {
         let generation = self.generation;
         self.connection_state = ConnectionState::Connecting;
         self.connection_picker
-            .update(cx, |picker, cx| picker.set_connecting(true, cx));
+            .update(cx, |picker, cx| picker.set_state(self.connection_state, cx));
         self.databases.clear();
         self.branches.clear();
         self.nodes.clear();
@@ -365,8 +358,6 @@ impl Workspace {
                 if this.generation != generation {
                     return;
                 }
-                this.connection_picker
-                    .update(cx, |picker, cx| picker.set_connecting(false, cx));
                 match result {
                     Ok((password, databases)) => {
                         this.connection_state = ConnectionState::Ready;
@@ -395,6 +386,8 @@ impl Workspace {
                         this.status = "Connection failed".into();
                     }
                 }
+                this.connection_picker
+                    .update(cx, |picker, cx| picker.set_state(this.connection_state, cx));
                 this.schedule_save(window, cx);
                 cx.notify();
             },
@@ -1808,75 +1801,30 @@ impl Render for Workspace {
                         )
                     }),
             )
-            .when_some(selected_profile.as_ref(), |sidebar, _| {
-                let status = match self.connection_state {
-                    ConnectionState::Ready => "Connected",
-                    ConnectionState::Connecting => "Connecting…",
-                    ConnectionState::Failed => "Connection failed",
-                    ConnectionState::Disconnected => "Disconnected",
-                };
-                sidebar.child(
-                    h_flex()
-                        .px_4()
-                        .pt_1()
-                        .min_h_8()
-                        .gap_2()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(
-                            h_flex()
-                                .id("sidebar-connection-status")
-                                .role(Role::Status)
-                                .aria_label(status)
-                                .flex_1()
-                                .gap_1p5()
-                                .when(self.connection_state == ConnectionState::Failed, |status| {
-                                    status.text_color(cx.theme().danger)
-                                })
-                                .child(
-                                    Icon::new(match self.connection_state {
-                                        ConnectionState::Ready => IconName::Check,
-                                        ConnectionState::Connecting => IconName::RefreshCw,
-                                        _ => IconName::Unplug,
-                                    })
-                                    .xsmall(),
-                                )
-                                .child(status),
-                        )
-                        .when(self.connection_state == ConnectionState::Ready, |row| {
-                            row.child(format!(
-                                "{} {}",
-                                self.databases.len(),
-                                if self.databases.len() == 1 { "database" } else { "databases" }
-                            ))
-                        })
-                        .when(self.connection_state == ConnectionState::Failed, |row| {
-                            row.child(
-                                Button::new("sidebar-retry-connection")
-                                    .ghost()
-                                    .small()
-                                    .label("Retry")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        if let Some(id) = this.selected {
-                                            this.activate(id, window, cx);
-                                        }
-                                    })),
-                            )
-                        }),
-                )
-            })
             .child(
                 h_flex()
                     .px_3()
                     .pt_4()
                     .pb_2()
+                    .gap_2()
                     .justify_between()
                     .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Databases"),
+                        h_flex()
+                            .gap_1p5()
+                            .text_sm()
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Databases"),
+                            )
+                            .when(self.connection_state == ConnectionState::Ready, |heading| {
+                                heading.child(
+                                    div()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
+                                        .child(format!("({})", self.databases.len())),
+                                )
+                            }),
                     )
                     .when(
                         selected_profile.as_ref().is_some_and(|profile| {
@@ -1947,7 +1895,23 @@ impl Render for Workspace {
                                     ConnectionState::Disconnected => {
                                         "Connect to browse schemas and tables here."
                                     }
-                                })),
+                                }))
+                                .when(self.connection_state == ConnectionState::Failed, |view| {
+                                    view.child(
+                                        h_flex().child(
+                                            Button::new("sidebar-retry-connection")
+                                                .ghost()
+                                                .small()
+                                                .icon(IconName::RefreshCw)
+                                                .label("Retry")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    if let Some(id) = this.selected {
+                                                        this.activate(id, window, cx);
+                                                    }
+                                                })),
+                                        ),
+                                    )
+                                }),
                         )
                     }),
             )

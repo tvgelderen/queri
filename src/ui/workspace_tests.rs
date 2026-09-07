@@ -813,12 +813,23 @@ async fn sidebar_retry_recovers_after_dismissing_the_connection_error(cx: &mut T
         workspace.read(cx).connection_state == ConnectionState::Failed
     })
     .await;
-    cx.update_window(window, |_, window, cx| window.click("dismiss-error", cx))
-        .expect("dismiss the detailed connection error");
-    rusqlite::Connection::open(path).expect("restore the missing database file");
+    let picker_label = format!("Switch connection: Archive · SQLite · {}", path.display());
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(
+            window.find("connection-picker").label(),
+            Some(format!("{picker_label} · Connection failed").as_str())
+        );
+        window.click("dismiss-error", cx);
+    })
+    .expect("selector announces the failure after the connection attempt");
+    rusqlite::Connection::open(&path).expect("restore the missing database file");
     cx.update_window(window, |_, window, cx| {
         assert!(workspace.read(cx).error.is_empty());
         window.click("sidebar-retry-connection", cx);
+        assert_eq!(
+            window.find("connection-picker").label(),
+            Some(format!("{picker_label} · Connecting…").as_str())
+        );
     })
     .expect("retry remains available in the sidebar");
     cx.wait_for(window, Duration::from_secs(5), |_, cx| {
@@ -826,6 +837,14 @@ async fn sidebar_retry_recovers_after_dismissing_the_connection_error(cx: &mut T
             && workspace.read(cx).databases == ["restored.sqlite"]
     })
     .await;
+    cx.update_window(window, |_, window, _| {
+        assert_eq!(
+            window.find("connection-picker").label(),
+            Some(format!("{picker_label} · Connected").as_str())
+        );
+        assert!(window.try_find("sidebar-retry-connection").is_none());
+    })
+    .expect("selector announces recovery and the error-state retry is removed");
 }
 
 #[gpui_kit::test]

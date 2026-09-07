@@ -1,4 +1,7 @@
-use super::controls::{destructive_menu_item, icon_button, menu_item};
+use super::{
+    ConnectionState,
+    controls::{destructive_menu_item, icon_button, menu_item},
+};
 use crate::model::{ConnectionConfig, ConnectionProfile};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::Button as Trigger;
@@ -68,7 +71,7 @@ impl ConnectionItem {
         format!("{} · {}", self.provider, self.endpoint)
     }
 
-    fn identity(&self, cx: &App) -> Div {
+    fn identity(&self, state: Option<ConnectionState>, cx: &App) -> Div {
         h_flex()
             .w_full()
             .min_w_0()
@@ -87,11 +90,40 @@ impl ConnectionItem {
                     .min_w_0()
                     .gap_1()
                     .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_ellipsis()
-                            .child(self.name.clone()),
+                        h_flex()
+                            .min_w_0()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_ellipsis()
+                                    .child(self.name.clone()),
+                            )
+                            .when_some(state, |row, state| {
+                                row.child(
+                                    div()
+                                        .id("connection-status")
+                                        .role(Role::Status)
+                                        .aria_label(state.label())
+                                        .size_4()
+                                        .flex_shrink_0()
+                                        .child(
+                                            Icon::new(if state == ConnectionState::Ready {
+                                                IconName::Plug
+                                            } else {
+                                                IconName::Unplug
+                                            })
+                                            .small()
+                                            .text_color(match state {
+                                                ConnectionState::Ready => cx.theme().foreground,
+                                                ConnectionState::Failed => cx.theme().danger,
+                                                _ => cx.theme().muted_foreground,
+                                            }),
+                                        ),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -180,11 +212,12 @@ impl ConnectionPicker {
         self.focus.focus(window, cx);
     }
 
-    pub fn set_connecting(&mut self, connecting: bool, cx: &mut Context<Self>) {
+    pub(super) fn set_state(&mut self, state: ConnectionState, cx: &mut Context<Self>) {
         self.list.update(cx, |list, cx| {
-            list.delegate_mut().connecting = connecting;
+            list.delegate_mut().state = state;
             cx.notify();
         });
+        cx.notify();
     }
 
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -204,7 +237,14 @@ impl Render for ConnectionPicker {
             .find(|item| Some(item.id) == connections.active);
         let label = active.map_or_else(
             || "Select connection".to_owned(),
-            |item| format!("Switch connection: {} · {}", item.name, item.description()),
+            |item| {
+                format!(
+                    "Switch connection: {} · {} · {}",
+                    item.name,
+                    item.description(),
+                    connections.state.label()
+                )
+            },
         );
         let identity = active.map_or_else(
             || {
@@ -214,7 +254,7 @@ impl Render for ConnectionPicker {
                     .child(Icon::new(IconName::Database).small())
                     .child(div().text_sm().child("Select connection"))
             },
-            |item| item.identity(cx),
+            |item| item.identity(Some(connections.state), cx),
         );
         let list = self.list.clone();
         let view = cx.entity();
@@ -301,7 +341,7 @@ struct Connections {
     matches: Vec<ConnectionItem>,
     cursor: Option<IndexPath>,
     active: Option<Uuid>,
-    connecting: bool,
+    state: ConnectionState,
 }
 
 impl Connections {
@@ -315,7 +355,7 @@ impl Connections {
             items,
             cursor: None,
             active: None,
-            connecting: false,
+            state: ConnectionState::Disconnected,
         }
     }
 
@@ -414,7 +454,7 @@ impl ListDelegate for Connections {
                         .min_w_0()
                         .py_1()
                         .gap_2()
-                        .child(div().flex_1().min_w_0().child(item.identity(cx)))
+                        .child(div().flex_1().min_w_0().child(item.identity(None, cx)))
                         .child(
                             div()
                                 .size_4()
@@ -449,7 +489,10 @@ impl ListDelegate for Connections {
                                     )
                                     .item(
                                         menu_item("Refresh connection", IconName::RefreshCw)
-                                            .disabled(list.read(cx).delegate().connecting)
+                                            .disabled(
+                                                list.read(cx).delegate().state
+                                                    == ConnectionState::Connecting,
+                                            )
                                             .on_click(move |_, _, cx| {
                                                 refresh.update(cx, |_, cx| {
                                                     cx.emit(

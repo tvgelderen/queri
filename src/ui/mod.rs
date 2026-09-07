@@ -25,6 +25,25 @@ use gpui_kit::{App, Context, Entity, Window};
 use std::{future::Future, sync::Arc};
 pub use workspace::Workspace;
 
+#[derive(Clone, Copy, PartialEq)]
+enum ConnectionState {
+    Disconnected,
+    Connecting,
+    Ready,
+    Failed,
+}
+
+impl ConnectionState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Disconnected => "Disconnected",
+            Self::Connecting => "Connecting…",
+            Self::Ready => "Connected",
+            Self::Failed => "Connection failed",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Services {
     pub runtime: Arc<tokio::runtime::Runtime>,
