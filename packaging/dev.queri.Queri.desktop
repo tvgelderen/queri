@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Queri
+Comment=PostgreSQL and SQLite workspace
+Exec=queri
+Icon=dev.queri.Queri
+Terminal=false
+Categories=Development;Database;
+StartupWMClass=dev.queri.Queri
+Keywords=SQL;PostgreSQL;SQLite;Database;

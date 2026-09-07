@@ -1,0 +1,14 @@
+/target/
+/dist/
+
+# Local databases and credentials, including files from the former web app.
+/data/
+/logs/
+/.env
+
+# Untracked build artifacts from the former web app.
+/node_modules/
+/.tanstack/
+/.output/
+/.nitro/
+/drizzle/dev/
