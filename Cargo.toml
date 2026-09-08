@@ -35,6 +35,7 @@ harness = false
 required-features = ["test-support"]
 
 [patch.crates-io]
+tokio-postgres = { path = "vendor/tokio-postgres-0.7.18" }
 gpui-pre = { path = "vendor/gpui-pre-0.3.10" }
 gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu-0.3.10" }
 gpui-component = { path = "vendor/gpui-component-0.8.1" }

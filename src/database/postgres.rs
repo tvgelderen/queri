@@ -83,6 +83,10 @@ impl Postgres {
 /// arrays and timestamps. Table metadata supplies types to the row inspector.
 pub async fn query(client: &Client, sql: &str) -> Result<Vec<ResultSet>> {
     let stream = client.simple_query_raw(sql).await?;
+    collect_results(stream).await
+}
+
+pub async fn collect_results(stream: tokio_postgres::SimpleQueryStream) -> Result<Vec<ResultSet>> {
     futures::pin_mut!(stream);
     let mut sets = vec![];
     let mut current = ResultSet::default();

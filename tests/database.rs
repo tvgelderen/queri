@@ -767,3 +767,254 @@ fn postgres_formatted_sql_executes_equivalently() -> Result<()> {
         Ok(())
     })
 }
+
+#[test]
+fn sqlite_transaction_status_uses_autocommit() -> Result<()> {
+    runtime()?.block_on(async {
+        let session = fixture().await?;
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Idle);
+        session.query("BEGIN".into()).await?;
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Open);
+        assert!(session.query("SELECT * FROM missing".into()).await.is_err());
+        // SQLite statement errors do not imply PostgreSQL's failed transaction state.
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Open);
+        session.query("ROLLBACK".into()).await?;
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Idle);
+        session.query("SAVEPOINT s; RELEASE s".into()).await?;
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Idle);
+        assert!(
+            session
+                .query_postgres_params("SELECT $1".into(), vec![None])
+                .await
+                .is_err()
+        );
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires disposable PostgreSQL"]
+fn postgres_authoritative_transaction_status() -> Result<()> {
+    runtime()?.block_on(async {
+        let (profile, password) = postgres_profile()?;
+        let session = Session::connect(profile.clone(), password.clone()).await?;
+        let other = Session::connect(profile.clone(), password.clone()).await?;
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Idle);
+        session
+            .query("SELECT 'BEGIN;'; /* BEGIN */ SELECT 1".into())
+            .await?;
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Idle);
+        session
+            .query("START TRANSACTION; SAVEPOINT s".into())
+            .await?;
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Open);
+        assert_eq!(other.transaction_status().await?, TransactionStatus::Idle);
+        assert!(session.query("SELECT 1/0".into()).await.is_err());
+        assert_eq!(
+            session.transaction_status().await?,
+            TransactionStatus::Failed
+        );
+        session.query("ROLLBACK TO s".into()).await?;
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Open);
+        session.query("COMMIT".into()).await?;
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Idle);
+        session.query("BEGIN; ROLLBACK".into()).await?;
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Idle);
+        assert!(
+            session
+                .query("BEGIN; SELECT 1/0; COMMIT".into())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            session.transaction_status().await?,
+            TransactionStatus::Failed
+        );
+        // COMMIT in a failed transaction is a server-side rollback.
+        session.query("COMMIT".into()).await?;
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Idle);
+        assert!(session.query("SELECT 1/0".into()).await.is_err());
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Idle);
+
+        session.query("BEGIN".into()).await?;
+        let pid = session.query("SELECT pg_backend_pid()".into()).await?.sets[0].rows[0][0].text();
+        other
+            .query_postgres_params(
+                "SELECT pg_terminate_backend($1::integer)".into(),
+                vec![Some(pid)],
+            )
+            .await?;
+        assert_eq!(
+            session.transaction_status().await?,
+            TransactionStatus::Unknown
+        );
+        assert!(session.query("SELECT 1".into()).await.is_err());
+        let reconnected = Session::connect(profile, password).await?;
+        assert_eq!(
+            reconnected.transaction_status().await?,
+            TransactionStatus::Idle
+        );
+        Ok(())
+    })
+}
+
+async fn wait_for_postgres_sleep(observer: &Session, pid: &str) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let output = observer
+                .query_postgres_params(
+                    "SELECT wait_event FROM pg_stat_activity WHERE pid=$1::integer".into(),
+                    vec![Some(pid.into())],
+                )
+                .await?;
+            if output.sets[0]
+                .rows
+                .first()
+                .is_some_and(|row| row[0].text() == "PgSleep")
+            {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?
+}
+
+#[test]
+#[ignore = "requires disposable PostgreSQL"]
+fn postgres_cancellation_and_abandoned_work_state() -> Result<()> {
+    runtime()?.block_on(async {
+        let (profile, password) = postgres_profile()?;
+        let session = Session::connect(profile.clone(), password.clone()).await?;
+        let observer = Session::connect(profile, password).await?;
+        let pid = session.query("SELECT pg_backend_pid()".into()).await?.sets[0].rows[0][0].text();
+        for in_transaction in [false, true] {
+            if in_transaction {
+                session.query("BEGIN".into()).await?;
+            }
+            let running = session.clone();
+            let task = tokio::spawn(async move {
+                if in_transaction {
+                    running
+                        .query_postgres_params(
+                            "SELECT pg_sleep($1::float8)".into(),
+                            vec![Some("20".into())],
+                        )
+                        .await
+                } else {
+                    running.query("SELECT pg_sleep(20)".into()).await
+                }
+            });
+            wait_for_postgres_sleep(&observer, &pid).await?;
+            session.cancel().await?;
+            assert!(
+                tokio::time::timeout(Duration::from_secs(3), task)
+                    .await??
+                    .is_err()
+            );
+            assert_eq!(
+                session.transaction_status().await?,
+                if in_transaction {
+                    TransactionStatus::Failed
+                } else {
+                    TransactionStatus::Idle
+                }
+            );
+            session.query("ROLLBACK".into()).await?;
+            assert_eq!(
+                session.query("SELECT 42".into()).await?.sets[0].rows[0][0].text(),
+                "42"
+            );
+        }
+        let running = session.clone();
+        let serialized =
+            tokio::spawn(async move { running.query("SELECT pg_sleep(0.1); BEGIN".into()).await });
+        wait_for_postgres_sleep(&observer, &pid).await?;
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Open);
+        serialized.await??;
+        session.query("ROLLBACK".into()).await?;
+        let running = session.clone();
+        let task = tokio::spawn(async move {
+            running
+                .query("BEGIN; SELECT pg_sleep(0.3); SELECT 1/0".into())
+                .await
+        });
+        wait_for_postgres_sleep(&observer, &pid).await?;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        // The response consumer disappeared, but the driver must still drain
+        // the script before the status Sync can complete.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), session.transaction_status()).await??,
+            TransactionStatus::Failed
+        );
+        session.query("ROLLBACK".into()).await?;
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires disposable PostgreSQL"]
+fn postgres_text_bind_fidelity_errors_and_limits() -> Result<()> {
+    runtime()?.block_on(async {
+        let (profile, password) = postgres_profile()?;
+        let session = Session::connect(profile, password).await?;
+        session.query("CREATE TEMP TABLE bind_effects(n integer); CREATE TYPE pg_temp.mood AS ENUM ('calm', 'é'); SET TIME ZONE 'UTC'".into()).await?;
+        let sql = "SELECT $1::text, $2::text, $3::numeric, $4::int[], $5::timestamp, $6::timestamptz, $7::bytea, $8::pg_temp.mood, $9::text, $3::numeric";
+        let values = vec![
+            None, Some(""), Some("12345678901234567890.12345678901234567890"),
+            Some("{1,NULL,-3}"), Some("2024-02-29 12:34:56.123456"),
+            Some("2024-02-29 12:34:56.123456+05:30"), Some("\\x00ff80"), Some("é"),
+            Some("'); DROP TABLE bind_effects; --\n雪"),
+        ].into_iter().map(|v| v.map(str::to_owned)).collect();
+        let empty = session.query_postgres_params("SELECT $1::text AS value WHERE false".into(), vec![None]).await?;
+        assert_eq!(empty.sets[0].columns, vec!["value"]);
+        assert!(empty.sets[0].rows.is_empty());
+        assert_eq!(session.query_postgres_params("SELECT $1".into(), vec![Some("inferred text".into())]).await?.sets[0].rows[0][0].text(), "inferred text");
+        session.query_postgres_params("BEGIN".into(), vec![]).await?;
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Open);
+        // A local encoding error sent no SQL and must not mark the transaction failed.
+        assert!(session.query_postgres_params("SELECT \0".into(), vec![]).await.is_err());
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Open);
+        session.query_postgres_params("COMMIT".into(), vec![]).await?;
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Idle);
+        let output = session.query_postgres_params(sql.into(), values).await?;
+        let reference = session.query("SELECT NULL::text, ''::text, 12345678901234567890.12345678901234567890::numeric, '{1,NULL,-3}'::int[], '2024-02-29 12:34:56.123456'::timestamp, '2024-02-29 12:34:56.123456+05:30'::timestamptz, '\\x00ff80'::bytea, 'é'::pg_temp.mood, $v$'); DROP TABLE bind_effects; --
+雪$v$::text, 12345678901234567890.12345678901234567890::numeric".into()).await?;
+        assert_eq!(output.sets[0].rows, reference.sets[0].rows);
+        assert_eq!(output.sets[0].rows[0][0], Cell::Null);
+        assert_eq!(output.sets[0].rows[0][1], Cell::Text(String::new()));
+        assert_eq!(output.sets[0].rows[0][2].text(), "12345678901234567890.12345678901234567890");
+        let inserted = session.query_postgres_params("INSERT INTO bind_effects VALUES ($1::int)".into(), vec![Some("7".into())]).await?;
+        assert_eq!(inserted.sets[0].affected, 1);
+        assert!(inserted.sets[0].columns.is_empty());
+        for (sql, params) in [
+            ("SELECT $1::int", vec![Some("bad".into())]),
+            ("SELECT $1::int", vec![]),
+            ("SELECT 1", vec![None]),
+            ("SELECT $1::text", vec![Some("a\0b".into())]),
+            ("INSERT INTO bind_effects VALUES (99); SELECT 1", vec![]),
+            ("SELEC $1", vec![None]),
+        ] {
+            session.query("BEGIN".into()).await?;
+            assert!(session.query_postgres_params(sql.into(), params).await.is_err());
+            assert_eq!(session.transaction_status().await?, TransactionStatus::Failed);
+            session.query("ROLLBACK".into()).await?;
+        }
+        assert_eq!(session.query("SELECT count(*) FROM bind_effects".into()).await?.sets[0].rows[0][0].text(), "1");
+        let limited = session.query_postgres_params(
+            "INSERT INTO bind_effects SELECT generate_series(1,$1::int) RETURNING n".into(), vec![Some("11000".into())]
+        ).await?;
+        assert_eq!(limited.sets[0].rows.len(), MAX_RESULT_ROWS);
+        assert_eq!(limited.sets[0].affected, 11000);
+        assert!(limited.sets[0].truncated);
+        assert_eq!(session.query("SELECT count(*) FROM bind_effects".into()).await?.sets[0].rows[0][0].text(), "11001");
+        let bytes = session.query_postgres_params(
+            "SELECT repeat('x', $1::int) FROM generate_series(1,34)".into(), vec![Some("1048576".into())]
+        ).await?;
+        assert!(bytes.sets[0].truncated);
+        assert_eq!(bytes.sets[0].rows.len(), MAX_RESULT_BYTES / 1048576);
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Idle);
+        Ok(())
+    })
+}

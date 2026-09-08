@@ -107,6 +107,53 @@ impl Session {
         })
     }
 
+    /// Waits for prior session work and observes the backend's transaction state.
+    /// PostgreSQL uses protocol Sync/ReadyForQuery, even after SQL errors.
+    /// A failed connection returns Unknown; this never reconnects implicitly.
+    pub async fn transaction_status(&self) -> Result<TransactionStatus> {
+        match &self.backend {
+            Backend::Postgres(pg) => Ok(match pg.client.lock().await.transaction_status().await {
+                Ok(b'I') => TransactionStatus::Idle,
+                Ok(b'T') => TransactionStatus::Open,
+                Ok(b'E') => TransactionStatus::Failed,
+                _ => TransactionStatus::Unknown,
+            }),
+            Backend::Sqlite { .. } => {
+                self.with_sqlite(|conn| {
+                    Ok(if conn.is_autocommit() {
+                        TransactionStatus::Idle
+                    } else {
+                        TransactionStatus::Open
+                    })
+                })
+                .await
+            }
+        }
+    }
+
+    /// Executes one PostgreSQL statement with positional text bind values.
+    /// None is SQL NULL, Some("") is empty text. Types are inferred by PostgreSQL;
+    /// use SQL casts for ambiguous parameters. Results retain exact server text
+    /// and the same display limits as query(). SQLite is deliberately unsupported.
+    pub async fn query_postgres_params(
+        &self,
+        sql: String,
+        params: Vec<Option<String>>,
+    ) -> Result<QueryOutput> {
+        let Backend::Postgres(pg) = &self.backend else {
+            bail!("Text bind execution requires a PostgreSQL session");
+        };
+        let start = Instant::now();
+        let client = pg.client.lock().await;
+        let params: Vec<_> = params.iter().map(|value| value.as_deref()).collect();
+        let stream = client.query_text_raw(&sql, &params).await?;
+        let sets = postgres::collect_results(stream).await?;
+        Ok(QueryOutput {
+            sets,
+            elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        })
+    }
+
     pub async fn cancel(&self) -> Result<()> {
         match &self.backend {
             Backend::Postgres(pg) => pg

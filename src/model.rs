@@ -227,6 +227,16 @@ pub struct ResultSet {
     pub truncated: bool,
 }
 
+/// Authoritative state observed while holding the session's execution lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionStatus {
+    Idle,
+    Open,
+    Failed,
+    /// The server could not be reached, or its status was not recognized.
+    Unknown,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct QueryOutput {
     pub sets: Vec<ResultSet>,

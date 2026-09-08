@@ -46,3 +46,28 @@ When upstream provides equivalent backdrop support, remove the three backdrop
 patches together after verifying the rendering tests. Remove the vendored sources
 once upstream also provides destructive menu styling and rectangular table
 selection, and the menu and table interaction tests pass.
+
+## PostgreSQL execution foundations
+
+`tokio-postgres-0.7.18` is the published crates.io source, upstream revision
+`f1cb6ec0d5766b136cbd68f3010d64142a5daa66`. Original licenses are retained.
+Only `src/client.rs`, `src/query.rs`, and `src/simple_query.rs` are modified:
+
+- `Client::transaction_status()` sends the existing protocol Sync request and
+  returns the ReadyForQuery status byte. No SQL parsing, extra connection,
+  cached-state inference, or transaction-changing SQL is involved.
+- `Client::query_text_raw()` sends unnamed Parse/Bind/Describe-portal/Execute/Sync
+  in one request. Bind parameters and results both use text format. PostgreSQL
+  infers parameter types; NULL and empty text remain distinct. It reuses
+  `SimpleQueryStream` and does not alter ordinary binary query methods.
+- The text stream defers database errors until ReadyForQuery and then terminates.
+  Dropped receivers retain the upstream connection driver's drainage behavior.
+
+The application serializes these operations with its existing session mutex.
+The text path supports one statement; the existing simple-query path remains
+the script API. COPY streaming is outside both application query APIs.
+
+To refresh this vendor, compare these three files with the pinned registry
+source and rerun `tests/database.rs` against disposable PostgreSQL, including
+ignored tests. Remove the patch only when upstream offers equivalent text binds
+and authoritative status access with the same drainage guarantees.
