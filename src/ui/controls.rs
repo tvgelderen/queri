@@ -53,7 +53,7 @@ pub fn brand_logo(height: Pixels, cx: &App) -> Stateful<Svg> {
         .role(Role::Image)
         .aria_label("Queri")
         .flex_shrink_0()
-        .w(height * (232. / 64.))
+        .w(height * (222. / 64.))
         .h(height)
 }
 
