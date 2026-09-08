@@ -25,6 +25,12 @@ Local changes:
   disabled styling; Queri's connection, database, and history deletion actions
   use native rows without duplicating menu geometry.
 
+- `gpui-component/src/table/{state,data_table}.rs`: opt-in rectangular cell
+  selection through `range_selectable(true)` and `selected_range()`. Dragging,
+  Shift-clicking, and Shift+arrow keys extend the range; ordinary selection and
+  row checkboxes retain their behavior. Queri resets ranges when results change.
+  Native interaction tests cover keyboard, pointer, clipboard, and refresh behavior.
+
 Queri enables an 8-logical-pixel Gaussian sigma in `src/ui/theme.rs`. These
 patches implement blur on Linux's WGPU renderer (Wayland, X11, and headless).
 Other renderers retain the ordinary dimmed overlay. Textures are allocated on
@@ -38,5 +44,5 @@ Mesa lavapipe works for headless testing. `bash scripts/check.sh` includes it.
 Upstream tracking: [GPUI Kit #3598](https://github.com/longbridge/gpui-kit/issues/3598).
 When upstream provides equivalent backdrop support, remove the three backdrop
 patches together after verifying the rendering tests. Remove the vendored sources
-once upstream also provides destructive menu styling and the menu interaction
-tests pass.
+once upstream also provides destructive menu styling and rectangular table
+selection, and the menu and table interaction tests pass.

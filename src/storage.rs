@@ -39,7 +39,7 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         ensure!(
-            version <= 2,
+            version <= 3,
             "This application database was created by a newer Queri version."
         );
         if version == 0 {
@@ -57,6 +57,22 @@ impl Store {
                 PRAGMA user_version=2;",
             )?;
         }
+        if version < 3 {
+            tx.execute_batch(
+                "CREATE TABLE saved_queries (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                sql TEXT NOT NULL,
+                favorite INTEGER NOT NULL DEFAULT 0,
+                connection_id TEXT REFERENCES connections(id) ON DELETE SET NULL,
+                database_name TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            PRAGMA user_version=3;",
+            )?;
+        }
         tx.commit()?;
         Ok(store)
     }
@@ -67,6 +83,106 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         Ok(conn)
+    }
+
+    pub fn saved_queries(&self, search: &str, connection: Option<Uuid>) -> Result<Vec<SavedQuery>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT id,name,sql,favorite,connection_id,database_name,revision
+            FROM saved_queries WHERE (?2 IS NULL OR connection_id=?2)
+            AND (instr(lower(name),lower(?1))>0 OR instr(lower(sql),lower(?1))>0)
+            ORDER BY favorite DESC, name COLLATE NOCASE, id",
+        )?;
+        let rows = stmt.query_map(
+            params![search, connection.map(|id| id.to_string())],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )?;
+        rows.map(|row| {
+            let (id, name, sql, favorite, connection, database, revision) = row?;
+            Ok(SavedQuery {
+                id: id.parse()?,
+                name,
+                sql,
+                favorite,
+                connection_id: connection.map(|id| id.parse()).transpose()?,
+                database,
+                revision,
+            })
+        })
+        .collect()
+    }
+
+    /// Revision zero inserts. Updates require the revision the editor originally loaded.
+    pub fn save_query(&self, query: &SavedQuery) -> Result<SavedQuery> {
+        ensure!(!query.name.trim().is_empty(), "Enter a query name.");
+        let conn = self.connection()?;
+        if query.revision == 0 {
+            conn.execute(
+                "INSERT INTO saved_queries(id,name,sql,favorite,connection_id,database_name)
+                VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    query.id.to_string(),
+                    query.name.trim(),
+                    query.sql,
+                    query.favorite,
+                    query.connection_id.map(|id| id.to_string()),
+                    query.database
+                ],
+            )?;
+        } else {
+            let changed = conn.execute(
+                "UPDATE saved_queries SET name=?2,sql=?3,favorite=?4,
+                connection_id=?5,database_name=?6,revision=revision+1,updated_at=CURRENT_TIMESTAMP
+                WHERE id=?1 AND revision=?7",
+                params![
+                    query.id.to_string(),
+                    query.name.trim(),
+                    query.sql,
+                    query.favorite,
+                    query.connection_id.map(|id| id.to_string()),
+                    query.database,
+                    query.revision
+                ],
+            )?;
+            ensure!(
+                changed == 1,
+                "This saved query was changed or deleted elsewhere. Reopen it from the library or save as a new query."
+            );
+        }
+        let mut saved = query.clone();
+        saved.name = saved.name.trim().to_owned();
+        saved.revision += 1;
+        Ok(saved)
+    }
+
+    pub fn delete_query(&self, id: Uuid) -> Result<()> {
+        self.connection()?
+            .execute("DELETE FROM saved_queries WHERE id=?1", [id.to_string()])?;
+        Ok(())
+    }
+
+    pub fn rename_query_database(
+        &self,
+        connection: Uuid,
+        source: &str,
+        target: &str,
+    ) -> Result<()> {
+        self.connection()?.execute(
+            "UPDATE saved_queries SET database_name=?3,revision=revision+1,
+            updated_at=CURRENT_TIMESTAMP WHERE connection_id=?1 AND database_name=?2",
+            params![connection.to_string(), source, target],
+        )?;
+        Ok(())
     }
 
     pub fn profiles(&self) -> Result<Vec<ConnectionProfile>> {
@@ -302,4 +418,38 @@ fn unsigned(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
             Box::new(error),
         )
     })
+}
+
+#[cfg(test)]
+mod saved_query_tests {
+    use super::*;
+    #[test]
+    fn saved_queries_detect_stale_updates_and_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app");
+        let store = Store::open(&path).unwrap();
+        let query = SavedQuery {
+            id: Uuid::new_v4(),
+            name: " Test ".into(),
+            sql: "SELECT 1".into(),
+            favorite: false,
+            connection_id: None,
+            database: String::new(),
+            revision: 0,
+        };
+        let first = store.save_query(&query).unwrap();
+        assert_eq!(first.name, "Test");
+        let mut second = first.clone();
+        second.sql = "SELECT 2".into();
+        store.save_query(&second).unwrap();
+        assert!(store.save_query(&first).is_err());
+        let entries = Store::open(path)
+            .unwrap()
+            .saved_queries("select 2", None)
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].revision, 2);
+        store.delete_query(first.id).unwrap();
+        assert!(store.saved_queries("", None).unwrap().is_empty());
+    }
 }

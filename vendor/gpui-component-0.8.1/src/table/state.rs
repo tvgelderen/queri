@@ -274,6 +274,10 @@ pub struct TableState<D: TableDelegate> {
     right_clicked_cell: Option<(usize, usize)>,
     selected_col: Option<usize>,
     selected_cell: Option<(usize, usize)>,
+    range_selectable: bool,
+    range_anchor: Option<(usize, usize)>,
+    range_dragged: bool,
+    range_drag_active: bool,
 
     /// The column index that is being resized.
     resizing_col: Option<usize>,
@@ -316,6 +320,10 @@ where
             right_clicked_cell: None,
             selected_col: None,
             selected_cell: None,
+            range_selectable: false,
+            range_anchor: None,
+            range_dragged: false,
+            range_drag_active: false,
             resizing_col: None,
             fitted_col: None,
             col_drag_gap: None,
@@ -603,6 +611,138 @@ where
         self.selected_cell.filter(|_| self.selection_mode.is_cell())
     }
 
+    /// Enables rectangular selection; existing consumers retain single-cell behavior.
+    pub fn range_selectable(mut self, enabled: bool) -> Self {
+        self.range_selectable = enabled;
+        self
+    }
+
+    /// Inclusive corners in display coordinates.
+    pub fn selected_range(&self) -> Option<((usize, usize), (usize, usize))> {
+        let end = self.selected_cell()?;
+        let start = self.range_anchor.unwrap_or(end);
+        Some((
+            (start.0.min(end.0), start.1.min(end.1)),
+            (start.0.max(end.0), start.1.max(end.1)),
+        ))
+    }
+
+    fn cell_in_selection(&self, row: usize, col: usize) -> bool {
+        self.selected_range()
+            .is_some_and(|(a, b)| row >= a.0 && row <= b.0 && col >= a.1 && col <= b.1)
+    }
+
+    fn begin_range_drag(
+        &mut self,
+        row: usize,
+        col: usize,
+        event: &gpui::MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.delegate.column(col, cx).selectable {
+            return;
+        }
+        self.range_dragged = false;
+        self.range_drag_active = true;
+        if !event.modifiers.shift {
+            self.set_selected_cell(row, col, cx);
+        }
+    }
+
+    fn update_range_drag(
+        &mut self,
+        row: usize,
+        col: usize,
+        event: &gpui::MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if self.range_drag_active
+            && event.pressed_button == Some(MouseButton::Left)
+            && self.selected_cell().is_some()
+            && self.selected_cell() != Some((row, col))
+            && self.delegate.column(col, cx).selectable
+        {
+            self.extend_selection(row, col, cx);
+            self.range_dragged = true;
+        }
+    }
+
+    /// Extends a rectangle while keeping its initial anchor.
+    pub fn extend_selection(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
+        let anchor = self
+            .range_anchor
+            .or(self.selected_cell())
+            .unwrap_or((row, col));
+        self.set_selected_cell(row, col, cx);
+        self.range_anchor = Some(anchor);
+    }
+
+    pub(super) fn extend_up(
+        &mut self,
+        _: &super::data_table::ExtendUp,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.range_selectable {
+            cx.propagate();
+            return;
+        }
+        if let Some((r, c)) = self.selected_cell() {
+            self.extend_selection(r.saturating_sub(1), c, cx);
+        }
+    }
+    pub(super) fn extend_down(
+        &mut self,
+        _: &super::data_table::ExtendDown,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.range_selectable {
+            cx.propagate();
+            return;
+        }
+        if let Some((r, c)) = self.selected_cell() {
+            self.extend_selection(
+                r.saturating_add(1)
+                    .min(self.delegate.rows_count(cx).saturating_sub(1)),
+                c,
+                cx,
+            );
+        }
+    }
+    pub(super) fn extend_left(
+        &mut self,
+        _: &super::data_table::ExtendLeft,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.range_selectable {
+            cx.propagate();
+            return;
+        }
+        if let Some((r, c)) = self.selected_cell() {
+            self.extend_selection(r, c.saturating_sub(1), cx);
+        }
+    }
+    pub(super) fn extend_right(
+        &mut self,
+        _: &super::data_table::ExtendRight,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.range_selectable {
+            cx.propagate();
+            return;
+        }
+        if let Some((r, c)) = self.selected_cell() {
+            self.extend_selection(
+                r,
+                c.saturating_add(1)
+                    .min(self.delegate.columns_count(cx).saturating_sub(1)),
+                cx,
+            );
+        }
+    }
     /// Sets the selected cell to the given row and column indices.
     ///
     /// This method:
@@ -621,6 +761,7 @@ where
     pub fn set_selected_cell(&mut self, row_ix: usize, col_ix: usize, cx: &mut Context<Self>) {
         self.selection_mode = SelectionMode::Cell;
         self.selected_cell = Some((row_ix, col_ix));
+        self.range_anchor = None;
         self.right_clicked_cell = None;
 
         // Scroll to the cell
@@ -651,6 +792,9 @@ where
         self.selected_row = None;
         self.selected_col = None;
         self.selected_cell = None;
+        self.range_anchor = None;
+        self.range_dragged = false;
+        self.range_drag_active = false;
         cx.emit(TableEvent::ClearSelection);
         cx.notify();
     }
@@ -904,6 +1048,16 @@ where
         cx.stop_propagation();
 
         let is_double_click = e.click_count() == 2;
+        if self.range_selectable && !is_double_click {
+            if self.range_dragged {
+                self.range_dragged = false;
+                return;
+            }
+            if e.modifiers().shift {
+                self.extend_selection(row_ix, col_ix, cx);
+                return;
+            }
+        }
 
         // When the row header column is hidden, a single click on the
         // already-selected cell escalates the selection to the entire row —
@@ -911,7 +1065,8 @@ where
         // Double-clicks are passed through to `DoubleClickedCell` and never
         // trigger the escalation.
         let is_reselect = self.selected_cell() == Some((row_ix, col_ix));
-        let should_escalate_to_row = !self.row_header
+        let should_escalate_to_row = !self.range_selectable
+            && !self.row_header
             && self.row_selectable
             && is_reselect
             && !is_double_click
@@ -1552,7 +1707,7 @@ where
     {
         let cell = if self.cell_selectable {
             cell.role(gpui::Role::GridCell)
-                .aria_selected(self.selected_cell() == Some((row_ix, col_ix)))
+                .aria_selected(self.cell_in_selection(row_ix, col_ix))
         } else {
             cell.role(gpui::Role::Cell)
         };
@@ -2263,7 +2418,7 @@ where
 
                                 (0..left_columns_count).for_each(|col_ix| {
                                     let is_cell_selected =
-                                        self.selected_cell() == Some((row_ix, col_ix));
+                                        self.cell_in_selection(row_ix, col_ix);
                                     let is_cell_right_clicked =
                                         self.right_clicked_cell == Some((row_ix, col_ix));
 
@@ -2314,7 +2469,15 @@ where
                                                         )
                                                     },
                                                 )
-                                                .when(self.cell_selectable, |this| {
+                                                .when(self.range_selectable, |this| {
+    this.on_mouse_down(MouseButton::Left, cx.listener(move |table, e: &gpui::MouseDownEvent, _, cx| {
+        table.begin_range_drag(row_ix, col_ix, e, cx);
+    }))
+    .on_mouse_move(cx.listener(move |table, e: &gpui::MouseMoveEvent, _, cx| {
+        table.update_range_drag(row_ix, col_ix, e, cx);
+    }))
+})
+.when(self.cell_selectable, |this| {
                                                     this.on_click(cx.listener(
                                                         move |table, e, window, cx| {
                                                             table.on_cell_click(
@@ -2369,7 +2532,7 @@ where
                                         visible_range.for_each(|col_ix| {
                                             let col_ix = col_ix + left_columns_count;
                                             let is_cell_selected =
-                                                table.selected_cell() == Some((row_ix, col_ix));
+                                                table.cell_in_selection(row_ix, col_ix);
                                             let is_cell_right_clicked =
                                                 table.right_clicked_cell == Some((row_ix, col_ix));
 
@@ -2424,7 +2587,15 @@ where
                                                                 )
                                                             },
                                                         )
-                                                        .when(table.cell_selectable, |this| {
+                                                        .when(table.range_selectable, |this| {
+    this.on_mouse_down(MouseButton::Left, cx.listener(move |table, e: &gpui::MouseDownEvent, _, cx| {
+        table.begin_range_drag(row_ix, col_ix, e, cx);
+    }))
+    .on_mouse_move(cx.listener(move |table, e: &gpui::MouseMoveEvent, _, cx| {
+        table.update_range_drag(row_ix, col_ix, e, cx);
+    }))
+})
+.when(table.cell_selectable, |this| {
                                                             this.on_click(cx.listener(
                                                                 move |table, e, window, cx| {
                                                                     cx.stop_propagation();
@@ -2693,6 +2864,21 @@ where
 
         let inner_table = v_flex()
             .id("table-inner")
+            .when(self.range_selectable, |table| {
+                table
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, _| {
+                            this.range_drag_active = false;
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, _| {
+                            this.range_drag_active = false;
+                        }),
+                    )
+            })
             .test_support()
             // A table that selects rows or cells is a grid. The counts cover
             // every row, not just the rendered ones, plus the header row.

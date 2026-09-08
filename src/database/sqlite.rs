@@ -149,7 +149,7 @@ pub fn browse(conn: &Connection, table: &TableRef, options: &BrowseOptions) -> R
     let metadata = metadata(conn, table)?;
     let qualified = qualified(&table.schema, &table.name)?;
     let mut values = vec![];
-    let filter = match &options.filter {
+    let mut filter = match &options.filter {
         Some(filter) => {
             let column = filter.validate(&metadata, true)?;
             let name = quote_identifier(&column.name)?;
@@ -198,6 +198,16 @@ pub fn browse(conn: &Connection, table: &TableRef, options: &BrowseOptions) -> R
         }
         None => String::new(),
     };
+    if let Some(scope) = &options.relationship {
+        let (predicate, params) = relationship_predicate(conn, table, scope, values.len() + 1)?;
+        values.extend(params);
+        filter.push_str(if filter.is_empty() {
+            " WHERE "
+        } else {
+            " AND "
+        });
+        filter.push_str(&predicate);
+    }
     let sort = browse_ordering(&metadata, &options.sort)?;
     let total: i64 = conn.query_row(
         &format!("SELECT count(*) FROM {qualified}{filter}"),
@@ -372,4 +382,130 @@ pub fn change_rows(conn: &mut Connection, table: &TableRef, change: RowChange) -
     };
     tx.commit()?;
     Ok(u64::try_from(affected)?)
+}
+
+pub fn foreign_keys(
+    conn: &Connection,
+    table: &TableRef,
+    incoming: bool,
+) -> Result<Vec<ForeignKey>> {
+    let sources = if incoming {
+        tables(conn, &table.schema)?
+    } else {
+        vec![table.clone()]
+    };
+    let mut keys = vec![];
+    for source in sources.into_iter().filter(TableRef::is_table) {
+        let mut stmt=conn.prepare("SELECT id,seq,\"table\",\"from\",\"to\" FROM pragma_foreign_key_list(?1,?2) ORDER BY id,seq")?;
+        let rows = stmt.query_map(params![source.name, source.schema], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        let mut local: Vec<ForeignKey> = vec![];
+        for row in rows {
+            let (id, target, from, to) = row?;
+            let id = id.to_string();
+            if local.last().is_none_or(|k| k.id != id) {
+                local.push(ForeignKey {
+                    id: id.clone(),
+                    name: format!("{} → {}", source.name, target),
+                    source: source.clone(),
+                    target: TableRef {
+                        schema: source.schema.clone(),
+                        name: target.clone(),
+                        kind: RelationKind::Table,
+                    },
+                    columns: vec![],
+                });
+            }
+            if let Some(key) = local.last_mut() {
+                let target_column = if let Some(to) = to {
+                    to
+                } else {
+                    conn.query_row(
+                        "SELECT name FROM pragma_table_info(?1,?2) WHERE pk=?3",
+                        params![target, source.schema, i64::try_from(key.columns.len())? + 1],
+                        |row| row.get(0),
+                    )
+                    .context("Could not resolve the referenced primary key")?
+                };
+                key.columns.push(ForeignKeyColumn {
+                    source: from,
+                    target: target_column,
+                });
+            }
+        }
+        keys.extend(
+            local
+                .into_iter()
+                .filter(|k| !incoming || k.target.name.eq_ignore_ascii_case(&table.name)),
+        );
+    }
+    Ok(keys)
+}
+
+fn relationship_predicate(
+    conn: &Connection,
+    table: &TableRef,
+    scope: &RelationshipScope,
+    start: usize,
+) -> Result<(String, Vec<Value>)> {
+    let origin = if scope.incoming {
+        &scope.key.target
+    } else {
+        &scope.key.source
+    };
+    ensure!(
+        scope.destination() == table
+            && foreign_keys(conn, origin, scope.incoming)?.contains(&scope.key),
+        "This relationship changed or was removed. Open it again from the source table."
+    );
+    ensure!(
+        scope.values.len() == scope.key.columns.len()
+            && !scope.values.iter().any(|v| matches!(v, Cell::Null)),
+        "The relationship key is incomplete."
+    );
+    let mut predicates = vec![];
+    let mut values = vec![];
+    for (i, (column, cell)) in scope.key.columns.iter().zip(&scope.values).enumerate() {
+        values.push(match cell {
+            Cell::Null => Value::Null,
+            Cell::Text(s) => Value::Text(s.clone()),
+            Cell::Integer(n) => Value::Integer(*n),
+            Cell::Real(n) => Value::Real(*n),
+            Cell::Blob(b) => Value::Blob(b.clone()),
+        });
+        let parameter = start + i;
+        let parent = quote_identifier(&column.target)?;
+        if scope.incoming {
+            // Parent on the left supplies its declared affinity and collation. Unary +
+            // strips the child's affinity, matching SQLite foreign-key comparison rules.
+            predicates.push(format!(
+                "queri_parent.{parent} = ?{parameter} AND queri_parent.{parent} = +{}.{}",
+                qualified(&table.schema, &table.name)?,
+                quote_identifier(&column.source)?
+            ));
+        } else {
+            predicates.push(format!(
+                "{}.{parent} = ?{parameter}",
+                qualified(&table.schema, &table.name)?
+            ));
+        }
+    }
+    let predicate = predicates.join(" AND ");
+    Ok((
+        if scope.incoming {
+            format!(
+                "EXISTS (SELECT 1 FROM {} AS queri_parent WHERE {predicate})",
+                qualified(&origin.schema, &origin.name)?
+            )
+        } else {
+            predicate
+        },
+        values,
+    ))
 }

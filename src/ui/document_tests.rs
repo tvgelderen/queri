@@ -282,7 +282,8 @@ async fn row_inspector_inserts_edits_and_deletes_real_rows(cx: &mut TestAppConte
         let grid = doc.read(cx).grid.clone();
         grid.update(cx, |grid, cx| grid.set_selected_row(1, cx));
         window.render_frame(cx);
-        window.click("edit", cx);
+        window.click("row-actions", cx);
+        crate::ui::test_support::click_label(window, "Edit row…", cx);
         window.click(("row-field", 1_usize), cx);
         window.press("ctrl-a", cx);
         window.input("Edited in the inspector", cx);
@@ -304,7 +305,8 @@ async fn row_inspector_inserts_edits_and_deletes_real_rows(cx: &mut TestAppConte
         let grid = doc.read(cx).grid.clone();
         grid.update(cx, |grid, cx| grid.set_selected_row(1, cx));
         window.render_frame(cx);
-        window.click("delete", cx);
+        window.click("row-actions", cx);
+        crate::ui::test_support::click_label(window, "Delete row…", cx);
         window.click("ok", cx);
     })
     .expect("confirm deletion");
@@ -607,4 +609,258 @@ async fn empty_table_actions_respect_read_only_connections(cx: &mut TestAppConte
             "Added elsewhere"
         )
     });
+}
+
+#[gpui_kit::test]
+async fn rectangular_selection_copies_and_refresh_clears_it(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    fixture
+        .services
+        .runtime
+        .block_on(
+            fixture
+                .session
+                .query("INSERT INTO items VALUES(2,'Beta');".into()),
+        )
+        .unwrap();
+    let (window, doc) = fixture.open(true, cx);
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("table-cell-0:1", cx);
+        let grid = doc.read(cx).grid.clone();
+        assert_eq!(grid.read(cx).selected_cell(), Some((0, 1)));
+        window.drag_to("table-cell-0:1", "refresh-table", cx);
+        let selection_after_release = grid.read(cx).selected_range();
+        window.drag_to("export-data", "table-cell-1:2", cx);
+        assert_eq!(grid.read(cx).selected_range(), selection_after_release);
+        window.click("table-cell-0:1", cx);
+        window.press("shift-right", cx);
+        window.press("shift-down", cx);
+        assert_eq!(grid.read(cx).selected_range(), Some(((0, 1), (1, 2))));
+        assert!(grid.read(cx).delegate().checked.is_empty());
+        window.click("table-cell-0:1", cx);
+        window.click_with_modifiers(
+            "table-cell-1:2",
+            gpui_kit::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        assert_eq!(grid.read(cx).selected_range(), Some(((0, 1), (1, 2))));
+        window.drag_to("table-cell-0:1", "table-cell-1:2", cx);
+        assert_eq!(grid.read(cx).selected_range(), Some(((0, 1), (1, 2))));
+        doc.update(cx, |doc, cx| {
+            doc.copy_cells(crate::export::Format::Tsv, true, cx)
+        });
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|v| v.text()),
+            Some("id\tname\n1\tAlpha\n2\tBeta\n".into())
+        );
+        window.click("copy-selection", cx);
+        crate::ui::test_support::click_label(window, "Copy as JSON", cx);
+        let copied = cx.read_from_clipboard().and_then(|v| v.text()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&copied).unwrap();
+        assert_eq!(json["columns"], serde_json::json!(["id", "name"]));
+        assert_eq!(json["rows"][1][1]["value"], "Beta");
+        doc.update(cx, |doc, cx| doc.refresh(window, cx));
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update(|cx| assert_eq!(doc.read(cx).grid.read(cx).selected_range(), None));
+}
+
+#[gpui_kit::test]
+async fn saved_query_is_explicit_and_formatting_is_one_undo(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(false, cx);
+    let original = "select 1 as answer, 'é' as label;";
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.input(original, cx);
+        window.click("save-query", cx);
+        window.click("Name", cx);
+        window.input("Daily check", cx);
+        window.click("confirm-save-query", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        doc.read(cx).saved_query.is_some()
+    })
+    .await;
+    assert_eq!(
+        fixture.services.store.saved_queries("", None).unwrap()[0].sql,
+        original
+    );
+    assert!(
+        fixture
+            .services
+            .store
+            .history(fixture.profile.id, "", 0)
+            .unwrap()
+            .is_empty()
+    );
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| doc.focus(window, cx));
+        window.press("ctrl-shift-f", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        !doc.read(cx).formatting
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        assert_ne!(doc.read(cx).draft(cx).sql, original);
+        assert!(doc.read(cx).draft(cx).sql.contains("'é'"));
+        window.press("ctrl-z", cx);
+        assert_eq!(doc.read(cx).draft(cx).sql, original);
+        window.press("ctrl-y", cx);
+        assert_ne!(doc.read(cx).draft(cx).sql, original);
+    })
+    .unwrap();
+    // Formatting changes only the draft until the user explicitly saves again.
+    assert_eq!(
+        fixture.services.store.saved_queries("", None).unwrap()[0].sql,
+        original
+    );
+}
+
+#[gpui_kit::test]
+async fn cell_inspector_copies_original_json_after_switching_views(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(false, cx);
+    let raw = r#"{"n":12345678901234567890,"n":1.2300}"#;
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        super::super::cell_inspector::open(
+            fixture.services.clone(),
+            Cell::Text(raw.into()),
+            "JSON value".into(),
+            None,
+            window,
+            cx,
+        );
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.try_find("copy-formatted-cell").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("copy-formatted-cell", cx);
+        let formatted = cx.read_from_clipboard().and_then(|v| v.text()).unwrap();
+        assert_eq!(formatted.matches("\"n\"").count(), 2);
+        window.click("copy-raw-cell", cx);
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|v| v.text()),
+            Some(raw.into())
+        );
+        window.press("escape", cx);
+        doc.update(cx, |doc, cx| doc.focus(window, cx));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+async fn export_dialog_writes_captured_page_without_running_sql(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(true, cx);
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    let destination = fixture._directory.path().join("export.csv");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("export-data", cx);
+        window.click("save-export", cx);
+    })
+    .unwrap();
+    assert!(cx.did_prompt_for_new_path());
+    cx.simulate_new_path_selection(|_| Some(destination.clone()));
+    cx.wait_for(window, Duration::from_secs(5), |_, _| destination.exists())
+        .await;
+    assert_eq!(
+        std::fs::read_to_string(destination).unwrap(),
+        "id,name\n1,Alpha\n"
+    );
+    assert!(
+        fixture
+            .services
+            .store
+            .history(fixture.profile.id, "", 0)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[gpui_kit::test]
+async fn format_selection_keeps_surrounding_sql(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(false, cx);
+    let original = "-- before\nselect 'é', 1;\n-- after";
+    let start = original.find("select").unwrap();
+    let end = original.find(";\n").unwrap() + 1;
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.input(original, cx);
+        doc.update(cx, |doc, cx| {
+            if let DocumentKind::Sql { editor } = &doc.kind {
+                editor.update(cx, |editor, cx| editor.set_selected_range(start..end, cx));
+            }
+            doc.format_sql(window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        !doc.read(cx).formatting
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        let value = doc.read(cx).draft(cx).sql;
+        assert!(value.starts_with("-- before\n"));
+        assert!(value.ends_with("\n-- after"));
+        assert_ne!(value, original);
+        window.press("ctrl-z", cx);
+        assert_eq!(doc.read(cx).draft(cx).sql, original);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+async fn selecting_a_cell_keeps_the_grid_stable_and_double_click_inspects_it(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(true, cx);
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let before = window.find("table-cell-0:2").bounds();
+        window.click("table-cell-0:2", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("table-cell-0:2").bounds(), before);
+        window.double_click("table-cell-0:2", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.try_find("copy-raw-cell").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("copy-raw-cell", cx);
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|v| v.text()),
+            Some("Alpha".into())
+        );
+    })
+    .unwrap();
 }

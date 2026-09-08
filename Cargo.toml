@@ -21,14 +21,13 @@ native-tls = "0.2"
 postgres-native-tls = "0.5"
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 sqlparser = { version = "0.63", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net"] }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
-uuid = { version = "1", features = ["v4", "serde"] }
-
-[dev-dependencies]
+sqlformat = "0.5.0"
 tempfile = "3"
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [[test]]
 name = "dialog_backdrop"

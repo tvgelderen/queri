@@ -297,6 +297,7 @@ impl TableMetadata {
 
 #[derive(Clone, Debug, Default)]
 pub struct BrowseOptions {
+    pub relationship: Option<RelationshipScope>,
     pub offset: u64,
     pub limit: u32,
     pub filter: Option<TableFilter>,
@@ -402,6 +403,10 @@ impl Default for Preferences {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Draft {
+    #[serde(default)]
+    pub relationship: Option<RelationshipScope>,
+    #[serde(default)]
+    pub saved_query: Option<SavedQuery>,
     pub connection_id: Uuid,
     pub database: String,
     pub sql: String,
@@ -435,7 +440,9 @@ pub fn parse_field(
         );
         let bytes = text
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let pair = std::str::from_utf8(pair)?;
                 Ok(u8::from_str_radix(pair, 16)?)
@@ -460,4 +467,55 @@ pub fn parse_field(
         return Ok(Cell::Real(number));
     }
     Ok(Cell::Text(text.to_owned()))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedQuery {
+    pub id: Uuid,
+    pub name: String,
+    pub sql: String,
+    pub favorite: bool,
+    pub connection_id: Option<Uuid>,
+    pub database: String,
+    pub revision: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignKeyColumn {
+    pub source: String,
+    pub target: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignKey {
+    pub id: String,
+    pub name: String,
+    pub source: TableRef,
+    pub target: TableRef,
+    pub columns: Vec<ForeignKeyColumn>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RelationshipScope {
+    pub key: ForeignKey,
+    pub incoming: bool,
+    pub values: Vec<Cell>,
+}
+impl RelationshipScope {
+    pub fn destination(&self) -> &TableRef {
+        if self.incoming {
+            &self.key.source
+        } else {
+            &self.key.target
+        }
+    }
+    pub fn label(&self) -> String {
+        format!(
+            "{} · {}",
+            if self.incoming {
+                "Referencing rows"
+            } else {
+                "Referenced row"
+            },
+            self.key.name
+        )
+    }
 }

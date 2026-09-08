@@ -252,6 +252,8 @@ impl Workspace {
                 );
                 if let Some(doc) = workspace.documents.last() {
                     doc.update(cx, |doc, _| {
+                        doc.set_relationship(draft.relationship);
+                        doc.saved_query = draft.saved_query;
                         doc.editor_height = draft.editor_height.clamp(100., 1200.);
                         if let Some(number) = draft.query_number {
                             doc.query_number = number;
@@ -674,6 +676,7 @@ impl Workspace {
             doc.profile.id == profile.id
                 && doc.profile.database() == profile.database()
                 && doc.table_ref() == Some(&table)
+                && doc.relationship().is_none()
         }) {
             self.select_document(index, window, cx);
         } else {
@@ -732,6 +735,38 @@ impl Workspace {
             |this, doc, _: &NewDocumentQuery, window, cx| {
                 let profile = doc.read(cx).profile.clone();
                 this.add_document(profile, None, String::new(), true, window, cx);
+            },
+        ));
+        self.subscriptions.push(cx.subscribe_in(
+            &doc,
+            window,
+            |this, doc, event: &super::document::OpenSqlFile, window, cx| {
+                let profile = doc.read(cx).profile.clone();
+                this.add_document(profile, None, event.0.clone(), true, window, cx);
+            },
+        ));
+        self.subscriptions.push(cx.subscribe_in(
+            &doc,
+            window,
+            |this, doc, event: &super::document::OpenRelated, window, cx| {
+                let profile = doc.read(cx).profile.clone();
+                let scope = event.0.clone();
+                this.add_document(
+                    profile,
+                    Some(scope.destination().clone()),
+                    String::new(),
+                    false,
+                    window,
+                    cx,
+                );
+                if let Some(target) = this.documents.last() {
+                    target.update(cx, |doc, cx| {
+                        doc.set_relationship(Some(scope));
+                        doc.connect(window, cx);
+                        doc.focus(window, cx);
+                    });
+                }
+                this.schedule_save(window, cx);
             },
         ));
         self.documents.push(doc.clone());
@@ -982,7 +1017,7 @@ impl Workspace {
             let profile = profile.clone();
             dialog
                 .title(format!("Remove {}?", profile.name))
-                .child("Its saved connection, SQL drafts, and query history will be removed. The database itself is retained.")
+                .child("Its saved connection, SQL drafts, and query history will be removed. Saved queries and the database itself are retained.")
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Remove connection")
@@ -1028,6 +1063,89 @@ impl Workspace {
                     });
                     true
                 })
+        });
+    }
+
+    fn saved_queries(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let library = cx.new(|cx| {
+            super::saved_queries::SavedQueries::new(
+                self.services.clone(),
+                self.profiles.clone(),
+                window,
+                cx,
+            )
+        });
+        self.subscriptions.push(cx.subscribe_in(
+            &library,
+            window,
+            |this, _, event: &super::saved_queries::OpenQuery, window, cx| {
+                let query = event.0.clone();
+                if let Some(profile) = query
+                    .connection_id
+                    .and_then(|id| this.profiles.iter().find(|p| p.id == id))
+                    .cloned()
+                {
+                    window.close_dialog(cx);
+                    this.add_document(
+                        profile.for_database(&query.database),
+                        None,
+                        query.sql.clone(),
+                        true,
+                        window,
+                        cx,
+                    );
+                    if let Some(doc) = this.documents.last() {
+                        doc.update(cx, |doc, cx| {
+                            doc.saved_query = Some(query);
+                            cx.emit(DocumentChanged);
+                            cx.notify();
+                        });
+                    }
+                } else {
+                    let profiles = this.profiles.clone();
+                    let view = cx.entity().downgrade();
+                    window.open_dialog(cx, move |dialog, _, _| {
+                        dialog.title("Choose a connection").child(
+                            v_flex()
+                                .gap_2()
+                                .when(profiles.is_empty(), |v| {
+                                    v.child("Add a connection to open this query.")
+                                })
+                                .children(profiles.iter().map(|profile| {
+                                    let profile = profile.clone();
+                                    let query = query.clone();
+                                    let view = view.clone();
+                                    Button::new(SharedString::from(profile.id.to_string()))
+                                        .label(profile.name.clone())
+                                        .on_click(move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            window.close_dialog(cx);
+                                            let _ = view.update(cx, |this, cx| {
+                                                this.add_document(
+                                                    profile.clone(),
+                                                    None,
+                                                    query.sql.clone(),
+                                                    true,
+                                                    window,
+                                                    cx,
+                                                );
+                                                if let Some(doc) = this.documents.last() {
+                                                    doc.update(cx, |doc, cx| {
+                                                        doc.saved_query = Some(query.clone());
+                                                        cx.emit(DocumentChanged);
+                                                    });
+                                                }
+                                            });
+                                        })
+                                })),
+                        )
+                    });
+                }
+            },
+        ));
+        library.update(cx, |this, cx| this.load(window, cx));
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title("Saved queries").child(library.clone())
         });
     }
 
@@ -1186,6 +1304,28 @@ impl Workspace {
         let target = match action {
             DatabaseAction::Create { name } | DatabaseAction::Clone { target: name, .. } => name,
             DatabaseAction::Rename { source, target, .. } => {
+                let store = self.services.store.clone();
+                let source_name = source.clone();
+                let target_name = target.clone();
+                task(
+                    &self.services,
+                    window,
+                    cx,
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            store.rename_query_database(id, &source_name, &target_name)
+                        })
+                        .await?
+                    },
+                    |this, result, _, cx| {
+                        if let Err(e) = result {
+                            this.error = format!(
+                                "Database renamed, but saved-query associations could not be updated: {e:#}"
+                            );
+                        }
+                        cx.notify();
+                    },
+                );
                 for doc in &self.documents {
                     if doc.read(cx).profile.id == id && doc.read(cx).profile.database() == *source {
                         doc.update(cx, |doc, cx| doc.rename_database(target, cx));
@@ -1951,6 +2091,8 @@ impl Render for Workspace {
                         )
                     }),
             )
+            .child(div().px_3().child(Button::new("saved-queries").outline().icon(IconName::Code).label("Saved queries")
+                .on_click(cx.listener(|this,_,window,cx|this.saved_queries(window,cx)))))
             .child(
                 h_flex()
                     .px_3()

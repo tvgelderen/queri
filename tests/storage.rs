@@ -165,6 +165,8 @@ fn version_one_migration_preserves_settings_drafts_and_history() -> Result<()> {
     let preferences = Preferences {
         active_connection: Some(profile.id),
         drafts: vec![Draft {
+            saved_query: None,
+            relationship: None,
             connection_id: profile.id,
             database: "postgres".into(),
             sql: "SELECT 'draft'".into(),
@@ -196,7 +198,7 @@ fn version_one_migration_preserves_settings_drafts_and_history() -> Result<()> {
     let store = Store::open(&path)?;
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-        2
+        3
     );
     assert_eq!(
         serde_json::to_value(&store.profiles()?[0])?,
@@ -388,5 +390,34 @@ fn failed_key_creation_and_credential_writes_roll_back_metadata() -> Result<()> 
         store.load_password(profile.id)?.as_deref(),
         Some("original")
     );
+    Ok(())
+}
+
+#[test]
+fn saved_queries_survive_connection_removal_and_database_rename() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let store = Store::open(directory.path().join("app.db"))?;
+    let profile = profile();
+    store.save_profile(&profile)?;
+    let saved = store.save_query(&SavedQuery {
+        id: Uuid::new_v4(),
+        name: "Find user".into(),
+        sql: "SELECT 1".into(),
+        favorite: true,
+        connection_id: Some(profile.id),
+        database: "old".into(),
+        revision: 0,
+    })?;
+    store.rename_query_database(profile.id, "old", "new")?;
+    assert_eq!(
+        store.saved_queries("", Some(profile.id))?[0].database,
+        "new"
+    );
+    assert!(store.save_query(&saved).is_err());
+    store.delete_profile(profile.id)?;
+    let queries = store.saved_queries("", None)?;
+    assert_eq!(queries.len(), 1);
+    assert_eq!(queries[0].connection_id, None);
+    assert_eq!(queries[0].sql, "SELECT 1");
     Ok(())
 }

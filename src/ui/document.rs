@@ -30,7 +30,15 @@ mod tests;
 
 actions!(
     queri_document,
-    [RunQuery, CancelQuery, Refresh, InspectCell, EditRow]
+    [
+        RunQuery,
+        CancelQuery,
+        Refresh,
+        InspectCell,
+        EditRow,
+        CopyCells,
+        FormatSql
+    ]
 );
 
 #[derive(Clone, Copy, PartialEq)]
@@ -74,6 +82,10 @@ enum QueryOutcome {
 
 pub struct DocumentChanged;
 impl EventEmitter<DocumentChanged> for Document {}
+pub struct OpenRelated(pub RelationshipScope);
+impl EventEmitter<OpenRelated> for Document {}
+pub struct OpenSqlFile(pub String);
+impl EventEmitter<OpenSqlFile> for Document {}
 pub struct NewDocumentQuery;
 impl EventEmitter<NewDocumentQuery> for Document {}
 pub struct ConnectionPasswordRequired;
@@ -96,12 +108,17 @@ pub struct Document {
     pub warn_destructive: bool,
     pub editor_height: f32,
     pub query_number: u32,
+    pub saved_query: Option<SavedQuery>,
+    formatting: bool,
     subscriptions: Vec<Subscription>,
 }
 
 impl Document {
     pub fn init(cx: &mut App) {
         cx.bind_keys([
+            KeyBinding::new("ctrl-shift-f", FormatSql, Some("QueriDocument")),
+            KeyBinding::new("ctrl-shift-f", FormatSql, Some("QueriDocument > Input")),
+            KeyBinding::new("ctrl-c", CopyCells, Some("QueriDocument > DataTable")),
             KeyBinding::new("ctrl-enter", RunQuery, Some("QueriDocument")),
             KeyBinding::new("ctrl-enter", RunQuery, Some("QueriDocument > Input")),
             KeyBinding::new("ctrl-shift-c", CancelQuery, Some("QueriDocument")),
@@ -147,6 +164,8 @@ impl Document {
         let grid = cx.new(|cx| {
             TableState::new(Grid::new(Arc::new(ResultSet::default())), window, cx)
                 .cell_selectable(true)
+                .range_selectable(true)
+                .loop_selection(false)
         });
         let mut subscriptions = vec![
             cx.subscribe_in(&grid, window, |this, _, event: &GridEvent, window, cx| {
@@ -211,14 +230,32 @@ impl Document {
             warn_destructive: true,
             editor_height: default_editor_height(),
             query_number: 1,
+            saved_query: None,
+            formatting: false,
             subscriptions,
         }
     }
 
     pub fn title(&self) -> String {
         match &self.kind {
-            DocumentKind::Sql { .. } => format!("Query {}", self.query_number),
+            DocumentKind::Sql { .. } => self
+                .saved_query
+                .as_ref()
+                .map(|q| q.name.clone())
+                .unwrap_or_else(|| format!("Query {}", self.query_number)),
             DocumentKind::Table { table, .. } => format!("{}.{}", table.schema, table.name),
+        }
+    }
+    pub fn relationship(&self) -> Option<&RelationshipScope> {
+        match &self.kind {
+            DocumentKind::Table { options, .. } => options.relationship.as_ref(),
+            _ => None,
+        }
+    }
+    pub fn set_relationship(&mut self, scope: Option<RelationshipScope>) {
+        if let DocumentKind::Table { options, .. } = &mut self.kind {
+            options.relationship = scope;
+            options.offset = 0;
         }
     }
     pub fn table_ref(&self) -> Option<&TableRef> {
@@ -229,6 +266,8 @@ impl Document {
     }
     pub fn draft(&self, cx: &App) -> Draft {
         Draft {
+            relationship: self.relationship().cloned(),
+            saved_query: self.saved_query.clone(),
             connection_id: self.profile.id,
             database: self.profile.database(),
             query_number: self.table_ref().is_none().then_some(self.query_number),
@@ -482,6 +521,7 @@ impl Document {
                 }
                 _ => None,
             };
+            state.clear_selection(cx);
             state.refresh(cx);
             state.clear_selection(cx);
             cx.notify();
@@ -642,10 +682,211 @@ impl Document {
         cx.notify();
     }
 
+    fn related_rows(&mut self, incoming: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let DocumentKind::Table {
+            table,
+            page: Some(page),
+            section: Section::Data,
+            ..
+        } = &self.kind
+        else {
+            return;
+        };
+        let Some(index) = self.selected_row(cx) else {
+            return;
+        };
+        let Some(row) = page.data.rows.get(index).cloned() else {
+            return;
+        };
+        let columns = page.data.columns.clone();
+        let table = table.clone();
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        self.operation = Operation::Running;
+        self.status = "Loading relationships…".into();
+        task(
+            &self.services,
+            window,
+            cx,
+            async move { session.foreign_keys(table, incoming).await },
+            move |this, result, window, cx| {
+                this.operation = Operation::Idle;
+                match result {
+                    Err(e) => this.error = format!("Could not load relationships: {e:#}"),
+                    Ok(keys) => {
+                        let scopes: Vec<_> = keys
+                            .into_iter()
+                            .filter_map(|key| {
+                                let values: Option<Vec<_>> = key
+                                    .columns
+                                    .iter()
+                                    .map(|pair| {
+                                        let name =
+                                            if incoming { &pair.target } else { &pair.source };
+                                        columns
+                                            .iter()
+                                            .position(|c| c == name)
+                                            .and_then(|i| row.get(i).cloned())
+                                            .filter(|v| !matches!(v, Cell::Null))
+                                    })
+                                    .collect();
+                                values.map(|values| RelationshipScope {
+                                    key,
+                                    incoming,
+                                    values,
+                                })
+                            })
+                            .collect();
+                        if scopes.is_empty() {
+                            this.status =
+                                "No relationships with a complete key for this row.".into();
+                        } else {
+                            this.status.clear();
+                            let view = cx.entity().downgrade();
+                            window.open_dialog(cx,move |dialog,_,cx| {
+                                dialog.title(if incoming {"Find referencing rows"} else {"Open referenced row"})
+                                    .child(v_flex().gap_3()
+                                        .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Opens a separate table tab. Uncommitted changes in this tab are not visible there."))
+                                        .child(v_flex().id("relationships").max_h(px(360.)).overflow_y_scroll().gap_2()
+                                            .children(scopes.iter().enumerate().map(|(index,scope)| {
+                                                let view=view.clone();let scope=scope.clone();
+                                                let names=scope.key.columns.iter().map(|p|format!("{} → {}",p.source,p.target)).collect::<Vec<_>>().join(", ");
+                                                Button::new(("relationship",index)).label(format!("{}.{} · {} · {names}",scope.destination().schema,scope.destination().name,scope.key.name))
+                                                    .on_click(move |_,window,cx| {
+                                                        window.close_dialog(cx);
+                                                        let _=view.update(cx,|_,cx|cx.emit(OpenRelated(scope.clone())));
+                                                    })
+                                            }))))
+                            });
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        );
+        cx.notify();
+    }
+
+    fn cell_selection(&self, cx: &App) -> Option<crate::export::Selection> {
+        let state = self.grid.read(cx);
+        let ((r1, c1), (r2, c2)) = state.selected_range()?;
+        let skip = usize::from(state.delegate().checkable);
+        if c2 < skip {
+            return None;
+        }
+        Some(crate::export::Selection {
+            rows: (r1..=r2).collect(),
+            columns: (c1.max(skip) - skip..=c2 - skip).collect(),
+        })
+    }
+
+    fn copy_cells(&mut self, format: crate::export::Format, headers: bool, cx: &mut Context<Self>) {
+        let Some(selection) = self.cell_selection(cx) else {
+            return;
+        };
+        let data = &self.grid.read(cx).delegate().data;
+        if format == crate::export::Format::Tsv
+            && !headers
+            && selection.rows.len() == 1
+            && selection.columns.len() == 1
+        {
+            if let Some(cell) = data
+                .rows
+                .get(selection.rows[0])
+                .and_then(|r| r.get(selection.columns[0]))
+            {
+                cx.write_to_clipboard(ClipboardItem::new_string(cell.text()));
+            }
+            return;
+        }
+        let mut bytes = Vec::new();
+        match crate::export::serialize(data, &selection, format, headers, "\\N", &mut bytes)
+            .and_then(|()| Ok(String::from_utf8(bytes)?))
+        {
+            Ok(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+            Err(error) => self.error = format!("Could not copy selection: {error:#}"),
+        }
+        cx.notify();
+    }
+
+    fn export(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.grid.read(cx);
+        let grid = state.delegate();
+        let data = grid.data.clone();
+        let rows: Vec<_> = if grid.checked.is_empty() {
+            state.selected_row().into_iter().collect()
+        } else {
+            grid.checked.iter().copied().collect()
+        };
+        let selected_rows = (!rows.is_empty()).then(|| crate::export::Selection {
+            rows,
+            columns: (0..data.columns.len()).collect(),
+        });
+        let cells = self.cell_selection(cx);
+        super::export_dialog::open(
+            self.services.clone(),
+            data,
+            selected_rows,
+            cells,
+            window,
+            cx,
+        );
+    }
+
+    fn data_actions(&self, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .gap_1()
+            .child(
+                Button::new("export-data")
+                    .ghost()
+                    .small()
+                    .label("Export…")
+                    .disabled(self.grid.read(cx).delegate().data.columns.is_empty())
+                    .on_click(cx.listener(|this, _, window, cx| this.export(window, cx))),
+            )
+            .child(
+                icon_button("copy-selection", IconName::Copy, "Copy selected cells")
+                    .disabled(self.cell_selection(cx).is_none())
+                    .dropdown_menu({
+                        let view = cx.entity();
+                        move |menu, _, cx| {
+                            view.update(cx, |_, cx| {
+                                menu.item(menu_item("Copy cells", IconName::Copy).on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.copy_cells(crate::export::Format::Tsv, false, cx)
+                                    }),
+                                ))
+                                .item(menu_item("Copy with headers", IconName::Copy).on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.copy_cells(crate::export::Format::Tsv, true, cx)
+                                    }),
+                                ))
+                                .item(
+                                    menu_item("Copy as JSON", IconName::Copy).on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.copy_cells(crate::export::Format::Json, true, cx)
+                                        }),
+                                    ),
+                                )
+                            })
+                        }
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn selected_row(&self, cx: &App) -> Option<usize> {
         let grid = self.grid.read(cx);
         if grid.delegate().checked.len() == 1 {
             return grid.delegate().checked.first().copied();
+        }
+        if grid.delegate().checked.is_empty()
+            && grid
+                .selected_range()
+                .is_some_and(|(start, end)| start.0 != end.0)
+        {
+            return None;
         }
         grid.selected_row()
             .or_else(|| grid.selected_cell().map(|(row, _)| row))
@@ -660,11 +901,35 @@ impl Document {
             return;
         };
         let columns = &grid.delegate().data.columns;
-        let text = if let Some((_, col)) = grid.selected_cell() {
-            row.get(col.saturating_sub(usize::from(grid.delegate().checkable)))
-                .map(Cell::text)
-                .unwrap_or_default()
-        } else {
+        if let Some((_, col)) = grid.selected_cell() {
+            let index = col.saturating_sub(usize::from(grid.delegate().checkable));
+            if let Some(cell) = row.get(index) {
+                super::cell_inspector::open(
+                    self.services.clone(),
+                    cell.clone(),
+                    columns
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| "Cell contents".into()),
+                    match &self.kind {
+                        DocumentKind::Table {
+                            page: Some(page),
+                            section: Section::Data,
+                            ..
+                        } => page
+                            .metadata
+                            .columns
+                            .get(index)
+                            .map(|c| c.data_type.clone()),
+                        _ => None,
+                    },
+                    window,
+                    cx,
+                );
+            }
+            return;
+        }
+        let text = {
             columns
                 .iter()
                 .zip(row)
@@ -1063,9 +1328,185 @@ impl Document {
         }
     }
 
+    fn format_sql(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.formatting {
+            return;
+        }
+        let DocumentKind::Sql { editor } = &self.kind else {
+            return;
+        };
+        let editor = editor.clone();
+        let original = editor.read(cx).value().to_string();
+        let selection = editor.read(cx).selected_range();
+        let range = if selection.is_empty() {
+            0..original.len()
+        } else {
+            selection.clone()
+        };
+        let input = original[range.clone()].to_owned();
+        let dialect = if matches!(self.profile.config, ConnectionConfig::Sqlite { .. }) {
+            sql::SqlDialect::Sqlite
+        } else {
+            sql::SqlDialect::Postgres
+        };
+        self.formatting = true;
+        self.error.clear();
+        task(
+            &self.services,
+            window,
+            cx,
+            async move { tokio::task::spawn_blocking(move || sql::format_sql(&input, dialect)).await? },
+            move |this, result, window, cx| {
+                this.formatting = false;
+                match result {
+                    Ok(formatted) => {
+                        if editor.read(cx).value().as_ref() != original
+                            || editor.read(cx).selected_range() != selection
+                        {
+                            this.status =
+                                "SQL changed while formatting. Format again to apply it.".into();
+                        } else if original[range.clone()] != formatted {
+                            editor.update(cx, |editor, cx| {
+                                editor.set_selected_range(range.clone(), cx);
+                                editor.replace(formatted.clone(), window, cx);
+                                if !selection.is_empty() {
+                                    editor.set_selected_range(
+                                        range.start..range.start + formatted.len(),
+                                        cx,
+                                    );
+                                }
+                            });
+                            cx.emit(DocumentChanged);
+                            this.status = "SQL formatted · Undo to restore".into();
+                        } else {
+                            this.status = "SQL is already formatted".into();
+                        }
+                    }
+                    Err(e) => this.error = format!("{e:#}"),
+                }
+                cx.notify();
+            },
+        );
+        cx.notify();
+    }
+
+    fn save_query(&mut self, new: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let sql = self.draft(cx).sql;
+        let mut query = self
+            .saved_query
+            .clone()
+            .filter(|_| !new)
+            .unwrap_or_else(|| SavedQuery {
+                id: uuid::Uuid::new_v4(),
+                name: String::new(),
+                sql: String::new(),
+                favorite: false,
+                connection_id: Some(self.profile.id),
+                database: self.profile.database(),
+                revision: 0,
+            });
+        query.sql = sql;
+        query.connection_id = Some(self.profile.id);
+        query.database = self.profile.database();
+        let form = super::saved_queries::edit(self.services.clone(), query, window, cx);
+        self.subscriptions.push(cx.subscribe_in(
+            &form,
+            window,
+            |this, _, event: &super::saved_queries::QuerySaved, _, cx| {
+                this.saved_query = Some(event.0.clone());
+                cx.emit(DocumentChanged);
+                cx.notify();
+            },
+        ));
+    }
+
+    fn sql_file(&mut self, import: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let sql = self.draft(cx).sql;
+        if import {
+            let receiver = cx.prompt_for_paths(PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: false,
+                prompt: Some("Open SQL file".into()),
+            });
+            cx.spawn_in(window, async move |view, cx| {
+                let result = receiver.await;
+                let _ = view.update_in(cx, |this, window, cx| {
+                    match result {
+                        Ok(Ok(Some(paths))) => {
+                            if let Some(path) = paths.into_iter().next() {
+                                task(
+                                    &this.services,
+                                    window,
+                                    cx,
+                                    async move {
+                                        Ok(tokio::task::spawn_blocking(move || {
+                                            std::fs::read_to_string(path)
+                                        })
+                                        .await??)
+                                    },
+                                    |this, result, _, cx| {
+                                        match result {
+                                            Ok(sql) => cx.emit(OpenSqlFile(sql)),
+                                            Err(e) => {
+                                                this.error =
+                                                    format!("Could not open UTF-8 SQL file: {e:#}")
+                                            }
+                                        }
+                                        cx.notify();
+                                    },
+                                );
+                            }
+                        }
+                        Ok(Err(e)) => this.error = format!("Could not open file picker: {e}"),
+                        _ => {}
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        } else {
+            let receiver = cx.prompt_for_new_path(std::path::Path::new("."), Some("query.sql"));
+            cx.spawn_in(window, async move |view, cx| {
+                let result = receiver.await;
+                let _ = view.update_in(cx, |this, window, cx| {
+                    match result {
+                        Ok(Ok(Some(path))) => task(
+                            &this.services,
+                            window,
+                            cx,
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    crate::export::atomic_write(&path, |file| {
+                                        use std::io::Write;
+                                        file.write_all(sql.as_bytes())?;
+                                        Ok(())
+                                    })
+                                })
+                                .await?
+                            },
+                            |this, result, _, cx| {
+                                match result {
+                                    Ok(()) => this.status = "SQL file saved".into(),
+                                    Err(e) => this.error = format!("Could not save SQL: {e:#}"),
+                                };
+                                cx.notify();
+                            },
+                        ),
+                        Ok(Err(e)) => this.error = format!("Could not open file picker: {e}"),
+                        _ => {}
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
     fn query_actions(&self, cx: &mut Context<Self>) -> AnyElement {
         let selection = matches!(&self.kind, DocumentKind::Sql { editor } if !editor.read(cx).selected_value().trim().is_empty());
         h_flex()
+            .flex_wrap()
             .gap_2()
             .child(
                 Button::new("run-query")
@@ -1086,6 +1527,56 @@ impl Document {
                     .on_click(cx.listener(|this, _, window, cx| this.run(window, cx))),
             )
             .child(shortcut("Ctrl ↵", cx))
+            .child(
+                Button::new("format-sql")
+                    .ghost()
+                    .small()
+                    .label(if self.formatting {
+                        "Formatting…"
+                    } else if selection {
+                        "Format selection"
+                    } else {
+                        "Format SQL"
+                    })
+                    .disabled(self.formatting)
+                    .tooltip("Format SQL · Ctrl+Shift+F")
+                    .on_click(cx.listener(|this, _, window, cx| this.format_sql(window, cx))),
+            )
+            .child(
+                Button::new("save-query")
+                    .ghost()
+                    .small()
+                    .label(if self.saved_query.is_some() {
+                        "Save changes…"
+                    } else {
+                        "Save query…"
+                    })
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.save_query(false, window, cx)),
+                    ),
+            )
+            .child(
+                icon_button("query-files", IconName::Ellipsis, "Query actions").dropdown_menu({
+                    let view = cx.entity();
+                    move |menu, _, cx| {
+                        view.update(cx, |_, cx| {
+                            menu.item(menu_item("Save as new query…", IconName::Plus).on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.save_query(true, window, cx)
+                                }),
+                            ))
+                            .item(menu_item("Open SQL file…", IconName::Folder).on_click(
+                                cx.listener(|this, _, window, cx| this.sql_file(true, window, cx)),
+                            ))
+                            .item(
+                                menu_item("Save SQL file…", IconName::File).on_click(cx.listener(
+                                    |this, _, window, cx| this.sql_file(false, window, cx),
+                                )),
+                            )
+                        })
+                    }
+                }),
+            )
             .when(
                 matches!(self.operation, Operation::Running | Operation::Cancelling),
                 |bar| {
@@ -1179,6 +1670,7 @@ impl Document {
                 )
             })
             .child(div().flex_1())
+            .child(self.data_actions(cx))
             .child(
                 h_flex()
                     .id("query-status")
@@ -1387,6 +1879,25 @@ impl Document {
             .flex_shrink_0()
             .px_4()
             .pb_2()
+            .when_some(options.relationship.as_ref(), |view, scope| {
+                view.child(
+                    h_flex()
+                        .gap_2()
+                        .flex_wrap()
+                        .child(div().text_sm().child(scope.label()))
+                        .child(
+                            Button::new("clear-relationship")
+                                .ghost()
+                                .small()
+                                .label("Clear relationship filter")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_relationship(None);
+                                    cx.emit(DocumentChanged);
+                                    this.refresh(window, cx);
+                                })),
+                        ),
+                )
+            })
             .child(
                 h_flex()
                     .gap_3()
@@ -1443,59 +1954,26 @@ impl Document {
                                         cx.listener(|this, _, window, cx| this.refresh(window, cx)),
                                     ),
                                 )
-                                .when(selected > 0, |row| {
-                                    row.child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(format!("{selected} selected")),
-                                    )
-                                    .child(
-                                        Button::new("edit")
-                                            .ghost()
-                                            .icon(IconName::Pencil)
-                                            .label("Edit")
-                                            .tooltip("Edit row · Ctrl+E")
-                                            .disabled(
-                                                !editable
-                                                    || selected != 1
-                                                    || self.selected_row(cx).is_none(),
-                                            )
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.edit_row(false, window, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("delete")
-                                            .danger()
-                                            .icon(IconName::Trash)
-                                            .label("Delete")
-                                            .tooltip("Delete selected rows")
-                                            .disabled(
-                                                !editable
-                                                    || (self.selected_row(cx).is_none()
-                                                        && self
-                                                            .grid
-                                                            .read(cx)
-                                                            .delegate()
-                                                            .checked
-                                                            .is_empty()),
-                                            )
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.delete_rows(window, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("inspect-cell")
-                                            .ghost()
-                                            .icon(IconName::ScanText)
-                                            .label("Inspect")
-                                            .tooltip("Inspect cell · Alt+Enter")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.inspect(window, cx)
-                                            })),
-                                    )
-                                })
+                                .child(self.data_actions(cx))
+                                .child(Button::new("row-actions").ghost().label("Row actions")
+                                    .tooltip(format!("{selected} selected · Edit: Ctrl+E · Inspect: Alt+Enter"))
+                                    .disabled(self.busy() || selected==0)
+                                    .dropdown_menu({
+                                        let view=cx.entity();
+                                        move |menu,_,cx| view.update(cx,|_,cx| menu
+                                            .item(menu_item("Inspect",IconName::ScanText).disabled(selected!=1)
+                                                .on_click(cx.listener(|this,_,window,cx|this.inspect(window,cx))))
+                                            .item(menu_item("Edit row…",IconName::Pencil).disabled(!editable || selected!=1)
+                                                .on_click(cx.listener(|this,_,window,cx|this.edit_row(false,window,cx))))
+                                            .separator()
+                                            .item(menu_item("Open referenced row…",IconName::ArrowRight).disabled(selected!=1)
+                                                .on_click(cx.listener(|this,_,window,cx|this.related_rows(false,window,cx))))
+                                            .item(menu_item("Find referencing rows…",IconName::Search).disabled(selected!=1)
+                                                .on_click(cx.listener(|this,_,window,cx|this.related_rows(true,window,cx))))
+                                            .separator()
+                                            .item(super::controls::destructive_menu_item(if selected==1 {"Delete row…".to_owned()} else {format!("Delete {selected} rows…")},!editable)
+                                                .on_click(cx.listener(|this,_,window,cx|this.delete_rows(window,cx)))))
+                                    }))
                                 .child(
                                     Button::new("insert")
                                         .icon(IconName::Plus)
@@ -1888,6 +2366,8 @@ impl Render for Document {
                     && self.grid.read(cx).delegate().data.rows.is_empty(),
                 |view| view.track_focus(&self.grid.read(cx).focus_handle(cx)),
             )
+            .on_action(cx.listener(|this, _: &FormatSql, window, cx| this.format_sql(window,cx)))
+            .on_action(cx.listener(|this, _: &CopyCells, _, cx| this.copy_cells(crate::export::Format::Tsv, false,cx)))
             .on_action(cx.listener(|this, _: &RunQuery, window, cx| this.run(window, cx)))
             .on_action(cx.listener(|this, _: &CancelQuery, window, cx| this.cancel(window, cx)))
             .on_action(cx.listener(|this, _: &Refresh, window, cx| this.refresh(window, cx)))

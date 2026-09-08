@@ -82,6 +82,7 @@ fn sqlite_metadata_filter_sort_pagination_and_exact_values() -> Result<()> {
                         predicate: FilterPredicate::Contains("al".into()),
                     }),
                     sort: Some(("quantity".into(), true)),
+                    relationship: None,
                 },
             )
             .await?;
@@ -236,6 +237,7 @@ async fn filter_workflows(session: &Session, schema: &str) -> Result<()> {
                     predicate: StartsWith("al".into()),
                 }),
                 sort: Some(("id".into(), true)),
+                relationship: None,
             },
         )
         .await?;
@@ -683,6 +685,85 @@ fn postgres_database_lifecycle_and_auth_failure() -> Result<()> {
                 force: false,
             })
             .await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn sqlite_relationship_navigation_preserves_composite_keys_and_affinity() -> Result<()> {
+    runtime()?.block_on(async {
+        let session=Session::connect(sqlite_profile(":memory:".into()),String::new()).await?;
+        session.query("CREATE TABLE parent(code TEXT COLLATE NOCASE, tenant INTEGER, PRIMARY KEY(tenant,code));
+            CREATE TABLE child(id INTEGER PRIMARY KEY, t TEXT, c TEXT, FOREIGN KEY(t,c) REFERENCES parent);
+            INSERT INTO parent VALUES('Alpha',1),('Beta',2);
+            INSERT INTO child VALUES(1,'01','alpha'),(2,'2','Beta'),(3,NULL,'Alpha');".into()).await?;
+        let child=TableRef{schema:"main".into(),name:"child".into(),kind:RelationKind::Table};
+        let keys=session.foreign_keys(child.clone(),false).await?;
+        assert_eq!(keys.len(),1);
+        assert_eq!(keys[0].columns[0].target,"tenant");
+        let outgoing=RelationshipScope { key:keys[0].clone(),incoming:false,values:vec![Cell::Text("01".into()),Cell::Text("alpha".into())] };
+        let result=session.browse(outgoing.destination().clone(),BrowseOptions{relationship:Some(outgoing),..page()}).await?;
+        assert_eq!(result.total,1);assert_eq!(result.data.rows[0][0],Cell::Text("Alpha".into()));
+        let incoming=RelationshipScope {key:keys[0].clone(),incoming:true,values:vec![Cell::Integer(1),Cell::Text("Alpha".into())]};
+        let result=session.browse(child.clone(),BrowseOptions{relationship:Some(incoming.clone()),..page()}).await?;
+        assert_eq!(result.total,1);assert_eq!(result.data.rows[0][0],Cell::Integer(1));
+        let filtered=session.browse(child.clone(),BrowseOptions{relationship:Some(incoming),filter:Some(TableFilter{column:"id".into(),predicate:FilterPredicate::Equals("2".into())}),..page()}).await?;
+        assert_eq!(filtered.total,0);
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires disposable PostgreSQL"]
+fn postgres_relationship_navigation_uses_native_key_types() -> Result<()> {
+    runtime()?.block_on(async {
+        let (profile,password)=postgres_profile()?;
+        let session=Session::connect(profile,password).await?;
+        let schema=format!("relations_{}",Uuid::new_v4().simple());
+        session.query(format!("CREATE SCHEMA {schema};
+            CREATE TABLE {schema}.parent(id uuid, tenant integer, PRIMARY KEY(tenant,id));
+            CREATE TABLE {schema}.child(id integer PRIMARY KEY,t bigint,p uuid,FOREIGN KEY(t,p) REFERENCES {schema}.parent(tenant,id));
+            INSERT INTO {schema}.parent VALUES('12345678-1234-1234-1234-123456789abc',1);
+            INSERT INTO {schema}.child VALUES(1,1,'12345678-1234-1234-1234-123456789abc'),(2,NULL,NULL);")).await?;
+        let child=TableRef{schema:schema.clone(),name:"child".into(),kind:RelationKind::Table};
+        let keys=session.foreign_keys(child.clone(),false).await?;
+        assert_eq!(keys.len(),1);
+        let scope=RelationshipScope{key:keys[0].clone(),incoming:false,values:vec![Cell::Text("1".into()),Cell::Text("12345678-1234-1234-1234-123456789abc".into())]};
+        let result=session.browse(scope.destination().clone(),BrowseOptions{relationship:Some(scope.clone()),..page()}).await?;
+        assert_eq!(result.total,1);
+        let incoming=RelationshipScope{incoming:true,..scope};
+        assert_eq!(session.browse(child,BrowseOptions{relationship:Some(incoming),..page()}).await?.total,1);
+        session.query(format!("DROP SCHEMA {schema} CASCADE")).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn sqlite_formatted_sql_executes_equivalently() -> Result<()> {
+    runtime()?.block_on(async {
+        let session = fixture().await?;
+        for sql in [
+            "SELECT name, row_number() OVER (ORDER BY id) FROM items WHERE quantity > 10;",
+            "WITH x(n) AS (VALUES(1),(2)) SELECT sum(n), 'é', x'00ff' FROM x;",
+        ] {
+            let formatted = queri::sql::format_sql(sql, queri::sql::SqlDialect::Sqlite)?;
+            assert_eq!(
+                session.query(sql.into()).await?.sets[0].rows,
+                session.query(formatted).await?.sets[0].rows
+            );
+        }
+        Ok(())
+    })
+}
+#[test]
+#[ignore = "requires disposable PostgreSQL"]
+fn postgres_formatted_sql_executes_equivalently() -> Result<()> {
+    runtime()?.block_on(async {
+        let (profile,password)=postgres_profile()?;
+        let session=Session::connect(profile,password).await?;
+        let sql="WITH x AS (SELECT 1 AS n) SELECT n::numeric, $body$ SELECT 'hello'; $body$, '{\"name\":\"Alice\"}'::jsonb->>'name' FROM x;";
+        let formatted=queri::sql::format_sql(sql,queri::sql::SqlDialect::Postgres)?;
+        assert_eq!(session.query(sql.into()).await?.sets[0].rows,session.query(formatted).await?.sets[0].rows);
         Ok(())
     })
 }

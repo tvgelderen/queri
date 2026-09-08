@@ -148,6 +148,18 @@ impl Session {
         }
     }
 
+    pub async fn foreign_keys(&self, table: TableRef, incoming: bool) -> Result<Vec<ForeignKey>> {
+        match &self.backend {
+            Backend::Postgres(pg) => {
+                postgres::foreign_keys(&*pg.client.lock().await, &table, incoming).await
+            }
+            Backend::Sqlite { .. } => {
+                self.with_sqlite(move |conn| sqlite::foreign_keys(conn, &table, incoming))
+                    .await
+            }
+        }
+    }
+
     pub async fn browse(&self, table: TableRef, options: BrowseOptions) -> Result<TablePage> {
         anyhow::ensure!(
             (1..=1000).contains(&options.limit),

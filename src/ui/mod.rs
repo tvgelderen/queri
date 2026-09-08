@@ -1,12 +1,15 @@
 mod admin;
+mod cell_inspector;
 mod connection_form;
 mod connection_picker;
 mod controls;
 mod document;
 mod document_tabs;
+mod export_dialog;
 mod grid;
 mod history;
 mod row_editor;
+mod saved_queries;
 mod table_finder;
 mod theme;
 mod workspace;

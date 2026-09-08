@@ -197,7 +197,7 @@ pub async fn browse(
         .filter
         .as_ref()
         .and_then(|filter| filter.predicate.value());
-    let filter = match &options.filter {
+    let mut filter = match &options.filter {
         Some(filter) => {
             let column = filter.validate(&metadata, false)?;
             let name = quote_identifier(&column.name)?;
@@ -248,6 +248,19 @@ pub async fn browse(
         }
         None => String::new(),
     };
+    let relation = match &options.relationship {
+        Some(scope) => Some(relationship_predicate(client, table, scope, params.len() + 1).await?),
+        None => None,
+    };
+    if let Some((predicate, value)) = &relation {
+        params.push(value);
+        filter.push_str(if filter.is_empty() {
+            " WHERE "
+        } else {
+            " AND "
+        });
+        filter.push_str(predicate);
+    }
     let sort = browse_ordering(&metadata, &options.sort)?;
     let count: i64 = client
         .query_one(
@@ -496,4 +509,146 @@ pub async fn database_action(client: &Client, action: DatabaseAction) -> Result<
     };
     client.batch_execute(&sql).await?;
     Ok(())
+}
+
+pub async fn foreign_keys(
+    client: &Client,
+    table: &TableRef,
+    incoming: bool,
+) -> Result<Vec<ForeignKey>> {
+    let rows = client
+        .query(
+            "SELECT con.oid::text,con.conname,ns.nspname,src.relname,nt.nspname,dst.relname,
+        a.attname,b.attname FROM pg_constraint con
+        JOIN pg_class src ON src.oid=con.conrelid JOIN pg_namespace ns ON ns.oid=src.relnamespace
+        JOIN pg_class dst ON dst.oid=con.confrelid JOIN pg_namespace nt ON nt.oid=dst.relnamespace
+        CROSS JOIN LATERAL unnest(con.conkey,con.confkey) WITH ORDINALITY AS k(s,t,ord)
+        JOIN pg_attribute a ON a.attrelid=src.oid AND a.attnum=k.s
+        JOIN pg_attribute b ON b.attrelid=dst.oid AND b.attnum=k.t
+        WHERE con.contype='f' AND
+        (CASE WHEN $3 THEN nt.nspname ELSE ns.nspname END)=$1 AND
+        (CASE WHEN $3 THEN dst.relname ELSE src.relname END)=$2
+        ORDER BY con.oid,k.ord",
+            &[&table.schema, &table.name, &incoming],
+        )
+        .await?;
+    let mut keys: Vec<ForeignKey> = vec![];
+    for row in rows {
+        let id: String = row.get(0);
+        if keys.last().is_none_or(|key| key.id != id) {
+            keys.push(ForeignKey {
+                id,
+                name: row.get(1),
+                source: TableRef {
+                    schema: row.get(2),
+                    name: row.get(3),
+                    kind: RelationKind::Table,
+                },
+                target: TableRef {
+                    schema: row.get(4),
+                    name: row.get(5),
+                    kind: RelationKind::Table,
+                },
+                columns: vec![],
+            });
+        }
+        if let Some(key) = keys.last_mut() {
+            key.columns.push(ForeignKeyColumn {
+                source: row.get(6),
+                target: row.get(7),
+            });
+        }
+    }
+    Ok(keys)
+}
+
+async fn relationship_predicate(
+    client: &Client,
+    table: &TableRef,
+    scope: &RelationshipScope,
+    parameter: usize,
+) -> Result<(String, String)> {
+    let origin = if scope.incoming {
+        &scope.key.target
+    } else {
+        &scope.key.source
+    };
+    let keys = foreign_keys(client, origin, scope.incoming).await?;
+    ensure!(
+        scope.destination() == table && keys.contains(&scope.key),
+        "This relationship changed or was removed. Open it again from the source table."
+    );
+    ensure!(
+        scope.values.len() == scope.key.columns.len()
+            && !scope.values.iter().any(|v| matches!(v, Cell::Null)),
+        "The relationship key is incomplete."
+    );
+    let operators = client
+        .query(
+            "SELECT ns.nspname,op.oprname,cn.nspname,coll.collname FROM pg_constraint con
+        CROSS JOIN LATERAL unnest(con.conpfeqop,con.confkey) WITH ORDINALITY AS k(op,attnum,ord)
+        JOIN pg_operator op ON op.oid=k.op JOIN pg_namespace ns ON ns.oid=op.oprnamespace
+        JOIN pg_attribute a ON a.attrelid=con.confrelid AND a.attnum=k.attnum
+        LEFT JOIN pg_collation coll ON coll.oid=a.attcollation
+        LEFT JOIN pg_namespace cn ON cn.oid=coll.collnamespace
+        WHERE con.oid::text=$1 ORDER BY k.ord",
+            &[&scope.key.id],
+        )
+        .await?;
+    ensure!(
+        operators.len() == scope.values.len(),
+        "The relationship changed."
+    );
+    let mut values = serde_json::Map::new();
+    let mut predicates = vec![];
+    for ((column, value), operator) in scope.key.columns.iter().zip(&scope.values).zip(operators) {
+        let (name, left, right) = if scope.incoming {
+            (
+                &column.target,
+                format!("queri_key.{}", quote_identifier(&column.target)?),
+                format!(
+                    "{}.{}",
+                    qualified(&table.schema, &table.name)?,
+                    quote_identifier(&column.source)?
+                ),
+            )
+        } else {
+            (
+                &column.source,
+                format!(
+                    "{}.{}",
+                    qualified(&table.schema, &table.name)?,
+                    quote_identifier(&column.target)?
+                ),
+                format!("queri_key.{}", quote_identifier(&column.source)?),
+            )
+        };
+        let collation_namespace: Option<String> = operator.get(2);
+        let collation_name: Option<String> = operator.get(3);
+        let left = match (collation_namespace, collation_name) {
+            (Some(namespace), Some(name)) => {
+                format!("({left} COLLATE {})", qualified(&namespace, &name)?)
+            }
+            _ => left,
+        };
+        values.insert(name.clone(), serde_json::Value::String(value.text()));
+        let namespace: String = operator.get(0);
+        let op: String = operator.get(1);
+        ensure!(
+            !op.is_empty() && op.chars().all(|c| "+-*/<>=~!@#%^&|?".contains(c)),
+            "Unsupported foreign-key operator."
+        );
+        predicates.push(format!(
+            "{left} OPERATOR({}.{op}) {right}",
+            quote_identifier(&namespace)?
+        ));
+    }
+    Ok((
+        format!(
+            "EXISTS (SELECT 1 FROM json_populate_record(NULL::{},${parameter}::text::json) AS queri_key WHERE {})",
+            qualified(&origin.schema, &origin.name)?,
+            predicates.join(" AND ")
+        ),
+        serde_json::Value::Object(values).to_string(),
+    ))
 }

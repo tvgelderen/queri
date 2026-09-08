@@ -12,14 +12,20 @@ use gpui::{
 };
 use gpui_base::TestSupportExt as _;
 
+gpui::actions!(table_range, [ExtendUp, ExtendDown, ExtendLeft, ExtendRight]);
+
 const CONTEXT: &'static str = "DataTable";
 pub(super) fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("escape", Cancel, Some(CONTEXT)),
         KeyBinding::new("up", SelectUp, Some(CONTEXT)),
+        KeyBinding::new("shift-up", ExtendUp, Some(CONTEXT)),
         KeyBinding::new("down", SelectDown, Some(CONTEXT)),
+        KeyBinding::new("shift-down", ExtendDown, Some(CONTEXT)),
         KeyBinding::new("left", SelectPrevColumn, Some(CONTEXT)),
+        KeyBinding::new("shift-left", ExtendLeft, Some(CONTEXT)),
         KeyBinding::new("right", SelectNextColumn, Some(CONTEXT)),
+        KeyBinding::new("shift-right", ExtendRight, Some(CONTEXT)),
         KeyBinding::new("home", SelectFirst, Some(CONTEXT)),
         KeyBinding::new("end", SelectLast, Some(CONTEXT)),
         KeyBinding::new("pageup", SelectPageUp, Some(CONTEXT)),
@@ -218,6 +224,10 @@ where
             .on_action(window.listener_for(&self.state, TableState::action_select_last_column))
             .on_action(window.listener_for(&self.state, TableState::action_select_page_up))
             .on_action(window.listener_for(&self.state, TableState::action_select_page_down))
+            .on_action(window.listener_for(&self.state, TableState::extend_up))
+            .on_action(window.listener_for(&self.state, TableState::extend_down))
+            .on_action(window.listener_for(&self.state, TableState::extend_left))
+            .on_action(window.listener_for(&self.state, TableState::extend_right))
             .bg(cx.theme().tokens.table)
             .when(bordered, |this| {
                 this.rounded(cx.theme().radius)

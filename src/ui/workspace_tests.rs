@@ -886,6 +886,8 @@ async fn missing_passwords_prompt_before_connecting_and_on_document_retry(cx: &m
                         Preferences {
                             active_connection: Some(profile.id),
                             drafts: vec![Draft {
+                                relationship: None,
+                                saved_query: None,
                                 connection_id: profile.id,
                                 database: "postgres".into(),
                                 sql: "SELECT 'retained draft'".into(),
@@ -1381,5 +1383,196 @@ async fn postgres_contextual_database_lifecycle_retains_drafts(cx: &mut TestAppC
         let doc = workspace.read(cx).documents[0].read(cx);
         assert!(doc.session.is_none());
         assert_eq!(doc.draft(cx).sql, "SELECT 'preserved draft';");
+    });
+}
+
+#[gpui_kit::test]
+async fn saved_library_sql_files_and_related_tabs_keep_work_separate(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("shop.sqlite");
+    let database = rusqlite::Connection::open(&path).unwrap();
+    database
+        .execute_batch(
+            "CREATE TABLE parent(id INTEGER PRIMARY KEY,name TEXT);
+        CREATE TABLE child(id INTEGER PRIMARY KEY,parent_id INTEGER REFERENCES parent(id));
+        INSERT INTO parent VALUES(1,'Alice'),(2,'Bob'); INSERT INTO child VALUES(10,1);",
+        )
+        .unwrap();
+    let profile = ConnectionProfile {
+        id: Uuid::new_v4(),
+        name: "Test".into(),
+        notes: String::new(),
+        color: String::new(),
+        remember_password: false,
+        config: ConnectionConfig::Sqlite {
+            path,
+            read_only: false,
+            create: false,
+            wal: true,
+            foreign_keys: true,
+        },
+    };
+    let store = Store::open(directory.path().join("app.db")).unwrap();
+    store.save_profile(&profile).unwrap();
+    let query = store
+        .save_query(&SavedQuery {
+            id: Uuid::new_v4(),
+            name: "Never execute on open".into(),
+            sql: "CREATE TABLE never_run(id INTEGER);".into(),
+            favorite: true,
+            connection_id: Some(profile.id),
+            database: profile.database(),
+            revision: 0,
+        })
+        .unwrap();
+    let services = Services::new(runtime().unwrap(), store.clone());
+    let (window, workspace) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(800.), px(700.)),
+                    cx,
+                ))),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                cx.new(|cx| {
+                    Workspace::new(
+                        services,
+                        Preferences {
+                            active_connection: Some(profile.id),
+                            ..Default::default()
+                        },
+                        vec![profile.clone()],
+                        window,
+                        cx,
+                    )
+                })
+            },
+        )
+        .unwrap()
+    });
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace.read(cx).connection_state == ConnectionState::Ready
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("saved-queries", cx);
+    })
+    .unwrap();
+    let open_id = gpui_kit::SharedString::from(format!("open-{}", query.id));
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.try_find(open_id.clone()).is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| window.click(open_id.clone(), cx))
+        .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace
+            .read(cx)
+            .documents
+            .last()
+            .is_some_and(|doc| !doc.read(cx).busy())
+    })
+    .await;
+    cx.update(|cx| {
+        let workspace = workspace.read(cx);
+        let doc = workspace.documents.last().unwrap().read(cx);
+        assert_eq!(doc.draft(cx).sql, query.sql);
+        assert_eq!(doc.saved_query.as_ref().map(|q| q.id), Some(query.id));
+    });
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='never_run'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    let file = directory.path().join("import.sql");
+    std::fs::write(&file, "SELECT 'imported';").unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.click("query-files", cx);
+        click_label(window, "Open SQL file…", cx);
+    })
+    .unwrap();
+    assert!(cx.did_prompt_for_paths());
+    cx.simulate_path_prompt_response(|_| Some(vec![file]));
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace
+            .read(cx)
+            .documents
+            .last()
+            .is_some_and(|doc| doc.read(cx).draft(cx).sql == "SELECT 'imported';")
+    })
+    .await;
+    let source = TableRef {
+        schema: "main".into(),
+        name: "child".into(),
+        kind: RelationKind::Table,
+    };
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |this, cx| {
+            this.open_table(profile.clone(), source, window, cx)
+        })
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        !workspace.read(cx).documents.last().unwrap().read(cx).busy()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("table-cell-0:2", cx);
+        window.click("row-actions", cx);
+        click_label(window, "Open referenced row…", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.try_find(("relationship", 0_usize)).is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click(("relationship", 0_usize), cx)
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace
+            .read(cx)
+            .documents
+            .last()
+            .is_some_and(|doc| doc.read(cx).relationship().is_some() && !doc.read(cx).busy())
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        let state = workspace.read(cx);
+        let target = state.documents.last().unwrap().read(cx);
+        assert_eq!(target.table_ref().unwrap().name, "parent");
+        let draft = target.draft(cx);
+        let restored: Draft =
+            serde_json::from_str(&serde_json::to_string(&draft).unwrap()).unwrap();
+        assert_eq!(restored.relationship, target.relationship().cloned());
+        window.render_frame(cx);
+        window.click("clear-relationship", cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert!(
+            workspace
+                .read(cx)
+                .documents
+                .last()
+                .unwrap()
+                .read(cx)
+                .relationship()
+                .is_none()
+        )
     });
 }
