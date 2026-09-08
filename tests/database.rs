@@ -557,19 +557,6 @@ fn sql_warnings_ignore_literals_and_check_each_statement() {
     assert!(queri::sql::destructive("TRUNCATE a"));
 }
 
-#[test]
-#[ignore = "requires an unlocked desktop Secret Service"]
-fn secret_service_credential_round_trip() -> Result<()> {
-    let id = Uuid::new_v4();
-    assert_eq!(queri::storage::load_password(id)?, None);
-    queri::storage::save_password(id, "queri-disposable-test-secret")?;
-    let loaded = queri::storage::load_password(id)?;
-    queri::storage::delete_password(id)?;
-    assert_eq!(loaded.as_deref(), Some("queri-disposable-test-secret"));
-    assert_eq!(queri::storage::load_password(id)?, None);
-    Ok(())
-}
-
 fn postgres_profile() -> Result<(ConnectionProfile, String)> {
     let url = std::env::var("QUERI_TEST_POSTGRES").map_err(|_| {
         anyhow::anyhow!("Set QUERI_TEST_POSTGRES to a disposable PostgreSQL database.")

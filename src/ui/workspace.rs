@@ -7,13 +7,13 @@ use super::{
         brand_logo, brand_mark, destructive_menu_item, icon_button, menu_item, setting_switch,
         shortcut,
     },
-    document::{Document, DocumentChanged, NewDocumentQuery},
+    document::{ConnectionPasswordRequired, Document, DocumentChanged, NewDocumentQuery},
     document_tabs::{document_tab, document_tab_bar},
     history::{History, NewHistoryQuery, ReplayQuery},
     table_finder::{OpenTable, TableFinder},
     task,
 };
-use crate::{database::Session, model::*, storage};
+use crate::{database::Session, model::*};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::resizable::ResizableState;
 use gpui_kit::component::{
@@ -65,6 +65,14 @@ enum Node {
 struct DatabaseBranch {
     session: Arc<Session>,
     schemas: BTreeMap<String, Option<Vec<TableRef>>>,
+}
+
+enum ConnectionAttempt {
+    Connected {
+        password: String,
+        databases: Vec<String>,
+    },
+    PasswordRequired,
 }
 
 pub struct Workspace {
@@ -122,7 +130,10 @@ impl Workspace {
                 |this, _, event: &ConnectionPickerEvent, window, cx| match event {
                     ConnectionPickerEvent::Selected(id) => {
                         if this.selected != Some(*id)
-                            || this.connection_state == ConnectionState::Failed
+                            || matches!(
+                                this.connection_state,
+                                ConnectionState::Disconnected | ConnectionState::Failed
+                            )
                         {
                             this.activate(*id, window, cx);
                         }
@@ -336,6 +347,7 @@ impl Workspace {
         self.status = format!("Connecting to {}…", profile.name);
         self.error.clear();
         let cached = self.passwords.get(&id).cloned();
+        let store = self.services.store.clone();
         task(
             &self.services,
             window,
@@ -343,23 +355,41 @@ impl Workspace {
             async move {
                 let password = if let Some(password) = cached {
                     password
-                } else if profile.remember_password {
-                    tokio::task::spawn_blocking(move || storage::load_password(id))
-                        .await??
-                        .unwrap_or_default()
+                } else if matches!(profile.config, ConnectionConfig::Postgres { .. }) {
+                    let password = if profile.remember_password {
+                        match tokio::task::spawn_blocking(move || store.load_password(id)).await? {
+                            Ok(password) => password,
+                            Err(error) => {
+                                eprintln!("Could not load the connection password: {error:#}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let Some(password) = password else {
+                        return Ok(ConnectionAttempt::PasswordRequired);
+                    };
+                    password
                 } else {
                     String::new()
                 };
                 let session = Session::connect(profile, password.clone()).await?;
                 let databases = session.databases().await?;
-                Ok((password, databases))
+                Ok(ConnectionAttempt::Connected {
+                    password,
+                    databases,
+                })
             },
             move |this, result, window, cx| {
                 if this.generation != generation {
                     return;
                 }
                 match result {
-                    Ok((password, databases)) => {
+                    Ok(ConnectionAttempt::Connected {
+                        password,
+                        databases,
+                    }) => {
                         this.connection_state = ConnectionState::Ready;
                         this.passwords.insert(id, password.clone());
                         this.databases = databases;
@@ -377,6 +407,11 @@ impl Workspace {
                                 });
                             }
                         }
+                    }
+                    Ok(ConnectionAttempt::PasswordRequired) => {
+                        this.connection_state = ConnectionState::Disconnected;
+                        this.status = "Enter your password to reconnect".into();
+                        this.connection_form(this.selected_profile(), window, cx);
                     }
                     Err(error) => {
                         this.connection_state = ConnectionState::Failed;
@@ -655,7 +690,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let password = self.passwords.get(&profile.id).cloned().unwrap_or_default();
+        let password = self.passwords.get(&profile.id).cloned();
         let query_number = self
             .documents
             .iter()
@@ -675,13 +710,9 @@ impl Workspace {
                 cx,
             )
         });
-        doc.update(cx, |doc, cx| {
+        doc.update(cx, |doc, _| {
             doc.query_number = query_number;
             doc.warn_destructive = self.preferences.warn_destructive;
-            if connect {
-                doc.connect(window, cx);
-                doc.focus(window, cx);
-            }
         });
         self.subscriptions.push(cx.subscribe_in(
             &doc,
@@ -691,18 +722,29 @@ impl Workspace {
         self.subscriptions.push(cx.subscribe_in(
             &doc,
             window,
+            |this, doc, _: &ConnectionPasswordRequired, window, cx| {
+                this.activate(doc.read(cx).profile.id, window, cx);
+            },
+        ));
+        self.subscriptions.push(cx.subscribe_in(
+            &doc,
+            window,
             |this, doc, _: &NewDocumentQuery, window, cx| {
                 let profile = doc.read(cx).profile.clone();
                 this.add_document(profile, None, String::new(), true, window, cx);
             },
         ));
-        self.documents.push(doc);
+        self.documents.push(doc.clone());
         self.active = self.documents.len() - 1;
         if !self.history_docked(window) {
             self.history = None;
         }
         self.reveal_active_tab(window, cx);
         if connect {
+            doc.update(cx, |doc, cx| {
+                doc.connect(window, cx);
+                doc.focus(window, cx);
+            });
             self.schedule_save(window, cx);
         }
         cx.notify();
@@ -950,18 +992,12 @@ impl Workspace {
                     view.update(cx, |this, cx| {
                         let store = this.services.store.clone();
                         let id = profile.id;
-                        let remember_password = profile.remember_password;
                         task(
                             &this.services,
                             window,
                             cx,
                             async move {
-                                tokio::task::spawn_blocking(move || {
-                                    if remember_password {
-                                        storage::delete_password(id)?;
-                                    }
-                                    store.delete_profile(id)
-                                })
+                                tokio::task::spawn_blocking(move || store.delete_profile(id))
                                 .await?
                             },
                             move |this, result, window, cx| {

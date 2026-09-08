@@ -76,12 +76,14 @@ pub struct DocumentChanged;
 impl EventEmitter<DocumentChanged> for Document {}
 pub struct NewDocumentQuery;
 impl EventEmitter<NewDocumentQuery> for Document {}
+pub struct ConnectionPasswordRequired;
+impl EventEmitter<ConnectionPasswordRequired> for Document {}
 
 pub struct Document {
     pub profile: ConnectionProfile,
     pub session: Option<Arc<Session>>,
     services: Services,
-    password: String,
+    password: Option<String>,
     kind: DocumentKind,
     grid: Entity<TableState<Grid>>,
     results: Vec<Arc<ResultSet>>,
@@ -112,7 +114,7 @@ impl Document {
     pub fn new(
         services: Services,
         profile: ConnectionProfile,
-        password: String,
+        password: Option<String>,
         table: Option<TableRef>,
         sql: String,
         window: &mut Window,
@@ -242,11 +244,11 @@ impl Document {
         self.operation != Operation::Idle
     }
     pub fn set_password(&mut self, password: String) {
-        self.password = password;
+        self.password = Some(password);
     }
     pub fn reconfigure(&mut self, profile: &ConnectionProfile, password: String) {
         self.profile = profile.for_database(&self.profile.database());
-        self.password = password;
+        self.password = Some(password);
         self.session = None;
         self.database_available = true;
     }
@@ -276,11 +278,18 @@ impl Document {
         if self.busy() || !self.database_available {
             return;
         }
+        let password = match self.password.clone() {
+            Some(password) => password,
+            None if matches!(self.profile.config, ConnectionConfig::Postgres { .. }) => {
+                cx.emit(ConnectionPasswordRequired);
+                return;
+            }
+            None => String::new(),
+        };
         self.operation = Operation::Connecting;
         self.error.clear();
         self.status = "Connecting…".into();
         let profile = self.profile.clone();
-        let password = self.password.clone();
         task(
             &self.services,
             window,

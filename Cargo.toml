@@ -10,12 +10,13 @@ test-support = ["gpui-kit/test-support"]
 
 [dependencies]
 anyhow = "1"
+chacha20poly1305 = "0.11"
 chrono = "0.4"
 directories = "6"
 futures = "0.3"
 fallible-iterator = "0.3"
+getrandom = "0.4"
 gpui-kit = { version = "=0.8.1", features = ["tree-sitter-sql"] }
-keyring = { version = "=3.6.3", features = ["sync-secret-service", "crypto-rust"] }
 native-tls = "0.2"
 postgres-native-tls = "0.5"
 rusqlite = { version = "0.41", features = ["bundled"] }

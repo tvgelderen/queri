@@ -3,7 +3,7 @@ use super::{
     controls::{choice, disclosure_button, setting_switch},
     input, task,
 };
-use crate::{database::Session, model::*, storage};
+use crate::{database::Session, model::*};
 use anyhow::Result;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -48,7 +48,6 @@ pub struct ConnectionForm {
     wal: bool,
     foreign_keys: bool,
     remember: bool,
-    previously_remembered: bool,
     busy: bool,
     message: String,
     error: bool,
@@ -116,9 +115,6 @@ impl ConnectionForm {
             remember: existing
                 .as_ref()
                 .is_none_or(|profile| profile.remember_password),
-            previously_remembered: existing
-                .as_ref()
-                .is_some_and(|profile| profile.remember_password),
             busy: false,
             message: String::new(),
             error: false,
@@ -144,21 +140,24 @@ impl ConnectionForm {
                         state.update(cx, |state, cx| state.set_value(value, window, cx));
                     }
                     form.tls = tls;
+                    if let Some(password) = cached_password {
+                        form.password
+                            .update(cx, |state, cx| state.set_value(password, window, cx));
+                        return form;
+                    }
                     if !form.remember {
-                        if let Some(password) = cached_password {
-                            form.password
-                                .update(cx, |state, cx| state.set_value(password, window, cx));
-                        }
+                        form.message = "Enter your password to reconnect.".into();
                         return form;
                     }
                     let id = form.id;
+                    let store = form.services.store.clone();
                     form.busy = true;
                     task(
                         &form.services,
                         window,
                         cx,
                         async move {
-                            tokio::task::spawn_blocking(move || storage::load_password(id)).await?
+                            tokio::task::spawn_blocking(move || store.load_password(id)).await?
                         },
                         move |this, result, window, cx| {
                             this.busy = false;
@@ -167,15 +166,11 @@ impl ConnectionForm {
                                     .password
                                     .update(cx, |state, cx| state.set_value(password, window, cx)),
                                 Ok(None) => {
-                                    this.remember = false;
-                                    if let Some(password) = cached_password {
-                                        this.password.update(cx, |state, cx| {
-                                            state.set_value(password, window, cx)
-                                        });
-                                    }
+                                    this.message = "Enter your password again to reconnect.".into();
                                 }
                                 Err(error) => {
-                                    this.message = format!("{error:#}");
+                                    eprintln!("Could not load the connection password: {error:#}");
+                                    this.message = "Could not read the saved password. Enter it again; turn off Remember password if saving fails.".into();
                                     this.error = true;
                                 }
                             }
@@ -398,8 +393,6 @@ impl ConnectionForm {
         };
         let password = self.password.read(cx).value().to_string();
         let store = self.services.store.clone();
-        let remember = self.remember;
-        let previously_remembered = self.previously_remembered;
         let sqlite = self.sqlite;
         let creating = sqlite && self.create && !self.existing;
         self.busy = true;
@@ -425,14 +418,7 @@ impl ConnectionForm {
                     let profile_copy = profile.clone();
                     let password_copy = password.clone();
                     tokio::task::spawn_blocking(move || {
-                        if !sqlite {
-                            if remember {
-                                storage::save_password(profile_copy.id, &password_copy)?;
-                            } else if previously_remembered {
-                                storage::delete_password(profile_copy.id)?;
-                            }
-                        }
-                        store.save_profile(&profile_copy)
+                        store.save_connection(&profile_copy, &password_copy)
                     })
                     .await??;
                 } else {
@@ -452,9 +438,17 @@ impl ConnectionForm {
                         }
                     }
                     Err(error) => {
-                        this.message = format!(
-                            "Could not complete the connection. Check the connection details and file permissions, then retry. If you are remembering a password, check that your system keyring is unlocked.\n\n{error:#}"
-                        );
+                        this.message = if save {
+                            eprintln!("Could not save the connection: {error:#}");
+                            if this.sqlite || !this.remember {
+                                "Could not save the connection. Check file permissions and retry."
+                                    .into()
+                            } else {
+                                "Could not save the connection. Check file permissions, or turn off Remember password and retry.".into()
+                            }
+                        } else {
+                            format!("Connection test failed.\n\n{error:#}")
+                        };
                         this.error = true;
                     }
                 }
@@ -651,7 +645,7 @@ impl Render for ConnectionForm {
                 })
                 .child(setting_switch(
                     "remember",
-                    "Remember password in system keyring",
+                    "Remember password",
                     self.remember,
                     cx.listener(|this, on, _, cx| {
                         this.remember = *on;
@@ -776,9 +770,9 @@ impl Render for ConnectionForm {
                         } else {
                             cx.theme().muted_foreground
                         })
-                        .child(h_flex().gap_2()
-                            .child(Icon::new(if self.error { IconName::CircleAlert } else if self.busy { IconName::RefreshCw } else { IconName::Check }).small())
-                            .child(self.message.clone())),
+                        .child(h_flex().items_start().gap_2()
+                            .child(div().flex_shrink_0().child(Icon::new(if self.error { IconName::CircleAlert } else if self.busy { IconName::RefreshCw } else { IconName::Check }).small()))
+                            .child(div().flex_1().min_w_0().whitespace_normal().child(self.message.clone()))),
                 )
             })
     }

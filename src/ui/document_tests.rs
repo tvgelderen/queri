@@ -77,7 +77,7 @@ impl Fixture {
                         let mut doc = Document::new(
                             self.services.clone(),
                             self.profile.clone(),
-                            String::new(),
+                            None,
                             table,
                             String::new(),
                             window,

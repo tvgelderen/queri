@@ -9,7 +9,7 @@ Requires Rust 1.97 or newer, a Linux desktop (Wayland or X11), and an OpenGL/Vul
 On Debian/Ubuntu, install the build dependencies:
 
 ```sh
-sudo apt install build-essential clang cmake pkg-config libssl-dev libdbus-1-dev \
+sudo apt install build-essential clang cmake pkg-config libssl-dev \
   libfontconfig1-dev libfreetype6-dev libwayland-dev libxkbcommon-dev \
   libxkbcommon-x11-dev libxcb1-dev libxcb-xkb-dev libvulkan1 libegl1 \
   desktop-file-utils
@@ -18,7 +18,7 @@ cargo run --locked
 
 On Arch Linux: `base-devel clang cmake pkgconf openssl dbus fontconfig freetype2 wayland libxkbcommon libxkbcommon-x11 libxcb vulkan-icd-loader mesa desktop-file-utils`.
 
-Remembered PostgreSQL passwords require an unlocked Secret Service provider, such as GNOME Keyring or KWallet. Turn off **Remember password** to use a password only for the current application session.
+**Remember password** saves PostgreSQL passwords encrypted locally and reconnects automatically, without a desktop keyring or master password. **Test connection** checks database access without saving. Turn off **Remember password** to keep the entered password only for the current application session.
 
 The native file picker uses `xdg-desktop-portal` and your desktop's file-chooser backend (for example, `xdg-desktop-portal-gtk`). You can also enter a SQLite path directly.
 
@@ -55,7 +55,11 @@ SQL results are limited to **10,000 rows / 32 MiB per script** and marked when t
 
 ## Storage
 
-Application data lives in `$XDG_DATA_HOME/queri/queri.sqlite3` (normally `~/.local/share/queri/queri.sqlite3`). Set `QUERI_DATA_DIR` to choose another directory. Connection metadata, preferences, drafts, and SQL history are stored locally. Passwords are stored separately in Secret Service under `dev.queri.Queri`. SQL text itself may contain sensitive values and is retained in drafts/history.
+Application data lives in `$XDG_DATA_HOME/queri/queri.sqlite3` (normally `~/.local/share/queri/queri.sqlite3`). Set `QUERI_DATA_DIR` to choose another directory. Connection metadata, preferences, drafts, and SQL history are stored locally. Remembered passwords use XChaCha20-Poly1305 encryption in the same database, with a random key in `queri.sqlite3.key` beside it. The key file has owner-only permissions (`0600`). Anyone who can read both files can decrypt the passwords. SQL text itself may contain sensitive values and is retained in drafts/history.
+
+Back up both the database and its `.key` file to restore remembered passwords. Losing or damaging the key makes those passwords unrecoverable; Queri will not replace it while saved passwords remain. Restore the original key, or turn off **Remember password** for the affected connections to remove their saved passwords. Connections can also be removed without the key. If a damaged key file remains after all saved passwords are removed, delete that file before remembering passwords again.
+
+Connections saved by older desktop versions retain their settings, drafts, and history. Enter previously remembered passwords once after updating. Queri no longer accesses desktop-keyring entries and leaves them untouched.
 
 This desktop rewrite uses fresh storage. The former web application's `data/` and `.env` files are not imported.
 
@@ -89,4 +93,4 @@ The archive contains the release binary, desktop launcher, icon, and a user-loca
 
 ## Code
 
-`src/database/` owns database I/O and mutations; `src/storage.rs` owns application persistence and credentials; `src/ui/` owns GPUI views and UI-thread completions. Tokio handles PostgreSQL I/O and dispatches SQLite/keyring work to blocking workers. GPUI Kit is pinned to `0.8.1`; `Cargo.lock` pins its GPUI snapshot and the remaining dependencies. `vendor/README.md` documents the pinned Linux renderer and shared-dialog patches for true backdrop blur.
+`src/database/` owns database I/O and mutations; `src/storage.rs` owns application persistence and credentials; `src/ui/` owns GPUI views and UI-thread completions. Tokio handles PostgreSQL I/O and dispatches SQLite and credential storage to blocking workers. GPUI Kit is pinned to `0.8.1`; `Cargo.lock` pins its GPUI snapshot and the remaining dependencies. `vendor/README.md` documents the pinned Linux renderer and shared-dialog patches for true backdrop blur.

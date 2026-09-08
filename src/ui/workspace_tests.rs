@@ -848,9 +848,161 @@ async fn sidebar_retry_recovers_after_dismissing_the_connection_error(cx: &mut T
 }
 
 #[gpui_kit::test]
-#[ignore = "requires QUERI_TEST_POSTGRES with CREATEDB"]
-async fn postgres_contextual_database_lifecycle_retains_drafts(cx: &mut TestAppContext) {
+async fn missing_passwords_prompt_before_connecting_and_on_document_retry(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
+    for previously_saved in [false, true] {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = Store::open(directory.path().join("app.db")).expect("store");
+        let profile = ConnectionProfile {
+            id: Uuid::new_v4(),
+            name: "Needs a password".into(),
+            notes: String::new(),
+            color: String::new(),
+            remember_password: true,
+            config: ConnectionConfig::Postgres {
+                host: "127.0.0.1".into(),
+                port: 9,
+                database: "postgres".into(),
+                user: "postgres".into(),
+                tls: TlsMode::Disable,
+                timeout_seconds: 1,
+            },
+        };
+        if previously_saved {
+            store
+                .save_connection(&profile, "saved before losing the key")
+                .expect("save password");
+            std::fs::remove_file(directory.path().join("app.db.key")).expect("remove key");
+        } else {
+            store.save_profile(&profile).expect("legacy connection");
+        }
+        let services = Services::new(runtime().expect("runtime"), store.clone());
+        let (window, workspace) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    Workspace::new(
+                        services,
+                        Preferences {
+                            active_connection: Some(profile.id),
+                            drafts: vec![Draft {
+                                connection_id: profile.id,
+                                database: "postgres".into(),
+                                sql: "SELECT 'retained draft'".into(),
+                                query_number: None,
+                                table: None,
+                                editor_height: 260.,
+                            }],
+                            ..Default::default()
+                        },
+                        vec![profile.clone()],
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .expect("workspace")
+        });
+        cx.wait_for(window, Duration::from_secs(5), |window, cx| {
+            workspace.read(cx).connection_state == ConnectionState::Disconnected
+                && window
+                    .try_find("save-connection")
+                    .is_some_and(|button| button.disabled() != Some(true))
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| {
+            assert!(workspace.read(cx).passwords.is_empty());
+            assert!(workspace.read(cx).error.is_empty());
+            assert!(
+                workspace
+                    .read(cx)
+                    .documents
+                    .iter()
+                    .all(|doc| !doc.read(cx).busy() && doc.read(cx).session.is_none())
+            );
+            assert_eq!(window.find("remember").checked(), Some(true));
+            window.click("cancel-connection", cx);
+        })
+        .expect("request re-entry without attempting an empty password");
+        cx.wait_for(window, Duration::from_secs(5), |window, _| {
+            window.try_find("save-connection").is_none()
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| window.click("reconnect", cx))
+            .expect("retry restored query");
+        cx.wait_for(window, Duration::from_secs(5), |window, cx| {
+            workspace.read(cx).connection_state == ConnectionState::Disconnected
+                && window
+                    .try_find("save-connection")
+                    .is_some_and(|button| button.disabled() != Some(true))
+        })
+        .await;
+        cx.update_window(window, |_, _, cx| {
+            assert!(
+                workspace
+                    .read(cx)
+                    .documents
+                    .iter()
+                    .all(|doc| !doc.read(cx).busy() && doc.read(cx).session.is_none())
+            );
+        })
+        .expect("document retry also requests the password");
+        if previously_saved {
+            cx.update_window(window, |_, window, cx| {
+                click_label(window, "Password", cx);
+                window.input("re-entered password", cx);
+                window.click("Connection name", cx);
+                window.press("ctrl-a", cx);
+                window.input("Recovered connection", cx);
+                window.click("save-connection", cx);
+            })
+            .expect("try saving after losing the key");
+            cx.wait_for(window, Duration::from_secs(5), |window, _| {
+                window
+                    .try_find("save-connection")
+                    .is_some_and(|button| button.disabled() != Some(true))
+            })
+            .await;
+            assert_eq!(
+                store.profiles().expect("rolled-back profile")[0].name,
+                "Needs a password"
+            );
+            assert!(store.load_password(profile.id).is_err());
+            cx.update_window(window, |_, window, cx| {
+                window.click("remember", cx);
+                window.click("save-connection", cx);
+            })
+            .expect("recover by removing the saved password");
+            cx.wait_for(window, Duration::from_secs(5), |window, cx| {
+                workspace.read(cx).connection_state == ConnectionState::Failed
+                    && window.try_find("save-connection").is_none()
+            })
+            .await;
+            assert_eq!(
+                store.load_password(profile.id).expect("removed credential"),
+                None
+            );
+            assert_eq!(
+                store.profiles().expect("saved profile")[0].name,
+                "Recovered connection"
+            );
+            cx.update(|cx| {
+                assert_eq!(
+                    workspace
+                        .read(cx)
+                        .passwords
+                        .get(&profile.id)
+                        .map(String::as_str),
+                    Some("re-entered password")
+                );
+            });
+        }
+        cx.update_window(window, |_, window, _| window.remove_window())
+            .expect("close workspace");
+    }
+}
+
+fn postgres_test_profile() -> (ConnectionProfile, String) {
     let config = std::env::var("QUERI_TEST_POSTGRES")
         .expect("PostgreSQL test URL")
         .parse::<tokio_postgres::Config>()
@@ -861,21 +1013,201 @@ async fn postgres_contextual_database_lifecycle_retains_drafts(cx: &mut TestAppC
     };
     let password =
         String::from_utf8(config.get_password().unwrap_or_default().to_vec()).expect("password");
-    let profile = ConnectionProfile {
-        id: Uuid::new_v4(),
-        name: "Test PostgreSQL".into(),
-        notes: String::new(),
-        color: String::new(),
-        remember_password: false,
-        config: ConnectionConfig::Postgres {
-            host,
-            port: config.get_ports().first().copied().unwrap_or(5432),
-            database: config.get_dbname().unwrap_or("postgres").into(),
-            user: config.get_user().unwrap_or("postgres").into(),
-            tls: TlsMode::Disable,
-            timeout_seconds: 5,
+    (
+        ConnectionProfile {
+            id: Uuid::new_v4(),
+            name: "Test PostgreSQL".into(),
+            notes: String::new(),
+            color: String::new(),
+            remember_password: false,
+            config: ConnectionConfig::Postgres {
+                host,
+                port: config.get_ports().first().copied().unwrap_or(5432),
+                database: config.get_dbname().unwrap_or("postgres").into(),
+                user: config.get_user().unwrap_or("postgres").into(),
+                tls: TlsMode::Disable,
+                timeout_seconds: 5,
+            },
         },
-    };
+        password,
+    )
+}
+
+#[gpui_kit::test]
+#[ignore = "requires QUERI_TEST_POSTGRES"]
+async fn postgres_remembered_password_reconnects_after_restart_and_remember_off(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let (mut profile, password) = postgres_test_profile();
+    profile.remember_password = true;
+    let directory = tempfile::tempdir().expect("directory");
+    let path = directory.path().join("app.db");
+    let store = Store::open(&path).expect("store");
+    store
+        .save_profile(&profile)
+        .expect("legacy connection without a local password");
+    let services = Services::new(runtime().expect("runtime"), store.clone());
+    let (window, workspace) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workspace::new(
+                    services.clone(),
+                    Preferences {
+                        active_connection: Some(profile.id),
+                        ..Default::default()
+                    },
+                    vec![profile.clone()],
+                    window,
+                    cx,
+                )
+            })
+        })
+        .expect("workspace")
+    });
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window
+            .try_find("save-connection")
+            .is_some_and(|button| button.disabled() != Some(true))
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        click_label(window, "Password", cx);
+        window.input(&password, cx);
+        window.click("test-connection", cx);
+    })
+    .expect("test the re-entered password");
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window
+            .try_find("test-connection")
+            .is_some_and(|button| button.disabled() != Some(true))
+    })
+    .await;
+    assert_eq!(
+        store.load_password(profile.id).expect("unsaved password"),
+        None
+    );
+    assert!(!directory.path().join("app.db.key").exists());
+    cx.update_window(window, |_, window, cx| window.click("save-connection", cx))
+        .expect("save and connect");
+    cx.wait_for(window, Duration::from_secs(5), |window, cx| {
+        workspace.read(cx).connection_state == ConnectionState::Ready
+            && window.try_find("save-connection").is_none()
+    })
+    .await;
+    assert_eq!(
+        store.load_password(profile.id).expect("saved password"),
+        Some(password.clone())
+    );
+    let preferences = cx.update(|cx| workspace.read(cx).snapshot(cx));
+    store
+        .save_preferences(&preferences)
+        .expect("save workspace");
+    cx.update_window(window, |_, window, _| window.remove_window())
+        .expect("close application window");
+    drop(workspace);
+    drop(services);
+    drop(store);
+
+    let store = Store::open(&path).expect("reopen store");
+    let services = Services::new(runtime().expect("fresh runtime"), store.clone());
+    let (window, workspace) = cx.update(|cx| {
+        gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workspace::new(
+                    services.clone(),
+                    store.preferences().expect("preferences"),
+                    store.profiles().expect("profiles"),
+                    window,
+                    cx,
+                )
+            })
+        })
+        .expect("restart workspace")
+    });
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace.read(cx).connection_state == ConnectionState::Ready
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(
+            workspace.read(cx).passwords.get(&profile.id),
+            Some(&password)
+        );
+        assert!(window.try_find("save-connection").is_none());
+        std::fs::remove_file(directory.path().join("app.db.key"))
+            .expect("lose key while session is cached");
+        workspace.update(cx, |workspace, cx| {
+            workspace.connection_form(Some(profile.clone()), window, cx)
+        });
+        window.click("remember", cx);
+        window.click("save-connection", cx);
+    })
+    .expect("turn off remembering while retaining the cached password");
+    cx.wait_for(window, Duration::from_secs(5), |window, cx| {
+        workspace.read(cx).connection_state == ConnectionState::Ready
+            && window.try_find("save-connection").is_none()
+    })
+    .await;
+    assert_eq!(
+        store
+            .load_password(profile.id)
+            .expect("password removed without a key"),
+        None
+    );
+    assert!(!store.profiles().expect("profiles")[0].remember_password);
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(
+            workspace.read(cx).passwords.get(&profile.id),
+            Some(&password)
+        );
+        workspace.update(cx, |workspace, cx| {
+            workspace.activate(profile.id, window, cx)
+        });
+    })
+    .expect("reconnect using only the session password");
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace.read(cx).connection_state == ConnectionState::Ready
+    })
+    .await;
+    cx.update_window(window, |_, window, _| window.remove_window())
+        .expect("close session-only workspace");
+    drop(workspace);
+    drop(services);
+
+    let services = Services::new(runtime().expect("fresh runtime"), store.clone());
+    let (window, workspace) = cx.update(|cx| {
+        gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workspace::new(
+                    services,
+                    store.preferences().expect("preferences"),
+                    store.profiles().expect("profiles"),
+                    window,
+                    cx,
+                )
+            })
+        })
+        .expect("restart session-only workspace")
+    });
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.try_find("save-connection").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        assert!(workspace.read(cx).passwords.is_empty());
+        assert_eq!(window.find("remember").checked(), Some(false));
+        window.remove_window();
+    })
+    .expect("session-only password does not survive restart");
+}
+
+#[gpui_kit::test]
+#[ignore = "requires QUERI_TEST_POSTGRES with CREATEDB"]
+async fn postgres_contextual_database_lifecycle_retains_drafts(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (profile, password) = postgres_test_profile();
     let directory = tempfile::tempdir().expect("directory");
     let store = Store::open(directory.path().join("app.db")).expect("store");
     store.save_profile(&profile).expect("save profile");
