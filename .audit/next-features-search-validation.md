@@ -63,4 +63,13 @@ All final commands exited 0. The full script was rerun after final implementatio
 
 ## Limits
 
+Parent integration review found inconsistent contextual lowercasing of Greek
+sigma between the query and searched text. Added a regression asserting that
+case-insensitive search for `ΟΣ` finds identical text. It failed before the fix.
+Both sides now use per-character Unicode lowercasing. Parent reran
+`cargo test --locked --features test-support --lib search` (7 passed) and
+`cargo fmt --all -- --check` (passed). The independent review found no other
+actionable issues. The implementation worktree and temporary branch were removed
+after verifying the integrated commit has identical contents.
+
 Search interactions were validated through native GPUI event dispatch and state/focus/selection assertions, not static markup checks. No manual physical-desktop or search-specific pixel-layout review was performed. The existing real-GPU check validates shared dialogs, not every new search layout. Grid navigation counts cells; draft search intentionally caps broad results at 1,000. Unicode matching uses lowercase semantics, not language-specific collation. Existing SQL-editor/inspector search behavior remains GPUI's implementation.

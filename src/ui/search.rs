@@ -25,7 +25,7 @@ pub fn literal_ranges(
         folded.extend(ch.to_lowercase());
     }
     boundaries.push((folded.len(), text.len()));
-    let query = query.to_lowercase();
+    let query: String = query.chars().flat_map(char::to_lowercase).collect();
     folded
         .match_indices(&query)
         .filter_map(|(start, value)| {
@@ -46,6 +46,7 @@ mod tests {
     use super::*;
     #[test]
     fn literal_unicode_multiline_offsets() {
+        assert_eq!(literal_ranges("ΟΣ", "ΟΣ", false, 10), vec![0..4]);
         let text = "é İ\nÄ.* ä.*";
         assert_eq!(literal_ranges(text, "ä.*", false, 100), vec![6..10, 11..15]);
         assert_eq!(literal_ranges(text, "ä.*", true, 100), vec![11..15]);
