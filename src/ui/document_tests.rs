@@ -1336,3 +1336,108 @@ async fn transaction_completion_from_old_session_cannot_replace_reconnect_state(
         .block_on(fixture.session.query("ROLLBACK".into()))
         .unwrap();
 }
+
+#[gpui_kit::test]
+async fn statement_timeout_controls_outcome_history_and_reconnect(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(false, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("statement-timeout").label(),
+            Some("Timeout: inherit")
+        );
+        window.click("statement-timeout", cx);
+        window
+            .within("dropdown-menu:Name(\"statement-timeout\")")
+            .within("popup-menu")
+            .click(1_usize, cx);
+        assert_eq!(doc.read(cx).statement_timeout, StatementTimeout::NoTimeout);
+    })
+    .unwrap();
+    // Allow the menu's deferred dismissal to settle before opening it again.
+    cx.executor().timer(Duration::from_millis(100)).await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("statement-timeout", cx);
+        window.within("dropdown-menu:Name(\"statement-timeout\")").within("popup-menu").click(2_usize, cx);
+        let input = doc.read(cx).timeout_input.clone();
+        input.update(cx, |input, cx| input.set_value("200", window, cx));
+        window.click("ok", cx);
+        assert_eq!(doc.read(cx).statement_timeout, StatementTimeout::custom(200).unwrap());
+        assert_eq!(doc.read(cx).draft(cx).statement_timeout, StatementTimeout::custom(200).unwrap());
+        doc.update(cx, |doc, cx| {
+            doc.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n) SELECT sum(x) FROM n".into(), window, cx);
+            doc.set_timeout(StatementTimeout::NoTimeout, cx);
+            assert_eq!(doc.statement_timeout, StatementTimeout::custom(200).unwrap());
+        });
+    }).unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        !doc.read(cx).busy()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        assert!(matches!(
+            doc.read(cx).query_outcome,
+            super::QueryOutcome::TimedOut
+        ));
+        assert_eq!(doc.read(cx).status, "Statement timed out");
+        doc.update(cx, |doc, cx| {
+            doc.disconnect(cx);
+            doc.connect(window, cx);
+        });
+    })
+    .unwrap();
+    let history = fixture
+        .services
+        .store
+        .history(fixture.profile.id, "", 0)
+        .unwrap();
+    assert!(
+        history[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Statement timed out")
+    );
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        !doc.read(cx).busy()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(
+            doc.read(cx).statement_timeout,
+            StatementTimeout::custom(200).unwrap()
+        );
+        doc.update(cx, |doc, cx| doc.execute("SELECT 42".into(), window, cx));
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        !doc.read(cx).busy()
+    })
+    .await;
+    cx.update(|cx| {
+        assert!(matches!(
+            doc.read(cx).query_outcome,
+            super::QueryOutcome::Succeeded
+        ))
+    });
+}
+
+#[gpui_kit::test]
+async fn statement_timeout_settings_preserve_failed_transaction_recovery(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(false, cx);
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| {
+            doc.transaction = TransactionStatus::Failed;
+            doc.set_timeout(StatementTimeout::NoTimeout, cx);
+        });
+        window.render_frame(cx);
+        assert_eq!(doc.read(cx).statement_timeout, StatementTimeout::Inherit);
+        assert_eq!(doc.read(cx).transaction, TransactionStatus::Failed);
+        assert_eq!(window.find("statement-timeout").disabled(), Some(true));
+        assert_ne!(window.find("rollback-transaction").disabled(), Some(true));
+    })
+    .unwrap();
+}

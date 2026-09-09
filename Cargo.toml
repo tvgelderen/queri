@@ -19,7 +19,7 @@ getrandom = "0.4"
 gpui-kit = { version = "=0.8.1", features = ["tree-sitter-sql"] }
 native-tls = "0.2"
 postgres-native-tls = "0.5"
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled", "hooks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sqlparser = { version = "0.63", default-features = false, features = ["std"] }

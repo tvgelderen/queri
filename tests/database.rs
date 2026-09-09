@@ -1156,3 +1156,188 @@ fn postgres_transaction_disconnect_during_commit_is_unknown() -> Result<()> {
         Ok(())
     })
 }
+
+#[test]
+fn sqlite_statement_timeouts_recover_and_bound_lock_waits() -> Result<()> {
+    runtime()?.block_on(async {
+        let dir = tempfile::tempdir()?;
+        let profile = sqlite_profile(dir.path().join("timeouts.db"));
+        let session = Session::connect(profile.clone(), String::new()).await?;
+        let other = Session::connect(profile.clone(), String::new()).await?;
+        session.query("CREATE TABLE locked(id INTEGER); INSERT INTO locked VALUES(1)".into()).await?;
+        session.set_statement_timeout(StatementTimeout::custom(200)?)?;
+        let error = session.query("BEGIN; WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n) SELECT sum(x) FROM n".into()).await.unwrap_err();
+        assert!(queri::database::is_statement_timeout(&error), "{error:#}");
+        // A read interruption retains SQLite's real open transaction, not PostgreSQL's Failed state.
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Open);
+        session.query("ROLLBACK; SELECT 42".into()).await?;
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Idle);
+        let error = session.query("BEGIN; WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n) INSERT INTO locked SELECT x FROM n".into()).await.unwrap_err();
+        assert!(queri::database::is_statement_timeout(&error));
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Idle, "SQLite rolls back an interrupted write transaction");
+        other.query("BEGIN IMMEDIATE; UPDATE locked SET id=2".into()).await?;
+        let started = std::time::Instant::now();
+        let error = session.query("UPDATE locked SET id=3".into()).await.unwrap_err();
+        assert!(queri::database::is_statement_timeout(&error), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(3), "default five-second busy wait must not defeat deadline");
+        other.query("ROLLBACK".into()).await?;
+        session.query("UPDATE locked SET id=4; SELECT id FROM locked".into()).await?;
+        // No detached timer can interrupt the following work, and another tab keeps its policy.
+        other.query("SELECT 1".into()).await?;
+        session.set_statement_timeout(StatementTimeout::NoTimeout)?;
+        session.query("SELECT 1".into()).await?;
+        let reopened = Session::connect(profile, String::new()).await?;
+        reopened.set_statement_timeout(StatementTimeout::custom(200)?)?;
+        let error = reopened.query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n) SELECT sum(x) FROM n".into()).await.unwrap_err();
+        assert!(queri::database::is_statement_timeout(&error));
+        Ok(())
+    })
+}
+
+#[test]
+fn sqlite_statement_timeouts_reset_for_each_batch_statement() -> Result<()> {
+    runtime()?.block_on(async {
+        let session = Session::connect(sqlite_profile(":memory:".into()), String::new()).await?;
+        session.set_statement_timeout(StatementTimeout::custom(200)?)?;
+        let started = std::time::Instant::now();
+        let output = session.query("SELECT 1;".repeat(200_000)).await?;
+        assert!(started.elapsed() > Duration::from_millis(200));
+        assert_eq!(output.sets.len(), 200_000);
+        assert!(output.sets.last().unwrap().truncated);
+        session.query("SELECT 42".into()).await?;
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires QUERI_TEST_POSTGRES pointing at a disposable PostgreSQL database"]
+fn postgres_statement_timeouts_bind_batch_recovery_and_independent_sessions() -> Result<()> {
+    runtime()?.block_on(async {
+        let (profile, password) = postgres_profile()?;
+        let session = Session::connect(profile.clone(), password.clone()).await?;
+        let other = Session::connect(profile.clone(), password.clone()).await?;
+        let initial =
+            session.query("SHOW statement_timeout".into()).await?.sets[0].rows[0][0].clone();
+        session.set_statement_timeout(StatementTimeout::custom(200)?)?;
+        let error = session
+            .query_postgres_params(
+                "SELECT pg_sleep($1::double precision)".into(),
+                vec![Some("10".into())],
+            )
+            .await
+            .unwrap_err();
+        assert!(queri::database::is_statement_timeout(&error), "{error:#}");
+        let error = session
+            .query("SELECT sum(x::numeric) FROM generate_series(1, 1000000000) AS x".into())
+            .await
+            .unwrap_err();
+        assert!(queri::database::is_statement_timeout(&error));
+        other.query("SELECT pg_sleep(0.4)".into()).await?;
+        session.query("SELECT 42".into()).await?;
+        session.query("BEGIN; SAVEPOINT recover".into()).await?;
+        let error = session
+            .query("SELECT pg_sleep(10)".into())
+            .await
+            .unwrap_err();
+        assert!(queri::database::is_statement_timeout(&error));
+        assert_eq!(
+            session.transaction_status().await?,
+            TransactionStatus::Failed
+        );
+        session
+            .query("ROLLBACK TO SAVEPOINT recover; SELECT 1".into())
+            .await?;
+        assert_eq!(session.transaction_status().await?, TransactionStatus::Open);
+        session.set_statement_timeout(StatementTimeout::custom(300)?)?;
+        session.query("SELECT 1".into()).await?;
+        session.query("ROLLBACK".into()).await?;
+        assert_eq!(
+            session.query("SHOW statement_timeout".into()).await?.sets[0].rows[0][0].text(),
+            "300ms"
+        );
+        session.query("SET statement_timeout=0".into()).await?;
+        assert_eq!(
+            session.query("SHOW statement_timeout".into()).await?.sets[0].rows[0][0].text(),
+            "300ms"
+        );
+        session.set_statement_timeout(StatementTimeout::custom(1000)?)?;
+        session
+            .query("SELECT pg_sleep(0.6); SELECT pg_sleep(0.6); SELECT 42".into())
+            .await?;
+        assert_eq!(
+            other.query("SHOW statement_timeout".into()).await?.sets[0].rows[0][0],
+            initial
+        );
+        session.set_statement_timeout(StatementTimeout::NoTimeout)?;
+        assert_eq!(
+            session.query("SHOW statement_timeout".into()).await?.sets[0].rows[0][0].text(),
+            "0"
+        );
+        session.query("SELECT pg_sleep(0.3)".into()).await?;
+        session.set_statement_timeout(StatementTimeout::Inherit)?;
+        assert_eq!(
+            session.query("SHOW statement_timeout".into()).await?.sets[0].rows[0][0],
+            initial
+        );
+        let reopened = Session::connect(profile, password).await?;
+        reopened.set_statement_timeout(StatementTimeout::custom(200)?)?;
+        let error = reopened
+            .query("SELECT pg_sleep(10)".into())
+            .await
+            .unwrap_err();
+        assert!(queri::database::is_statement_timeout(&error));
+        // Session advisory locks are deterministic and avoid fixture table collisions.
+        other
+            .query("SELECT pg_advisory_lock(782394223)".into())
+            .await?;
+        let error = reopened
+            .query("BEGIN; SELECT pg_advisory_xact_lock(782394223)".into())
+            .await
+            .unwrap_err();
+        assert!(queri::database::is_statement_timeout(&error));
+        assert_eq!(
+            reopened.transaction_status().await?,
+            TransactionStatus::Failed
+        );
+        reopened.query("ROLLBACK".into()).await?;
+        other
+            .query("SELECT pg_advisory_unlock(782394223)".into())
+            .await?;
+        reopened
+            .query("SELECT pg_advisory_xact_lock(782394223); SELECT 1".into())
+            .await?;
+        assert_eq!(
+            reopened.transaction_status().await?,
+            TransactionStatus::Idle
+        );
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires QUERI_TEST_POSTGRES and role creation on the disposable cluster"]
+fn postgres_statement_timeout_inherit_restores_initial_role_policy() -> Result<()> {
+    runtime()?.block_on(async {
+        let (mut profile, password) = postgres_profile()?;
+        let admin = Session::connect(profile.clone(), password).await?;
+        let role = format!("queri_timeout_{}", Uuid::new_v4().simple());
+        admin.query(format!("CREATE ROLE {role} LOGIN PASSWORD 'timeout-fixture'; ALTER ROLE {role} SET statement_timeout='800ms'" )).await?;
+        if let ConnectionConfig::Postgres { user, .. } = &mut profile.config { *user = role.clone(); }
+        let result: Result<()> = async {
+            let session = Session::connect(profile, "timeout-fixture".into()).await?;
+            anyhow::ensure!(session.query("SHOW statement_timeout".into()).await?.sets[0].rows[0][0].text() == "800ms");
+            session.set_statement_timeout(StatementTimeout::NoTimeout)?;
+            session.query("SELECT pg_sleep(1.2)".into()).await?;
+            session.set_statement_timeout(StatementTimeout::custom(200)?)?;
+            anyhow::ensure!(session.query("SHOW statement_timeout".into()).await?.sets[0].rows[0][0].text() == "200ms");
+            session.set_statement_timeout(StatementTimeout::Inherit)?;
+            anyhow::ensure!(session.query("SHOW statement_timeout".into()).await?.sets[0].rows[0][0].text() == "800ms");
+            let error = session.query("SELECT pg_sleep(10)".into()).await.unwrap_err();
+            anyhow::ensure!(queri::database::is_statement_timeout(&error));
+            session.query("SELECT 1".into()).await?;
+            Ok(())
+        }.await;
+        admin.query(format!("DROP ROLE {role}")).await?;
+        result
+    })
+}

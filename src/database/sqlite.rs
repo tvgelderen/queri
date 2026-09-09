@@ -56,12 +56,107 @@ fn result(
     Ok(set)
 }
 
-pub fn query(conn: &Connection, sql: &str) -> Result<Vec<ResultSet>> {
+thread_local! {
+    // rusqlite's busy handler accepts a function pointer, so its deadline is worker-local.
+    static BUSY_DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+fn wait_for_lock(_: i32) -> bool {
+    BUSY_DEADLINE.with(|deadline| {
+        let Some(remaining) = deadline
+            .get()
+            .and_then(|end| end.checked_duration_since(std::time::Instant::now()))
+        else {
+            return false;
+        };
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+        true
+    })
+}
+
+struct Deadline<'a> {
+    conn: &'a mut Connection,
+    busy_ms: Option<u32>,
+}
+impl Drop for Deadline<'_> {
+    fn drop(&mut self) {
+        if let Some(busy_ms) = self.busy_ms {
+            let _ = self.conn.progress_handler(0, None::<fn() -> bool>);
+            let _ = self
+                .conn
+                .busy_timeout(std::time::Duration::from_millis(u64::from(busy_ms)));
+        }
+        BUSY_DEADLINE.with(|deadline| deadline.set(None));
+    }
+}
+
+pub fn query(
+    conn: &mut Connection,
+    sql: &str,
+    timeout: StatementTimeout,
+) -> Result<Vec<ResultSet>> {
+    let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let busy_ms = if timeout.duration().is_some() {
+        Some(conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?)
+    } else {
+        None
+    };
+    let scope = Deadline { conn, busy_ms };
+    if busy_ms.is_some() {
+        scope.conn.busy_handler(Some(wait_for_lock))?;
+        let expired = timed_out.clone();
+        scope.conn.progress_handler(
+            1000,
+            Some(move || {
+                let expired_now = BUSY_DEADLINE.with(|deadline| {
+                    deadline
+                        .get()
+                        .is_some_and(|end| std::time::Instant::now() >= end)
+                });
+                if expired_now {
+                    expired.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                expired_now
+            }),
+        )?;
+    }
+    let conn = &*scope.conn;
     let mut sets = vec![];
     let mut batch = rusqlite::Batch::new(conn, sql);
     let (mut bytes, mut count) = (0, 0);
-    while let Some(mut stmt) = batch.next()? {
-        sets.push(result(&mut stmt, &[], &mut bytes, &mut count)?);
+    loop {
+        let deadline = timeout
+            .duration()
+            .map(|duration| std::time::Instant::now() + duration);
+        BUSY_DEADLINE.with(|value| value.set(deadline));
+        let next = (|| -> Result<Option<ResultSet>> {
+            let Some(mut stmt) = batch.next()? else {
+                return Ok(None);
+            };
+            Ok(Some(result(&mut stmt, &[], &mut bytes, &mut count)?))
+        })();
+        match next {
+            Ok(Some(set)) => sets.push(set),
+            Ok(None) => break,
+            Err(error) => {
+                let lock_expired = error.downcast_ref::<rusqlite::Error>().is_some_and(|e| {
+                    matches!(
+                        e.sqlite_error_code(),
+                        Some(
+                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                        )
+                    )
+                }) && deadline
+                    .is_some_and(|end| std::time::Instant::now() >= end);
+                return Err(
+                    if timed_out.load(std::sync::atomic::Ordering::Relaxed) || lock_expired {
+                        error.context(super::StatementTimedOut)
+                    } else {
+                        error
+                    },
+                );
+            }
+        }
     }
     Ok(sets)
 }

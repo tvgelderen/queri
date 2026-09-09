@@ -13,6 +13,7 @@ pub struct Postgres {
     pub client: AsyncMutex<Client>,
     pub cancel: tokio_postgres::CancelToken,
     pub tls: MakeTlsConnector,
+    initial_timeout: String,
     driver: tokio::task::JoinHandle<()>,
 }
 
@@ -23,6 +24,39 @@ impl Drop for Postgres {
 }
 
 impl Postgres {
+    pub async fn apply_timeout(
+        &self,
+        client: &Client,
+        timeout: StatementTimeout,
+        sql: &str,
+    ) -> Result<()> {
+        // Rollback must never fail because of a preceding configuration query.
+        let command = sql.trim().trim_end_matches(';').trim();
+        if ["ROLLBACK", "ABORT"]
+            .iter()
+            .any(|control| command.eq_ignore_ascii_case(control))
+        {
+            return Ok(());
+        }
+        // Configuration SQL would fail before ROLLBACK / ROLLBACK TO could recover.
+        if client.transaction_status().await? == b'E' {
+            return Ok(());
+        }
+        let value = match timeout {
+            StatementTimeout::Inherit => self.initial_timeout.clone(),
+            StatementTimeout::NoTimeout => "0".into(),
+            StatementTimeout::Custom(ms) => ms.to_string(),
+        };
+        // Reapply on every submission: transaction rollback and manual SET can undo it.
+        client
+            .query_one(
+                "SELECT set_config('statement_timeout', $1, false)",
+                &[&value],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn connect(profile: &ConnectionProfile, password: &str) -> Result<Self> {
         let ConnectionConfig::Postgres {
             host,
@@ -70,10 +104,15 @@ impl Postgres {
             }
         });
         let cancel = client.cancel_token();
+        let initial_timeout: String = client
+            .query_one("SHOW statement_timeout", &[])
+            .await?
+            .get(0);
         Ok(Self {
             client: AsyncMutex::new(client),
             cancel,
             tls: connector,
+            initial_timeout,
             driver,
         })
     }

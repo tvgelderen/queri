@@ -165,6 +165,7 @@ fn version_one_migration_preserves_settings_drafts_and_history() -> Result<()> {
     let preferences = Preferences {
         active_connection: Some(profile.id),
         drafts: vec![Draft {
+            statement_timeout: StatementTimeout::Inherit,
             saved_query: None,
             relationship: None,
             connection_id: profile.id,
@@ -419,5 +420,32 @@ fn saved_queries_survive_connection_removal_and_database_rename() -> Result<()> 
     assert_eq!(queries.len(), 1);
     assert_eq!(queries[0].connection_id, None);
     assert_eq!(queries[0].sql, "SELECT 1");
+    Ok(())
+}
+
+#[test]
+fn statement_timeout_drafts_are_backward_compatible_and_persistent() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let store = Store::open(directory.path().join("app.db"))?;
+    let legacy = serde_json::json!({
+        "connection_id": uuid::Uuid::new_v4(), "database": "postgres", "sql": "SELECT 1"
+    });
+    let mut draft: Draft = serde_json::from_value(legacy)?;
+    assert_eq!(draft.statement_timeout, StatementTimeout::Inherit);
+    for timeout in [
+        StatementTimeout::Inherit,
+        StatementTimeout::NoTimeout,
+        StatementTimeout::custom(12345)?,
+    ] {
+        draft.statement_timeout = timeout;
+        store.save_preferences(&Preferences {
+            drafts: vec![draft.clone()],
+            ..Default::default()
+        })?;
+        assert_eq!(store.preferences()?.drafts[0].statement_timeout, timeout);
+    }
+    assert!(StatementTimeout::custom(0).is_err());
+    assert!(StatementTimeout::custom(u32::MAX).is_err());
+    assert!(serde_json::from_str::<StatementTimeout>(r#"{"Custom":0}"#).is_err());
     Ok(())
 }

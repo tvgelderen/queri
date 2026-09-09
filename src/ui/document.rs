@@ -82,6 +82,7 @@ enum QueryOutcome {
     Succeeded,
     Failed,
     Cancelled,
+    TimedOut,
 }
 
 pub struct DocumentChanged;
@@ -121,6 +122,8 @@ pub struct Document {
     pub editor_height: f32,
     pub query_number: u32,
     pub saved_query: Option<SavedQuery>,
+    pub statement_timeout: StatementTimeout,
+    timeout_input: Entity<InputState>,
     formatting: bool,
     subscriptions: Vec<Subscription>,
 }
@@ -253,6 +256,8 @@ impl Document {
             editor_height: default_editor_height(),
             query_number: 1,
             saved_query: None,
+            statement_timeout: StatementTimeout::Inherit,
+            timeout_input: cx.new(|cx| InputState::new(window, cx).placeholder("Milliseconds")),
             formatting: false,
             subscriptions,
         }
@@ -295,6 +300,7 @@ impl Document {
     }
     pub fn draft(&self, cx: &App) -> Draft {
         Draft {
+            statement_timeout: self.statement_timeout,
             relationship: self.relationship().cloned(),
             saved_query: self.saved_query.clone(),
             connection_id: self.profile.id,
@@ -389,6 +395,9 @@ impl Document {
                 this.operation = Operation::Idle;
                 match result {
                     Ok((session, state)) => {
+                        if let Err(error) = session.set_statement_timeout(this.statement_timeout) {
+                            this.error = error.to_string();
+                        }
                         this.session = Some(session);
                         this.observe_transaction(state, cx);
                         this.status = "Connected · ready".into();
@@ -652,6 +661,7 @@ impl Document {
         let store = self.services.store.clone();
         let profile = self.profile.clone();
         let generation = self.session_generation;
+        let timeout = self.statement_timeout;
         self.operation = Operation::Running;
         self.status = "Executing…".into();
         self.error.clear();
@@ -661,7 +671,10 @@ impl Document {
             cx,
             async move {
                 let start = Instant::now();
-                let result = session.query(sql.clone()).await;
+                let result = match session.set_statement_timeout(timeout) {
+                    Ok(()) => session.query(sql.clone()).await,
+                    Err(error) => Err(error),
+                };
                 let transaction = session
                     .transaction_status()
                     .await
@@ -713,7 +726,10 @@ impl Document {
                         this.update_grid(cx);
                     }
                     Ok((Err(error), _, _)) | Err(error) => {
-                        this.query_outcome = if cancelled {
+                        let timed_out = crate::database::is_statement_timeout(&error);
+                        this.query_outcome = if timed_out {
+                            QueryOutcome::TimedOut
+                        } else if cancelled {
                             QueryOutcome::Cancelled
                         } else {
                             QueryOutcome::Failed
@@ -721,7 +737,9 @@ impl Document {
                         this.error = format!(
                             "{error:#}\nReview your SQL and run it again when you are ready."
                         );
-                        this.status = if cancelled {
+                        this.status = if timed_out {
+                            "Statement timed out"
+                        } else if cancelled {
                             "Query cancelled"
                         } else {
                             "Query failed"
@@ -798,6 +816,61 @@ impl Document {
         cx.emit(ReconnectRequested);
     }
 
+    fn set_timeout(&mut self, timeout: StatementTimeout, cx: &mut Context<Self>) {
+        if self.busy() || self.transaction == TransactionStatus::Failed {
+            return;
+        }
+        self.statement_timeout = timeout;
+        cx.emit(DocumentChanged);
+        cx.notify();
+    }
+
+    fn timeout_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        let disabled = self.busy() || self.transaction == TransactionStatus::Failed;
+        let mode = match self.statement_timeout {
+            StatementTimeout::Inherit => 0,
+            StatementTimeout::NoTimeout => 1,
+            StatementTimeout::Custom(_) => 2,
+        };
+        h_flex().gap_2()
+            .child(choice(
+                Button::new("statement-timeout").small().label(match self.statement_timeout {
+                    StatementTimeout::Inherit => "Timeout: inherit".to_string(),
+                    StatementTimeout::NoTimeout => "Timeout: none".to_string(),
+                    StatementTimeout::Custom(ms) => format!("Timeout: {ms} ms"),
+                }).disabled(disabled)
+                .tooltip("Per statement. Inherit uses the initial connection policy; None removes the application limit. Server policies may still apply. Recover a failed transaction before changing this setting."),
+                mode,
+                [(0, "Inherit connection/server".into()), (1, "No application timeout".into()), (2, "Custom duration…".into())],
+                cx.listener(|this, mode, window, cx| {
+                    if this.busy() || this.transaction == TransactionStatus::Failed { return; }
+                    match mode {
+                        0 => this.set_timeout(StatementTimeout::Inherit, cx),
+                        1 => this.set_timeout(StatementTimeout::NoTimeout, cx),
+                        _ => {
+                            let value = match this.statement_timeout { StatementTimeout::Custom(ms) => ms.to_string(), _ => "30000".into() };
+                            this.timeout_input.update(cx, |input, cx| input.set_value(value, window, cx));
+                            let input = this.timeout_input.clone();
+                            let view = cx.entity().downgrade();
+                            window.open_alert_dialog(cx, move |dialog, _, _| {
+                                let input = input.clone();
+                                let view = view.clone();
+                                dialog.title("Statement timeout")
+                                    .child("Positive duration in milliseconds (maximum 2147483647). Applies separately to each statement.")
+                                    .child(Input::new(&input))
+                                    .button_props(DialogButtonProps::default().ok_text("Apply").show_cancel(true)).on_ok(move |_, _, cx| {
+                                        let timeout = input.read(cx).value().parse::<u32>().ok().and_then(|ms| StatementTimeout::custom(ms).ok());
+                                        let Some(timeout) = timeout else { return false; };
+                                        let _ = view.update(cx, |this, cx| this.set_timeout(timeout, cx));
+                                        true
+                                    })
+                            });
+                        }
+                    }
+                }),
+            )).into_any_element()
+    }
+
     fn transaction_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let label = match self.transaction {
             TransactionStatus::Idle => {
@@ -819,6 +892,7 @@ impl Document {
             .px_4()
             .pb_2()
             .gap_2()
+            .child(self.timeout_controls(cx))
             .flex_wrap()
             .child(
                 div()
@@ -1899,7 +1973,9 @@ impl Document {
                         } else {
                             match self.query_outcome {
                                 QueryOutcome::Succeeded => IconName::Check,
-                                QueryOutcome::Failed => IconName::CircleAlert,
+                                QueryOutcome::Failed | QueryOutcome::TimedOut => {
+                                    IconName::CircleAlert
+                                }
                                 QueryOutcome::Cancelled => IconName::Square,
                                 QueryOutcome::NotRun => IconName::Code,
                             }
@@ -1980,6 +2056,10 @@ impl Document {
                     "Query could not complete",
                     "Review the error below, adjust your SQL, and try again.",
                 ),
+                QueryOutcome::TimedOut => (
+                    "Statement timed out",
+                    "Adjust the timeout or SQL. Recover any failed transaction before continuing.",
+                ),
                 QueryOutcome::Cancelled => (
                     "Query cancelled",
                     "You can edit or run your query again when you are ready.",
@@ -1994,7 +2074,7 @@ impl Document {
             Operation::Idle => match self.query_outcome {
                 QueryOutcome::NotRun => IconName::Code,
                 QueryOutcome::Succeeded => IconName::Check,
-                QueryOutcome::Failed => IconName::CircleAlert,
+                QueryOutcome::Failed | QueryOutcome::TimedOut => IconName::CircleAlert,
                 QueryOutcome::Cancelled => IconName::Square,
             },
         };

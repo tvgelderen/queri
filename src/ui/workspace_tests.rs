@@ -886,6 +886,7 @@ async fn missing_passwords_prompt_before_connecting_and_on_document_retry(cx: &m
                         Preferences {
                             active_connection: Some(profile.id),
                             drafts: vec![Draft {
+                                statement_timeout: StatementTimeout::Inherit,
                                 relationship: None,
                                 saved_query: None,
                                 connection_id: profile.id,
@@ -1600,6 +1601,7 @@ async fn workspace_search_live_drafts_selects_text_offline_and_drops_closed_tabs
     };
     let drafts = (1..=2)
         .map(|number| Draft {
+            statement_timeout: StatementTimeout::custom(number * 1000).unwrap(),
             relationship: None,
             saved_query: None,
             connection_id: profile.id,
@@ -1642,6 +1644,14 @@ async fn workspace_search_live_drafts_selects_text_offline_and_drops_closed_tabs
             },
         )
         .unwrap()
+    });
+    cx.update(|cx| {
+        for (index, doc) in workspace.read(cx).documents.iter().enumerate() {
+            assert_eq!(
+                doc.read(cx).draft(cx).statement_timeout,
+                StatementTimeout::custom((index as u32 + 1) * 1000).unwrap()
+            );
+        }
     });
     let target = cx.update(|cx| workspace.read(cx).documents[1].clone());
     let editor = cx.update(|cx| target.read(cx).sql_editor().unwrap());

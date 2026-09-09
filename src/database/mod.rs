@@ -13,6 +13,7 @@ use tokio::sync::Mutex as AsyncMutex;
 pub struct Session {
     backend: Backend,
     pub profile: ConnectionProfile,
+    timeout: Mutex<StatementTimeout>,
 }
 
 enum Backend {
@@ -71,7 +72,11 @@ impl Session {
                 }
             }
         };
-        Ok(Arc::new(Self { backend, profile }))
+        Ok(Arc::new(Self {
+            backend,
+            profile,
+            timeout: Mutex::new(StatementTimeout::Inherit),
+        }))
     }
 
     async fn with_sqlite<T: Send + 'static>(
@@ -92,12 +97,30 @@ impl Session {
         .context("SQLite worker failed")?
     }
 
+    /// Changes the policy used by the next execution; never sends SQL into a failed transaction.
+    pub fn set_statement_timeout(&self, timeout: StatementTimeout) -> Result<()> {
+        if let StatementTimeout::Custom(ms) = timeout {
+            StatementTimeout::custom(ms.get())?;
+        }
+        *self.timeout.lock().unwrap() = timeout;
+        Ok(())
+    }
+
     pub async fn query(&self, sql: String) -> Result<QueryOutput> {
         let start = Instant::now();
+        let timeout = *self.timeout.lock().unwrap();
         let sets = match &self.backend {
-            Backend::Postgres(pg) => postgres::query(&*pg.client.lock().await, &sql).await?,
+            Backend::Postgres(pg) => {
+                let client = pg.client.lock().await;
+                pg.apply_timeout(&client, timeout, &sql)
+                    .await
+                    .map_err(classify_postgres_error)?;
+                postgres::query(&client, &sql)
+                    .await
+                    .map_err(classify_postgres_error)?
+            }
             Backend::Sqlite { .. } => {
-                self.with_sqlite(move |conn| sqlite::query(conn, &sql))
+                self.with_sqlite(move |conn| sqlite::query(conn, &sql, timeout))
                     .await?
             }
         };
@@ -145,9 +168,18 @@ impl Session {
         };
         let start = Instant::now();
         let client = pg.client.lock().await;
+        let timeout = *self.timeout.lock().unwrap();
+        pg.apply_timeout(&client, timeout, &sql)
+            .await
+            .map_err(classify_postgres_error)?;
         let params: Vec<_> = params.iter().map(|value| value.as_deref()).collect();
-        let stream = client.query_text_raw(&sql, &params).await?;
-        let sets = postgres::collect_results(stream).await?;
+        let stream = client
+            .query_text_raw(&sql, &params)
+            .await
+            .map_err(|e| classify_postgres_error(e.into()))?;
+        let sets = postgres::collect_results(stream)
+            .await
+            .map_err(classify_postgres_error)?;
         Ok(QueryOutput {
             sets,
             elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -350,4 +382,32 @@ pub(super) fn validate_original(
         );
     }
     Ok(())
+}
+
+#[derive(Debug)]
+pub struct StatementTimedOut;
+impl std::fmt::Display for StatementTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Statement timed out")
+    }
+}
+impl std::error::Error for StatementTimedOut {}
+
+pub fn is_statement_timeout(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<StatementTimedOut>().is_some()
+}
+
+fn classify_postgres_error(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<tokio_postgres::Error>()
+        .and_then(|e| e.as_db_error())
+        .is_some_and(|e| {
+            e.code() == &tokio_postgres::error::SqlState::QUERY_CANCELED
+                && e.message().contains("statement timeout")
+        })
+    {
+        error.context(StatementTimedOut)
+    } else {
+        error
+    }
 }

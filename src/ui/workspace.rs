@@ -271,6 +271,7 @@ impl Workspace {
                     doc.update(cx, |doc, _| {
                         doc.set_relationship(draft.relationship);
                         doc.saved_query = draft.saved_query;
+                        doc.statement_timeout = draft.statement_timeout;
                         doc.editor_height = draft.editor_height.clamp(100., 1200.);
                         if let Some(number) = draft.query_number {
                             doc.query_number = number;

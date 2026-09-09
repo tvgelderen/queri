@@ -411,8 +411,39 @@ impl Default for Preferences {
     }
 }
 
+/// Milliseconds match PostgreSQL's statement_timeout range; zero has a separate meaning.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StatementTimeout {
+    #[default]
+    Inherit,
+    NoTimeout,
+    Custom(std::num::NonZeroU32),
+}
+
+impl StatementTimeout {
+    pub fn custom(milliseconds: u32) -> Result<Self> {
+        ensure!(
+            milliseconds <= i32::MAX as u32,
+            "Timeout must be at most 2147483647 ms."
+        );
+        Ok(Self::Custom(
+            std::num::NonZeroU32::new(milliseconds)
+                .ok_or_else(|| anyhow::anyhow!("Timeout must be positive."))?,
+        ))
+    }
+
+    pub fn duration(self) -> Option<std::time::Duration> {
+        match self {
+            Self::Custom(ms) => Some(std::time::Duration::from_millis(u64::from(ms.get()))),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Draft {
+    #[serde(default)]
+    pub statement_timeout: StatementTimeout,
     #[serde(default)]
     pub relationship: Option<RelationshipScope>,
     #[serde(default)]
