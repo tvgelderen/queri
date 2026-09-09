@@ -1576,3 +1576,203 @@ async fn saved_library_sql_files_and_related_tabs_keep_work_separate(cx: &mut Te
         )
     });
 }
+
+#[gpui_kit::test]
+async fn workspace_search_live_drafts_selects_text_offline_and_drops_closed_tabs(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Focusable;
+    cx.executor().allow_parking();
+    let directory = tempfile::tempdir().unwrap();
+    let profile = ConnectionProfile {
+        id: Uuid::new_v4(),
+        name: "Offline drafts".into(),
+        notes: String::new(),
+        color: String::new(),
+        remember_password: false,
+        config: ConnectionConfig::Sqlite {
+            path: directory.path().join("never-opened.db"),
+            read_only: true,
+            create: false,
+            wal: false,
+            foreign_keys: true,
+        },
+    };
+    let drafts = (1..=2)
+        .map(|number| Draft {
+            relationship: None,
+            saved_query: None,
+            connection_id: profile.id,
+            database: profile.database(),
+            sql: "persisted text".into(),
+            query_number: Some(number),
+            table: None,
+            editor_height: default_editor_height(),
+        })
+        .collect();
+    let services = Services::new(
+        runtime().unwrap(),
+        Store::open(directory.path().join("app.db")).unwrap(),
+    );
+    let (window, workspace) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(1200.), px(800.)),
+                    cx,
+                ))),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                cx.new(|cx| {
+                    Workspace::new(
+                        services.clone(),
+                        Preferences {
+                            drafts,
+                            ..Default::default()
+                        },
+                        vec![profile.clone()],
+                        window,
+                        cx,
+                    )
+                })
+            },
+        )
+        .unwrap()
+    });
+    let target = cx.update(|cx| workspace.read(cx).documents[1].clone());
+    let editor = cx.update(|cx| target.read(cx).sql_editor().unwrap());
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.active = 1;
+            cx.notify();
+        });
+        editor.update(cx, |editor, cx| editor.focus(window, cx));
+        window.render_frame(cx);
+        window.press("ctrl-a", cx);
+        window.input("-- unsaved é\nSELECT 'Ä\nneedle', 'Ä\nneedle';", cx);
+        window.press("ctrl-shift-s", cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            workspace
+                .read(cx)
+                .draft_search
+                .as_ref()
+                .and_then(|v| v.upgrade())
+                .is_some(),
+            "shortcut opened draft search"
+        );
+        window.press("escape", cx);
+        assert!(
+            editor.read(cx).focus_handle(cx).is_focused(window),
+            "closing search restores the originating editor"
+        );
+        window.press("ctrl-shift-s", cx);
+        window.input("ä\nneedle", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace
+            .read(cx)
+            .draft_search
+            .as_ref()
+            .and_then(|v| v.upgrade())
+            .is_some_and(|v| v.read(cx).match_count(cx) == 2)
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |workspace, _| workspace.active = 0);
+        window.press("tab", cx);
+        window.press("down", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(workspace.read(cx).active, 1);
+        assert_eq!(editor.read(cx).selected_text().to_string(), "Ä\nneedle");
+        assert_eq!(
+            editor.read(cx).selected_range().start,
+            editor.read(cx).value().rfind("Ä\nneedle").unwrap()
+        );
+        assert!(editor.read(cx).focus_handle(cx).is_focused(window));
+        assert!(
+            target.read(cx).session.is_none(),
+            "activating search must not connect"
+        );
+        window.press("ctrl-shift-s", cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.input("needle", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace
+            .read(cx)
+            .draft_search
+            .as_ref()
+            .and_then(|v| v.upgrade())
+            .is_some_and(|v| v.read(cx).match_count(cx) == 2)
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.set_selected_range(0..editor.text().len(), cx);
+            editor.replace("changed draft", window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace
+            .read(cx)
+            .draft_search
+            .as_ref()
+            .and_then(|v| v.upgrade())
+            .is_some_and(|v| v.read(cx).match_count(cx) == 0)
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.select_all(window, cx);
+            editor.replace("needle", window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace
+            .read(cx)
+            .draft_search
+            .as_ref()
+            .and_then(|v| v.upgrade())
+            .is_some_and(|v| v.read(cx).match_count(cx) == 1)
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.close_document(1, window, cx));
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace
+            .read(cx)
+            .draft_search
+            .as_ref()
+            .and_then(|v| v.upgrade())
+            .is_some_and(|v| v.read(cx).match_count(cx) == 0)
+    })
+    .await;
+    assert!(!directory.path().join("never-opened.db").exists());
+    assert!(
+        services
+            .store
+            .history(profile.id, "", 0)
+            .unwrap()
+            .is_empty()
+    );
+}

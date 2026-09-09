@@ -9,6 +9,7 @@ use super::{
     },
     document::{ConnectionPasswordRequired, Document, DocumentChanged, NewDocumentQuery},
     document_tabs::{document_tab, document_tab_bar},
+    draft_search::{DraftSearch, OpenDraftMatch},
     history::{History, NewHistoryQuery, ReplayQuery},
     table_finder::{OpenTable, TableFinder},
     task,
@@ -51,7 +52,8 @@ actions!(
         ToggleHistory,
         OpenTreeItem,
         NextDocument,
-        FindTable
+        FindTable,
+        FindDraft
     ]
 );
 
@@ -92,6 +94,7 @@ pub struct Workspace {
     tree: Entity<TreeState>,
     documents: Vec<Entity<Document>>,
     active: usize,
+    draft_search: Option<WeakEntity<DraftSearch>>,
     document_scroll: ScrollHandle,
     history: Option<Entity<History>>,
     status: String,
@@ -113,6 +116,8 @@ impl Workspace {
         cx.bind_keys([
             KeyBinding::new("ctrl-n", NewQuery, Some("QueriWorkspace")),
             KeyBinding::new("ctrl-p", FindTable, Some("QueriWorkspace")),
+            KeyBinding::new("ctrl-shift-s", FindDraft, Some("QueriWorkspace")),
+            KeyBinding::new("ctrl-shift-s", FindDraft, Some("QueriWorkspace > Input")),
             KeyBinding::new("ctrl-p", FindTable, Some("QueriWorkspace > Input")),
             KeyBinding::new("ctrl-shift-n", NewConnection, Some("QueriWorkspace")),
             KeyBinding::new("ctrl-w", CloseDocument, Some("QueriWorkspace")),
@@ -225,6 +230,7 @@ impl Workspace {
             tree,
             documents: vec![],
             active: 0,
+            draft_search: None,
             document_scroll: ScrollHandle::new(),
             history: None,
             status: "Choose a connection to begin".into(),
@@ -770,6 +776,7 @@ impl Workspace {
             },
         ));
         self.documents.push(doc.clone());
+        self.refresh_draft_search(window, cx);
         self.active = self.documents.len() - 1;
         if !self.history_docked(window) {
             self.history = None;
@@ -827,6 +834,61 @@ impl Workspace {
                     .map(|doc| doc.profile.database())
             })
             .or_else(|| Some(profile.database()))
+    }
+
+    fn refresh_draft_search(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(search) = self.draft_search.as_ref().and_then(WeakEntity::upgrade) {
+            search.update(cx, |search, cx| {
+                search.set_documents(&self.documents, window, cx)
+            });
+        }
+    }
+
+    fn find_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let finder = cx.new(|cx| DraftSearch::new(&self.documents, window, cx));
+        self.draft_search = Some(finder.downgrade());
+        self.subscriptions.push(cx.subscribe_in(
+            &finder,
+            window,
+            |this, _, event: &OpenDraftMatch, window, cx| {
+                let hit = &event.0;
+                let Some(index) = this
+                    .documents
+                    .iter()
+                    .position(|doc| doc.entity_id() == hit.document)
+                else {
+                    return;
+                };
+                let Some(editor) = this.documents[index].read(cx).sql_editor() else {
+                    return;
+                };
+                if editor.read(cx).text() != &hit.text {
+                    this.refresh_draft_search(window, cx);
+                    return;
+                }
+                window.close_dialog(cx);
+                // Opening a search hit must work offline and must not connect or run SQL.
+                this.active = index;
+                if !this.history_docked(window) {
+                    this.history = None;
+                }
+                this.reveal_active_tab(window, cx);
+                editor.update(cx, |editor, cx| {
+                    editor.set_selected_range(hit.range.clone(), cx);
+                    editor.focus(window, cx);
+                });
+                this.schedule_save(window, cx);
+                cx.notify();
+            },
+        ));
+        let focus = finder.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Search SQL drafts")
+                .width(px(680.))
+                .child(finder.clone())
+        });
+        focus.update(cx, |search, cx| search.focus(window, cx));
     }
 
     fn find_table(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -893,6 +955,7 @@ impl Workspace {
                 return;
             }
             self.documents.remove(index);
+            self.refresh_draft_search(window, cx);
             self.active = self
                 .active
                 .saturating_sub(usize::from(index <= self.active))
@@ -1041,6 +1104,7 @@ impl Workspace {
                                         this.profiles.retain(|profile| profile.id != id);
                                         this.passwords.remove(&id);
                                         this.documents.retain(|doc| doc.read(cx).profile.id != id);
+                                        this.refresh_draft_search(window, cx);
                                         this.active = 0;
                                         if this.selected == Some(id) {
                                             this.selected = None;
@@ -1784,6 +1848,8 @@ impl Workspace {
                                 [
                                     ("New query", "Ctrl + N"),
                                     ("Find table", "Ctrl + P"),
+                                    ("Find in editor / grid", "Ctrl + F"),
+                                    ("Search SQL drafts", "Ctrl + Shift + S"),
                                     ("Run SQL", "Ctrl + Enter"),
                                     ("Cancel query", "Ctrl + Shift + C"),
                                     ("Refresh table", "F5"),
@@ -2091,6 +2157,8 @@ impl Render for Workspace {
                         )
                     }),
             )
+            .child(div().px_3().child(Button::new("search-drafts").outline().icon(IconName::Search).label("Search SQL drafts")
+                .on_click(cx.listener(|this, _, window, cx| this.find_draft(window, cx)))))
             .child(div().px_3().child(Button::new("saved-queries").outline().icon(IconName::Code).label("Saved queries")
                 .on_click(cx.listener(|this,_,window,cx|this.saved_queries(window,cx)))))
             .child(
@@ -2303,6 +2371,7 @@ impl Render for Workspace {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(|this, _: &NewQuery, window, cx| this.new_query(window, cx)))
+            .on_action(cx.listener(|this, _: &FindDraft, window, cx| this.find_draft(window, cx)))
             .on_action(cx.listener(|this, _: &FindTable, window, cx| this.find_table(window, cx)))
             .on_action(cx.listener(|this, _: &NewConnection, window, cx| {
                 this.connection_form(None, window, cx)

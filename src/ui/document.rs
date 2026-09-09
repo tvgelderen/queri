@@ -2,6 +2,7 @@ use super::{
     Services,
     controls::{choice, empty_state, icon_button, menu_item, shortcut},
     grid::{Grid, GridEvent},
+    grid_search::{FindGrid, GridSearch},
     row_editor::{RowEditor, RowSaved},
     task,
 };
@@ -98,6 +99,7 @@ pub struct Document {
     password: Option<String>,
     kind: DocumentKind,
     grid: Entity<TableState<Grid>>,
+    grid_search: Entity<GridSearch>,
     results: Vec<Arc<ResultSet>>,
     result_index: usize,
     operation: Operation,
@@ -116,6 +118,8 @@ pub struct Document {
 impl Document {
     pub fn init(cx: &mut App) {
         cx.bind_keys([
+            KeyBinding::new("ctrl-f", FindGrid, Some("QueriDocument")),
+            KeyBinding::new("ctrl-f", FindGrid, Some("QueriDocument > DataTable")),
             KeyBinding::new("ctrl-shift-f", FormatSql, Some("QueriDocument")),
             KeyBinding::new("ctrl-shift-f", FormatSql, Some("QueriDocument > Input")),
             KeyBinding::new("ctrl-c", CopyCells, Some("QueriDocument > DataTable")),
@@ -156,6 +160,7 @@ impl Document {
                 editor: cx.new(|cx| {
                     EditorState::new(window, cx)
                         .language("sql")
+                        .searchable(true)
                         .default_value(sql)
                         .placeholder("Write SQL, then press Ctrl+Enter")
                 }),
@@ -167,6 +172,7 @@ impl Document {
                 .range_selectable(true)
                 .loop_selection(false)
         });
+        let grid_search = cx.new(|cx| GridSearch::new(grid.clone(), window, cx));
         let mut subscriptions = vec![
             cx.subscribe_in(&grid, window, |this, _, event: &GridEvent, window, cx| {
                 if this.busy() {
@@ -220,6 +226,7 @@ impl Document {
             password,
             kind,
             grid,
+            grid_search,
             results: vec![],
             result_index: 0,
             operation: Operation::Idle,
@@ -233,6 +240,13 @@ impl Document {
             saved_query: None,
             formatting: false,
             subscriptions,
+        }
+    }
+
+    pub(super) fn sql_editor(&self) -> Option<Entity<EditorState>> {
+        match &self.kind {
+            DocumentKind::Sql { editor } => Some(editor.clone()),
+            _ => None,
         }
     }
 
@@ -2366,6 +2380,7 @@ impl Render for Document {
                     && self.grid.read(cx).delegate().data.rows.is_empty(),
                 |view| view.track_focus(&self.grid.read(cx).focus_handle(cx)),
             )
+            .on_action(cx.listener(|this, _: &FindGrid, window, cx| if this.grid.read(cx).focus_handle(cx).is_focused(window) { this.grid_search.update(cx, |search, cx| search.open(window, cx)) } else { cx.propagate(); }))
             .on_action(cx.listener(|this, _: &FormatSql, window, cx| this.format_sql(window,cx)))
             .on_action(cx.listener(|this, _: &CopyCells, _, cx| this.copy_cells(crate::export::Format::Tsv, false,cx)))
             .on_action(cx.listener(|this, _: &RunQuery, window, cx| this.run(window, cx)))
@@ -2506,6 +2521,7 @@ impl Render for Document {
                             }),
                     ),
             )
+            .child(self.grid_search.clone())
             .child(div().flex_1().min_h_0().overflow_hidden().child(content))
             .when(!self.error.is_empty(), |view| {
                 view.child(

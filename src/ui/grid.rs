@@ -17,6 +17,7 @@ impl EventEmitter<GridEvent> for TableState<Grid> {}
 pub struct Grid {
     pub data: Arc<ResultSet>,
     pub checkable: bool,
+    pub search_cell: Option<(usize, usize)>,
     pub checked: BTreeSet<usize>,
     pub sortable: bool,
     pub sort: Option<(String, ColumnSort)>,
@@ -28,6 +29,7 @@ impl Grid {
         let mut grid = Self {
             data: Arc::new(ResultSet::default()),
             checkable: false,
+            search_cell: None,
             checked: BTreeSet::new(),
             sortable: false,
             sort: None,
@@ -38,6 +40,7 @@ impl Grid {
     }
     pub fn replace(&mut self, data: Arc<ResultSet>) {
         self.data = data;
+        self.search_cell = None;
         self.checked.clear();
         self.numeric_columns = (0..self.data.columns.len())
             .filter(|index| {
@@ -201,6 +204,11 @@ impl TableDelegate for Grid {
         let index = col.saturating_sub(usize::from(self.checkable));
         let cell = self.data.rows.get(row).and_then(|row| row.get(index));
         div()
+            .when(self.search_cell == Some((row, index)), |view| {
+                view.bg(cx.theme().accent)
+                    .border_1()
+                    .border_color(cx.theme().primary)
+            })
             .text_ellipsis()
             .when(matches!(cell, Some(Cell::Null)), |view| {
                 view.italic().text_color(cx.theme().muted_foreground)

@@ -864,3 +864,233 @@ async fn selecting_a_cell_keeps_the_grid_stable_and_double_click_inspects_it(
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+async fn grid_search_preserves_selection_wraps_and_invalidates(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(false, cx);
+    let grid = cx.update(|cx| doc.read(cx).grid.clone());
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| {
+            doc.results = vec![
+                Arc::new(ResultSet {
+                    columns: vec!["value".into(), "other".into()],
+                    rows: vec![
+                        vec![Cell::Text("Ä\nmatch".into()), Cell::Text("keep".into())],
+                        vec![
+                            Cell::Text("ä\nmatch".into()),
+                            Cell::Text("selection".into()),
+                        ],
+                    ],
+                    ..Default::default()
+                }),
+                Arc::new(ResultSet {
+                    columns: vec!["value".into()],
+                    rows: vec![vec![Cell::Text("different page".into())]],
+                    ..Default::default()
+                }),
+            ];
+            doc.update_grid(cx);
+        });
+        grid.update(cx, |grid, cx| {
+            grid.delegate_mut().checked.insert(1);
+            grid.set_selected_cell(0, 0, cx);
+            grid.extend_selection(1, 1, cx);
+            grid.focus_handle(cx).focus(window, cx);
+        });
+        window.render_frame(cx);
+        window.press("ctrl-f", cx);
+        window.input("ä\nmatch", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        grid.read(cx).delegate().search_cell == Some((0, 0))
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(doc.read(cx).grid_search.read(cx).status(), "1/2 cells");
+        assert_eq!(grid.read(cx).selected_range(), Some(((0, 0), (1, 1))));
+        assert_eq!(
+            grid.read(cx)
+                .delegate()
+                .checked
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(grid.read(cx).delegate().search_cell, Some((1, 0)));
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(grid.read(cx).delegate().search_cell, Some((0, 0)));
+        window.press("shift-enter", cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(grid.read(cx).delegate().search_cell, Some((1, 0)));
+        window.click("grid-search-case", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        grid.read(cx).delegate().search_cell == Some((1, 0))
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("grid-search-next", cx);
+        assert_eq!(
+            grid.read(cx).delegate().search_cell,
+            Some((1, 0)),
+            "case-sensitive search has one matching cell"
+        );
+        window.click("grid-search-close", cx);
+        assert!(grid.read(cx).focus_handle(cx).is_focused(window));
+        assert_eq!(grid.read(cx).selected_range(), Some(((0, 0), (1, 1))));
+        window.press("ctrl-c", cx);
+        assert!(
+            cx.read_from_clipboard()
+                .and_then(|v| v.text())
+                .unwrap()
+                .contains("selection")
+        );
+        window.press("ctrl-f", cx);
+        window.input("missing", cx);
+        window.press("ctrl-a", cx);
+        window.input("ä\nmatch", cx);
+        doc.update(cx, |doc, cx| {
+            doc.result_index = 1;
+            doc.update_grid(cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        doc.read(cx).grid_search.read(cx).status() == "0/0 cells"
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(grid.read(cx).delegate().search_cell, None);
+        window.press("escape", cx);
+        assert!(grid.read(cx).focus_handle(cx).is_focused(window));
+    })
+    .unwrap();
+    assert!(
+        fixture
+            .services
+            .store
+            .history(fixture.profile.id, "", 0)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[gpui_kit::test]
+async fn editor_search_and_format_shortcuts_remain_separate(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(false, cx);
+    let editor = cx.update(|cx| doc.read(cx).sql_editor().unwrap());
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.input("select 'needle', 'needle';", cx);
+        window.press("ctrl-f", cx);
+        window.render_frame(cx);
+        assert!(editor.read(cx).search_session().open);
+        assert!(!editor.read(cx).focus_handle(cx).is_focused(window));
+        window.input("needle", cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(editor.read(cx).search_session().matcher.len(), 2);
+        window.press("enter", cx);
+        assert_eq!(
+            editor
+                .read(cx)
+                .search_session()
+                .matcher
+                .current_match_index(),
+            1
+        );
+        window.press("escape", cx);
+        assert!(editor.read(cx).focus_handle(cx).is_focused(window));
+        assert!(!editor.read(cx).search_session().open);
+        window.press("ctrl-a", cx);
+        window.press("ctrl-shift-f", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        !doc.read(cx).formatting
+    })
+    .await;
+    cx.update(|cx| {
+        assert!(!editor.read(cx).search_session().open);
+        assert_ne!(
+            editor.read(cx).value().as_ref(),
+            "select 'needle', 'needle';"
+        );
+    });
+}
+
+#[gpui_kit::test]
+async fn inspector_search_keeps_document_search_and_sql_untouched(cx: &mut TestAppContext) {
+    use gpui_kit::component::WindowExt;
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(false, cx);
+    let sql_editor = cx.update(|cx| doc.read(cx).sql_editor().unwrap());
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.input("select 'untouched';", cx);
+        super::super::cell_inspector::open(
+            fixture.services.clone(),
+            Cell::Text("needle 世界 needle".into()),
+            "Search cell".into(),
+            None,
+            window,
+            cx,
+        );
+    })
+    .unwrap();
+    let inspector_editor = cx
+        .update_window(window, |_, window, cx| {
+            crate::ui::test_support::click_label(window, "Cell contents; Ctrl+F to search", cx);
+            window
+                .focused_input(cx)
+                .unwrap()
+                .as_editor()
+                .unwrap()
+                .clone()
+        })
+        .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        inspector_editor.read(cx).value().as_ref() == "needle 世界 needle"
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.press("ctrl-f", cx);
+        window.input("needle", cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        assert!(inspector_editor.read(cx).search_session().open);
+        assert_eq!(inspector_editor.read(cx).search_session().matcher.len(), 2);
+        assert!(!sql_editor.read(cx).search_session().open);
+        assert_eq!(sql_editor.read(cx).value().as_ref(), "select 'untouched';");
+        window.press("escape", cx);
+        assert!(
+            inspector_editor
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        );
+        window.press("escape", cx);
+        assert!(sql_editor.read(cx).focus_handle(cx).is_focused(window));
+    })
+    .unwrap();
+}
