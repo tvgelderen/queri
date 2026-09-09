@@ -38,7 +38,10 @@ actions!(
         InspectCell,
         EditRow,
         CopyCells,
-        FormatSql
+        FormatSql,
+        BeginTransaction,
+        CommitTransaction,
+        RollbackTransaction
     ]
 );
 
@@ -87,6 +90,8 @@ pub struct OpenRelated(pub RelationshipScope);
 impl EventEmitter<OpenRelated> for Document {}
 pub struct OpenSqlFile(pub String);
 impl EventEmitter<OpenSqlFile> for Document {}
+pub struct ReconnectRequested;
+impl EventEmitter<ReconnectRequested> for Document {}
 pub struct NewDocumentQuery;
 impl EventEmitter<NewDocumentQuery> for Document {}
 pub struct ConnectionPasswordRequired;
@@ -104,6 +109,11 @@ pub struct Document {
     result_index: usize,
     operation: Operation,
     query_outcome: QueryOutcome,
+    pub(super) transaction: TransactionStatus,
+    transaction_started: Option<Instant>,
+    session_generation: u64,
+    pub(super) releasing: bool,
+    cancel_pending: bool,
     status: String,
     error: String,
     database_available: bool,
@@ -231,6 +241,11 @@ impl Document {
             result_index: 0,
             operation: Operation::Idle,
             query_outcome: QueryOutcome::NotRun,
+            transaction: TransactionStatus::Idle,
+            transaction_started: None,
+            session_generation: 0,
+            releasing: false,
+            cancel_pending: false,
             status: "Connecting…".into(),
             error: String::new(),
             database_available: true,
@@ -294,7 +309,7 @@ impl Document {
         }
     }
     pub fn busy(&self) -> bool {
-        self.operation != Operation::Idle
+        self.operation != Operation::Idle || self.releasing || self.cancel_pending
     }
     pub fn set_password(&mut self, password: String) {
         self.password = Some(password);
@@ -302,11 +317,21 @@ impl Document {
     pub fn reconfigure(&mut self, profile: &ConnectionProfile, password: String) {
         self.profile = profile.for_database(&self.profile.database());
         self.password = Some(password);
+        self.session_generation += 1;
+        self.operation = Operation::Idle;
+        self.cancel_pending = false;
         self.session = None;
+        self.transaction = TransactionStatus::Unknown;
+        self.transaction_started = None;
         self.database_available = true;
     }
     pub fn disconnect(&mut self, cx: &mut Context<Self>) {
+        self.session_generation += 1;
+        self.operation = Operation::Idle;
+        self.cancel_pending = false;
         self.session = None;
+        self.transaction = TransactionStatus::Unknown;
+        self.transaction_started = None;
         self.status = "Disconnected".into();
         cx.notify();
     }
@@ -343,16 +368,29 @@ impl Document {
         self.error.clear();
         self.status = "Connecting…".into();
         let profile = self.profile.clone();
+        self.session_generation += 1;
+        let generation = self.session_generation;
         task(
             &self.services,
             window,
             cx,
-            async move { Session::connect(profile, password).await },
-            |this, result, window, cx| {
+            async move {
+                let session = Session::connect(profile, password).await?;
+                let state = session
+                    .transaction_status()
+                    .await
+                    .unwrap_or(TransactionStatus::Unknown);
+                Ok((session, state))
+            },
+            move |this, result, window, cx| {
+                if this.session_generation != generation {
+                    return;
+                }
                 this.operation = Operation::Idle;
                 match result {
-                    Ok(session) => {
+                    Ok((session, state)) => {
                         this.session = Some(session);
+                        this.observe_transaction(state, cx);
                         this.status = "Connected · ready".into();
                         if matches!(this.kind, DocumentKind::Table { .. }) {
                             this.refresh(window, cx);
@@ -388,12 +426,28 @@ impl Document {
         self.operation = Operation::Running;
         self.error.clear();
         self.status = "Loading table…".into();
+        let generation = self.session_generation;
         task(
             &self.services,
             window,
             cx,
-            async move { session.browse(table, options).await },
-            move |this, result, _, cx| {
+            async move {
+                let result = session.browse(table, options).await;
+                let state = session
+                    .transaction_status()
+                    .await
+                    .unwrap_or(TransactionStatus::Unknown);
+                Ok((result, state))
+            },
+            move |this, observed, _, cx| {
+                if this.session_generation != generation {
+                    return;
+                }
+                let (result, state) = match observed {
+                    Ok(pair) => pair,
+                    Err(error) => (Err(error), TransactionStatus::Unknown),
+                };
+                this.observe_transaction(state, cx);
                 this.operation = Operation::Idle;
                 match result {
                     Ok(page) => {
@@ -597,6 +651,7 @@ impl Document {
         };
         let store = self.services.store.clone();
         let profile = self.profile.clone();
+        let generation = self.session_generation;
         self.operation = Operation::Running;
         self.status = "Executing…".into();
         self.error.clear();
@@ -607,6 +662,10 @@ impl Document {
             async move {
                 let start = Instant::now();
                 let result = session.query(sql.clone()).await;
+                let transaction = session
+                    .transaction_status()
+                    .await
+                    .unwrap_or(TransactionStatus::Unknown);
                 let entry = HistoryEntry {
                     id: 0,
                     connection_id: profile.id,
@@ -624,13 +683,21 @@ impl Document {
                     .await?
                     .err()
                     .map(|error| format!("{error:#}"));
-                Ok((result, history_error))
+                Ok((result, history_error, transaction))
             },
-            |this, result, _, cx| {
+            move |this, result, _, cx| {
+                if this.session_generation != generation {
+                    return;
+                }
+                let transaction = result
+                    .as_ref()
+                    .map(|(_, _, state)| *state)
+                    .unwrap_or(TransactionStatus::Unknown);
+                this.observe_transaction(transaction, cx);
                 let cancelled = this.operation == Operation::Cancelling;
                 this.operation = Operation::Idle;
                 match result {
-                    Ok((Ok(output), history_error)) => {
+                    Ok((Ok(output), history_error, _)) => {
                         this.query_outcome = QueryOutcome::Succeeded;
                         this.status = format!(
                             "Completed in {} ms · {} result sets",
@@ -645,7 +712,7 @@ impl Document {
                         this.result_index = 0;
                         this.update_grid(cx);
                     }
-                    Ok((Err(error), _)) | Err(error) => {
+                    Ok((Err(error), _, _)) | Err(error) => {
                         this.query_outcome = if cancelled {
                             QueryOutcome::Cancelled
                         } else {
@@ -662,11 +729,139 @@ impl Document {
                         .into();
                     }
                 }
+                if transaction == TransactionStatus::Unknown {
+                    this.query_outcome = QueryOutcome::Failed;
+                    this.status = "Transaction outcome unknown".into();
+                    this.error = "Connection lost or transaction status unavailable. The last operation may have taken effect, including COMMIT. Queri has not retried it. Verify the outcome before running it again.".into();
+                }
                 cx.emit(DocumentChanged);
                 cx.notify();
             },
         );
         cx.notify();
+    }
+
+    pub(super) fn observe_transaction(&mut self, state: TransactionStatus, cx: &mut Context<Self>) {
+        self.transaction = state;
+        match state {
+            TransactionStatus::Open | TransactionStatus::Failed
+                if self.transaction_started.is_none() =>
+            {
+                self.transaction_started = Some(Instant::now());
+                let generation = self.session_generation;
+                let started = self.transaction_started;
+                let runtime = self.services.runtime.clone();
+                cx.spawn(async move |view, cx| {
+                    loop {
+                        let _ = runtime
+                            .spawn(async {
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await
+                            })
+                            .await;
+                        let keep = view
+                            .update(cx, |this, cx| {
+                                cx.notify();
+                                this.session_generation == generation
+                                    && this.transaction_started == started
+                            })
+                            .unwrap_or(false);
+                        if !keep {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+            TransactionStatus::Idle => self.transaction_started = None,
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn transaction_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let allowed = match command {
+            "BEGIN" => self.transaction == TransactionStatus::Idle,
+            "COMMIT" => self.transaction == TransactionStatus::Open,
+            "ROLLBACK" => matches!(
+                self.transaction,
+                TransactionStatus::Open | TransactionStatus::Failed
+            ),
+            _ => false,
+        };
+        if allowed && !self.busy() && self.session.is_some() {
+            self.execute(command.into(), window, cx);
+        }
+    }
+
+    fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = window;
+        cx.emit(ReconnectRequested);
+    }
+
+    fn transaction_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let label = match self.transaction {
+            TransactionStatus::Idle => {
+                if self.session.is_some() {
+                    "Autocommit"
+                } else {
+                    "Disconnected"
+                }
+            }
+            TransactionStatus::Open => "Transaction open",
+            TransactionStatus::Failed => "Transaction failed · roll back or recover a savepoint",
+            TransactionStatus::Unknown => "Transaction outcome unknown",
+        };
+        let elapsed = self
+            .transaction_started
+            .map(|start| format!(" · {}s", start.elapsed().as_secs()))
+            .unwrap_or_default();
+        h_flex()
+            .px_4()
+            .pb_2()
+            .gap_2()
+            .flex_wrap()
+            .child(
+                div()
+                    .id("transaction-status")
+                    .text_xs()
+                    .child(format!("{label}{elapsed}")),
+            )
+            .children(
+                [
+                    (
+                        "begin-transaction",
+                        "Begin",
+                        "BEGIN",
+                        self.transaction == TransactionStatus::Idle,
+                    ),
+                    (
+                        "commit-transaction",
+                        "Commit",
+                        "COMMIT",
+                        self.transaction == TransactionStatus::Open,
+                    ),
+                    (
+                        "rollback-transaction",
+                        "Rollback",
+                        "ROLLBACK",
+                        matches!(
+                            self.transaction,
+                            TransactionStatus::Open | TransactionStatus::Failed
+                        ),
+                    ),
+                ]
+                .into_iter()
+                .map(|(id, label, command, allowed)| {
+                    Button::new(id)
+                        .small()
+                        .label(label)
+                        .disabled(!allowed || self.busy() || self.session.is_none())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.transaction_command(command, window, cx)
+                        }))
+                }),
+            )
+            .into_any_element()
     }
 
     pub fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -677,13 +872,19 @@ impl Document {
             return;
         };
         self.operation = Operation::Cancelling;
+        self.cancel_pending = true;
+        let generation = self.session_generation;
         self.status = "Cancelling…".into();
         task(
             &self.services,
             window,
             cx,
             async move { session.cancel().await },
-            |this, result, _, cx| {
+            move |this, result, _, cx| {
+                if this.session_generation != generation {
+                    return;
+                }
+                this.cancel_pending = false;
                 if let Err(error) = result {
                     this.error = format!("{error:#}");
                     if this.operation == Operation::Cancelling {
@@ -2383,6 +2584,9 @@ impl Render for Document {
             .on_action(cx.listener(|this, _: &FindGrid, window, cx| if this.grid.read(cx).focus_handle(cx).is_focused(window) { this.grid_search.update(cx, |search, cx| search.open(window, cx)) } else { cx.propagate(); }))
             .on_action(cx.listener(|this, _: &FormatSql, window, cx| this.format_sql(window,cx)))
             .on_action(cx.listener(|this, _: &CopyCells, _, cx| this.copy_cells(crate::export::Format::Tsv, false,cx)))
+            .on_action(cx.listener(|this, _: &BeginTransaction, window, cx| this.transaction_command("BEGIN", window, cx)))
+            .on_action(cx.listener(|this, _: &CommitTransaction, window, cx| this.transaction_command("COMMIT", window, cx)))
+            .on_action(cx.listener(|this, _: &RollbackTransaction, window, cx| this.transaction_command("ROLLBACK", window, cx)))
             .on_action(cx.listener(|this, _: &RunQuery, window, cx| this.run(window, cx)))
             .on_action(cx.listener(|this, _: &CancelQuery, window, cx| this.cancel(window, cx)))
             .on_action(cx.listener(|this, _: &Refresh, window, cx| this.refresh(window, cx)))
@@ -2498,8 +2702,7 @@ impl Render for Document {
                                                     )
                                                     .on_click(cx.listener(
                                                         |this, _, window, cx| {
-                                                            this.session = None;
-                                                            this.connect(window, cx);
+                                                            this.reconnect(window, cx);
                                                         },
                                                     )),
                                             );
@@ -2521,6 +2724,7 @@ impl Render for Document {
                             }),
                     ),
             )
+            .when(matches!(self.kind, DocumentKind::Sql { .. }), |view| view.child(self.transaction_toolbar(cx)))
             .child(self.grid_search.clone())
             .child(div().flex_1().min_h_0().overflow_hidden().child(content))
             .when(!self.error.is_empty(), |view| {

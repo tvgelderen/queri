@@ -1776,3 +1776,156 @@ async fn workspace_search_live_drafts_selects_text_offline_and_drops_closed_tabs
             .is_empty()
     );
 }
+
+#[gpui_kit::test]
+async fn transaction_close_reconnect_profile_and_quit_guards(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let directory = tempfile::tempdir().unwrap();
+    let profile = ConnectionProfile {
+        id: Uuid::new_v4(),
+        name: "Transactions".into(),
+        notes: String::new(),
+        color: String::new(),
+        remember_password: false,
+        config: ConnectionConfig::Sqlite {
+            path: directory.path().join("db.sqlite"),
+            read_only: false,
+            create: true,
+            wal: true,
+            foreign_keys: true,
+        },
+    };
+    let store = Store::open(directory.path().join("app.db")).unwrap();
+    store.save_profile(&profile).unwrap();
+    let services = Services::new(runtime().unwrap(), store);
+    let (window, workspace) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workspace::new(
+                    services.clone(),
+                    Preferences {
+                        active_connection: Some(profile.id),
+                        ..Default::default()
+                    },
+                    vec![profile.clone()],
+                    window,
+                    cx,
+                )
+            })
+        })
+        .unwrap()
+    });
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace.read(cx).connection_state == ConnectionState::Ready
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("new-query", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace
+            .read(cx)
+            .documents
+            .first()
+            .is_some_and(|doc| !doc.read(cx).busy())
+    })
+    .await;
+    let doc = cx.update(|cx| workspace.read(cx).documents[0].clone());
+    cx.update_window(window, |_, window, cx| {
+        window.click("begin-transaction", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    let original = cx.update(|cx| doc.read(cx).session.clone().unwrap());
+    // Each loss path offers keeping the same session alive. Repeated requests
+    // while the guard is open must not stack another transaction prompt.
+    for action in 0..4 {
+        cx.update_window(window, |_, window, cx| {
+            workspace.update(cx, |workspace, cx| match action {
+                0 => {
+                    workspace.close_document(0, window, cx);
+                    workspace.close_document(0, window, cx);
+                }
+                1 => workspace.request_quit(window, cx),
+                2 => workspace.connection_form(Some(profile.clone()), window, cx),
+                _ => workspace.delete_connection(profile.id, window, cx),
+            });
+        })
+        .unwrap();
+        cx.wait_for(window, Duration::from_secs(5), |window, _| {
+            window.try_find_by_label("Keep open").is_some()
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| {
+            click_label(window, "Keep open", cx);
+        })
+        .unwrap();
+        cx.wait_for(window, Duration::from_secs(5), |window, cx| {
+            !doc.read(cx).busy() && window.try_find_by_label("Keep open").is_none()
+        })
+        .await;
+        cx.update(|cx| {
+            assert_eq!(workspace.read(cx).documents.len(), 1);
+            assert!(std::sync::Arc::ptr_eq(
+                doc.read(cx).session.as_ref().unwrap(),
+                &original
+            ));
+            assert_eq!(doc.read(cx).transaction, TransactionStatus::Open);
+        });
+    }
+    cx.update_window(window, |_, _, cx| {
+        doc.update(cx, |_, cx| {
+            cx.emit(super::super::document::ReconnectRequested)
+        });
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.try_find_by_label("Roll back and close").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        click_label(window, "Roll back and close", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        !doc.read(cx).busy()
+            && doc
+                .read(cx)
+                .session
+                .as_ref()
+                .is_some_and(|session| !std::sync::Arc::ptr_eq(session, &original))
+    })
+    .await;
+    assert_eq!(
+        services
+            .runtime
+            .block_on(original.transaction_status())
+            .unwrap(),
+        TransactionStatus::Idle
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.click("begin-transaction", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.close_document(0, window, cx));
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.try_find_by_label("Roll back and close").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        click_label(window, "Roll back and close", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace.read(cx).documents.is_empty()
+    })
+    .await;
+}

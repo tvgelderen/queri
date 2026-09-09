@@ -15,6 +15,7 @@ mod saved_queries;
 mod search;
 mod table_finder;
 mod theme;
+mod transaction_guard;
 mod workspace;
 
 #[cfg(all(test, feature = "test-support"))]

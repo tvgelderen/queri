@@ -1018,3 +1018,141 @@ fn postgres_text_bind_fidelity_errors_and_limits() -> Result<()> {
         Ok(())
     })
 }
+
+#[test]
+fn sqlite_transaction_commit_rollback_isolation_and_automatic_rollback() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    runtime()?.block_on(async {
+        let profile = sqlite_profile(dir.path().join("transactions.db"));
+        let first = Session::connect(profile.clone(), String::new()).await?;
+        let second = Session::connect(profile, String::new()).await?;
+        first
+            .query(
+                "CREATE TABLE tx(id INTEGER PRIMARY KEY); BEGIN; INSERT INTO tx VALUES(1)".into(),
+            )
+            .await?;
+        assert_eq!(first.transaction_status().await?, TransactionStatus::Open);
+        assert_eq!(second.transaction_status().await?, TransactionStatus::Idle);
+        assert_eq!(
+            second.query("SELECT count(*) FROM tx".into()).await?.sets[0].rows[0][0],
+            Cell::Integer(0)
+        );
+        first.query("COMMIT".into()).await?;
+        assert_eq!(
+            second.query("SELECT count(*) FROM tx".into()).await?.sets[0].rows[0][0],
+            Cell::Integer(1)
+        );
+        first
+            .query("BEGIN; INSERT INTO tx VALUES(2); ROLLBACK".into())
+            .await?;
+        assert_eq!(
+            second.query("SELECT count(*) FROM tx".into()).await?.sets[0].rows[0][0],
+            Cell::Integer(1)
+        );
+        first
+            .query("BEGIN; INSERT INTO tx VALUES(3)".into())
+            .await?;
+        assert!(
+            first
+                .query("INSERT OR ROLLBACK INTO tx VALUES(1)".into())
+                .await
+                .is_err()
+        );
+        assert_eq!(first.transaction_status().await?, TransactionStatus::Idle);
+        assert_eq!(
+            second.query("SELECT count(*) FROM tx".into()).await?.sets[0].rows[0][0],
+            Cell::Integer(1)
+        );
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires disposable PostgreSQL"]
+fn postgres_transaction_commit_rollback_isolation() -> Result<()> {
+    runtime()?.block_on(async {
+        let (profile, password) = postgres_profile()?;
+        let first = Session::connect(profile.clone(), password.clone()).await?;
+        let second = Session::connect(profile, password).await?;
+        let name = format!("transaction_{}", Uuid::new_v4().simple());
+        first
+            .query(format!("CREATE TABLE {name}(id INTEGER PRIMARY KEY)"))
+            .await?;
+        first
+            .query(format!("BEGIN; INSERT INTO {name} VALUES(1)"))
+            .await?;
+        assert_eq!(
+            second
+                .query(format!("SELECT count(*) FROM {name}"))
+                .await?
+                .sets[0]
+                .rows[0][0]
+                .text(),
+            "0"
+        );
+        first.query("COMMIT".into()).await?;
+        assert_eq!(
+            second
+                .query(format!("SELECT count(*) FROM {name}"))
+                .await?
+                .sets[0]
+                .rows[0][0]
+                .text(),
+            "1"
+        );
+        first
+            .query(format!(
+                "BEGIN; INSERT INTO {name} VALUES(2); SAVEPOINT recovery"
+            ))
+            .await?;
+        assert!(
+            first
+                .query(format!("INSERT INTO {name} VALUES(1)"))
+                .await
+                .is_err()
+        );
+        assert_eq!(first.transaction_status().await?, TransactionStatus::Failed);
+        first.query("ROLLBACK TO recovery; ROLLBACK".into()).await?;
+        assert_eq!(
+            second
+                .query(format!("SELECT count(*) FROM {name}"))
+                .await?
+                .sets[0]
+                .rows[0][0]
+                .text(),
+            "1"
+        );
+        first.query(format!("DROP TABLE {name}")).await?;
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires disposable PostgreSQL"]
+fn postgres_transaction_disconnect_during_commit_is_unknown() -> Result<()> {
+    runtime()?.block_on(async {
+        let (profile, password) = postgres_profile()?;
+        let writer = Session::connect(profile.clone(), password.clone()).await?;
+        let observer = Session::connect(profile, password).await?;
+        let name = format!("commit_loss_{}", Uuid::new_v4().simple());
+        observer.query(format!("CREATE TABLE {name}(id integer); CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(30); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_commit AFTER INSERT ON {name} DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION {name}()")).await?;
+        let pid = writer.query("SELECT pg_backend_pid()".into()).await?.sets[0].rows[0][0].text();
+        writer.query(format!("BEGIN; INSERT INTO {name} VALUES(1)")).await?;
+        let committing = writer.clone();
+        let commit = tokio::spawn(async move { committing.query("COMMIT".into()).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = observer.query(format!("SELECT count(*) FROM pg_stat_activity WHERE pid={pid} AND wait_event='PgSleep' AND query='COMMIT'")).await?;
+                if state.sets[0].rows[0][0].text() == "1" { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok::<_, anyhow::Error>(())
+        }).await??;
+        observer.query(format!("SELECT pg_terminate_backend({pid})")).await?;
+        assert!(tokio::time::timeout(Duration::from_secs(5), commit).await??.is_err());
+        assert_eq!(writer.transaction_status().await?, TransactionStatus::Unknown);
+        assert_eq!(observer.query(format!("SELECT count(*) FROM {name}")).await?.sets[0].rows[0][0].text(), "0");
+        observer.query(format!("DROP TABLE {name}; DROP FUNCTION {name}()")).await?;
+        Ok(())
+    })
+}

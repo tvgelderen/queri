@@ -1094,3 +1094,245 @@ async fn inspector_search_keeps_document_search_and_sql_untouched(cx: &mut TestA
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+async fn transaction_controls_manual_sql_and_error_observation(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(false, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.click("begin-transaction", cx);
+        assert!(doc.read(cx).busy());
+        // A second action cannot race the pending BEGIN/status observation.
+        doc.update(cx, |doc, cx| doc.transaction_command("COMMIT", window, cx));
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(doc.read(cx).transaction, TransactionStatus::Open);
+        assert!(doc.read(cx).transaction_started.is_some());
+        doc.update(cx, |doc, cx| {
+            doc.execute(
+                "INSERT INTO items VALUES(2,'pending'); SELECT * FROM missing".into(),
+                window,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(doc.read(cx).transaction, TransactionStatus::Open);
+        assert!(!doc.read(cx).error.is_empty());
+        window.click("rollback-transaction", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    assert_eq!(
+        fixture
+            .services
+            .runtime
+            .block_on(fixture.session.query("SELECT count(*) FROM items".into()))
+            .unwrap()
+            .sets[0]
+            .rows[0][0],
+        Cell::Integer(1)
+    );
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(doc.read(cx).transaction, TransactionStatus::Idle);
+        assert!(doc.read(cx).transaction_started.is_none());
+        doc.update(cx, |doc, cx| {
+            doc.execute(
+                "SAVEPOINT manual; INSERT INTO items VALUES(3,'saved')".into(),
+                window,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(doc.read(cx).transaction, TransactionStatus::Open);
+        window.click("commit-transaction", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update(|cx| assert_eq!(doc.read(cx).transaction, TransactionStatus::Idle));
+    assert_eq!(
+        fixture
+            .services
+            .runtime
+            .block_on(fixture.session.query("SELECT count(*) FROM items".into()))
+            .unwrap()
+            .sets[0]
+            .rows[0][0],
+        Cell::Integer(2)
+    );
+}
+
+#[gpui_kit::test]
+#[ignore = "requires QUERI_TEST_POSTGRES"]
+async fn postgres_transaction_failed_recovery_and_unknown_commit_ui(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let mut fixture = Fixture::new();
+    let config = std::env::var("QUERI_TEST_POSTGRES")
+        .unwrap()
+        .parse::<tokio_postgres::Config>()
+        .unwrap();
+    fixture.profile.config = ConnectionConfig::Postgres {
+        host: match &config.get_hosts()[0] {
+            tokio_postgres::config::Host::Tcp(host) => host.clone(),
+            _ => panic!("TCP required"),
+        },
+        port: config.get_ports()[0],
+        database: config.get_dbname().unwrap_or("postgres").into(),
+        user: config.get_user().unwrap().into(),
+        tls: TlsMode::Disable,
+        timeout_seconds: 5,
+    };
+    let password = String::from_utf8(config.get_password().unwrap_or_default().to_vec()).unwrap();
+    fixture.session = fixture
+        .services
+        .runtime
+        .block_on(Session::connect(fixture.profile.clone(), password.clone()))
+        .unwrap();
+    let observer = fixture
+        .services
+        .runtime
+        .block_on(Session::connect(fixture.profile.clone(), password))
+        .unwrap();
+    let (window, doc) = fixture.open(false, cx);
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| {
+            doc.execute("BEGIN; SAVEPOINT recovery; SELECT 1/0".into(), window, cx)
+        });
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(doc.read(cx).transaction, TransactionStatus::Failed);
+        doc.update(cx, |doc, cx| doc.transaction_command("COMMIT", window, cx));
+        assert!(
+            !doc.read(cx).busy(),
+            "Failed transaction cannot be committed by the toolbar"
+        );
+        doc.update(cx, |doc, cx| {
+            doc.execute("ROLLBACK TO recovery".into(), window, cx)
+        });
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update(|cx| assert_eq!(doc.read(cx).transaction, TransactionStatus::Open));
+    let pid = fixture
+        .services
+        .runtime
+        .block_on(fixture.session.query("SELECT pg_backend_pid()".into()))
+        .unwrap()
+        .sets[0]
+        .rows[0][0]
+        .text();
+    fixture
+        .services
+        .runtime
+        .block_on(observer.query(format!("SELECT pg_terminate_backend({pid})")))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.click("commit-transaction", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update(|cx| {
+        assert_eq!(doc.read(cx).transaction, TransactionStatus::Unknown);
+        assert!(doc.read(cx).error.contains("may have taken effect"));
+        assert!(matches!(
+            doc.read(cx).query_outcome,
+            super::QueryOutcome::Failed
+        ));
+    });
+}
+
+#[gpui_kit::test]
+async fn transaction_cancellation_settles_before_controls_enable(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(false, cx);
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| doc.execute("BEGIN; WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n) SELECT sum(x) FROM n".into(), window, cx));
+    }).unwrap();
+    // Let SQLite enter the recursive statement before interrupting its worker.
+    cx.executor().timer(Duration::from_millis(100)).await;
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| doc.cancel(window, cx));
+        assert!(doc.read(cx).busy());
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    let observed = fixture
+        .services
+        .runtime
+        .block_on(fixture.session.transaction_status())
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(doc.read(cx).transaction, observed);
+        assert!(matches!(
+            doc.read(cx).query_outcome,
+            super::QueryOutcome::Cancelled
+        ));
+        if observed == TransactionStatus::Open {
+            window.click("rollback-transaction", cx);
+        }
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update(|cx| assert_eq!(doc.read(cx).transaction, TransactionStatus::Idle));
+}
+
+#[gpui_kit::test]
+async fn transaction_completion_from_old_session_cannot_replace_reconnect_state(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(false, cx);
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| {
+            doc.execute("BEGIN; SELECT 99".into(), window, cx);
+            // Simulate session replacement before the old UI completion is delivered.
+            doc.disconnect(cx);
+            doc.connect(window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    fixture
+        .services
+        .runtime
+        .block_on(fixture.session.transaction_status())
+        .unwrap();
+    cx.executor().timer(Duration::from_millis(100)).await;
+    cx.update(|cx| {
+        assert_eq!(doc.read(cx).transaction, TransactionStatus::Idle);
+        assert!(doc.read(cx).results.is_empty());
+        assert!(doc.read(cx).transaction_started.is_none());
+        assert!(!Arc::ptr_eq(
+            doc.read(cx).session.as_ref().unwrap(),
+            &fixture.session
+        ));
+    });
+    fixture
+        .services
+        .runtime
+        .block_on(fixture.session.query("ROLLBACK".into()))
+        .unwrap();
+}

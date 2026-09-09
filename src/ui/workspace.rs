@@ -7,7 +7,9 @@ use super::{
         brand_logo, brand_mark, destructive_menu_item, icon_button, menu_item, setting_switch,
         shortcut,
     },
-    document::{ConnectionPasswordRequired, Document, DocumentChanged, NewDocumentQuery},
+    document::{
+        ConnectionPasswordRequired, Document, DocumentChanged, NewDocumentQuery, ReconnectRequested,
+    },
     document_tabs::{document_tab, document_tab_bar},
     draft_search::{DraftSearch, OpenDraftMatch},
     history::{History, NewHistoryQuery, ReplayQuery},
@@ -53,7 +55,8 @@ actions!(
         OpenTreeItem,
         NextDocument,
         FindTable,
-        FindDraft
+        FindDraft,
+        Quit
     ]
 );
 
@@ -201,16 +204,24 @@ impl Workspace {
                     let job = services.runtime.spawn(async move {
                         for session in sessions {
                             let _ = session.cancel().await;
+                            if matches!(
+                                session.transaction_status().await,
+                                Ok(TransactionStatus::Open | TransactionStatus::Failed)
+                            ) {
+                                let _ = session.query("ROLLBACK".into()).await;
+                            }
                         }
                     });
                     let _ = job.await;
                 }
             }),
         ];
+        cx.bind_keys([KeyBinding::new("ctrl-q", Quit, Some("QueriWorkspace"))]);
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        window.on_window_should_close(cx, |_, cx| {
-            cx.quit();
+        let view = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            let _ = view.update(cx, |this, cx| this.request_quit(window, cx));
             false
         });
         let mut workspace = Self {
@@ -726,6 +737,19 @@ impl Workspace {
         self.subscriptions.push(cx.subscribe_in(
             &doc,
             window,
+            |this, doc, _: &ReconnectRequested, window, cx| {
+                let doc = doc.clone();
+                this.guard_documents(vec![doc.clone()], window, cx, move |_, window, cx| {
+                    doc.update(cx, |doc, cx| {
+                        doc.disconnect(cx);
+                        doc.connect(window, cx);
+                    });
+                });
+            },
+        ));
+        self.subscriptions.push(cx.subscribe_in(
+            &doc,
+            window,
             |this, _, _: &DocumentChanged, window, cx| this.schedule_save(window, cx),
         ));
         self.subscriptions.push(cx.subscribe_in(
@@ -944,31 +968,56 @@ impl Workspace {
         cx.notify();
     }
 
+    fn guard_documents(
+        &mut self,
+        documents: Vec<Entity<Document>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        complete: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        // Completed operations include authoritative observation before becoming idle.
+        // Preserve immediate tab and form interactions when no transaction can be lost.
+        if documents.iter().all(|doc| {
+            let doc = doc.read(cx);
+            !doc.busy() && (doc.session.is_none() || doc.transaction == TransactionStatus::Idle)
+        }) {
+            complete(self, window, cx);
+        } else {
+            super::transaction_guard::release(&self.services, documents, window, cx, complete);
+        }
+    }
+
+    pub fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.guard_documents(self.documents.clone(), window, cx, |_, _, cx| cx.quit());
+    }
+
     fn close_document(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(doc) = self.documents.get(index) {
-            if doc.read(cx).busy() {
-                doc.update(cx, |doc, cx| doc.cancel(window, cx));
-                self.error =
-                    "Cancelling the active operation. Close the tab again after it finishes."
-                        .into();
-                cx.notify();
+        let Some(doc) = self.documents.get(index).cloned() else {
+            return;
+        };
+        self.guard_documents(vec![doc.clone()], window, cx, move |this, window, cx| {
+            let Some(index) = this
+                .documents
+                .iter()
+                .position(|candidate| candidate == &doc)
+            else {
                 return;
-            }
-            self.documents.remove(index);
-            self.refresh_draft_search(window, cx);
-            self.active = self
+            };
+            this.documents.remove(index);
+            this.refresh_draft_search(window, cx);
+            this.active = this
                 .active
-                .saturating_sub(usize::from(index <= self.active))
-                .min(self.documents.len().saturating_sub(1));
-            if let Some(doc) = self.documents.get(self.active) {
+                .saturating_sub(usize::from(index <= this.active))
+                .min(this.documents.len().saturating_sub(1));
+            if let Some(doc) = this.documents.get(this.active) {
                 doc.update(cx, |doc, cx| doc.focus(window, cx));
             } else {
-                self.focus.focus(window, cx);
+                this.focus.focus(window, cx);
             }
-            self.reveal_active_tab(window, cx);
-            self.schedule_save(window, cx);
+            this.reveal_active_tab(window, cx);
+            this.schedule_save(window, cx);
             cx.notify();
-        }
+        });
     }
 
     fn reveal_active_tab(&self, window: &mut Window, cx: &Context<Self>) {
@@ -985,6 +1034,35 @@ impl Workspace {
     }
 
     fn connection_form(
+        &mut self,
+        profile: Option<ConnectionProfile>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let affected = self
+            .documents
+            .iter()
+            .filter(|doc| {
+                profile
+                    .as_ref()
+                    .is_some_and(|profile| doc.read(cx).profile.id == profile.id)
+            })
+            .cloned()
+            .collect();
+        self.guard_documents(affected, window, cx, move |this, window, cx| {
+            // Drop acknowledged sessions before the editable form can save new settings.
+            if let Some(profile) = &profile {
+                for doc in &this.documents {
+                    if doc.read(cx).profile.id == profile.id {
+                        doc.update(cx, |doc, cx| doc.disconnect(cx));
+                    }
+                }
+            }
+            this.connection_form_ready(profile, window, cx);
+        });
+    }
+
+    fn connection_form_ready(
         &mut self,
         profile: Option<ConnectionProfile>,
         window: &mut Window,
@@ -1054,6 +1132,23 @@ impl Workspace {
     }
 
     fn delete_connection(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let affected = self
+            .documents
+            .iter()
+            .filter(|doc| doc.read(cx).profile.id == id)
+            .cloned()
+            .collect();
+        self.guard_documents(affected, window, cx, move |this, window, cx| {
+            for doc in &this.documents {
+                if doc.read(cx).profile.id == id {
+                    doc.update(cx, |doc, cx| doc.disconnect(cx));
+                }
+            }
+            this.delete_connection_ready(id, window, cx);
+        });
+    }
+
+    fn delete_connection_ready(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         let Some(profile) = self
             .profiles
             .iter()
@@ -1327,6 +1422,10 @@ impl Workspace {
                         }).cloned().collect::<Vec<_>>();
                         if affected.iter().any(|doc| doc.read(cx).busy()) || !this.loading.is_empty() {
                             admin.update(cx, |admin, cx| admin.show_error("Wait for queries and explorer loading to finish, or cancel the query, then retry.".into(), cx));
+                            return;
+                        }
+                        if affected.iter().any(|doc| doc.read(cx).session.is_some() && doc.read(cx).transaction == TransactionStatus::Unknown) {
+                            admin.update(cx, |admin, cx| admin.show_error("A tab has an unknown transaction outcome. Close or reconnect that tab and acknowledge the unknown outcome before continuing.".into(), cx));
                             return;
                         }
                         for doc in affected { doc.update(cx, |doc, cx| doc.disconnect(cx)); }
@@ -2376,6 +2475,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &NewConnection, window, cx| {
                 this.connection_form(None, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &Quit, window, cx| this.request_quit(window, cx)))
             .on_action(cx.listener(|this, _: &CloseDocument, window, cx| {
                 this.close_document(this.active, window, cx)
             }))
