@@ -1360,7 +1360,31 @@ async fn statement_timeout_controls_outcome_history_and_reconnect(cx: &mut TestA
     cx.executor().timer(Duration::from_millis(100)).await;
     cx.update_window(window, |_, window, cx| {
         window.click("statement-timeout", cx);
-        window.within("dropdown-menu:Name(\"statement-timeout\")").within("popup-menu").click(2_usize, cx);
+        window
+            .within("dropdown-menu:Name(\"statement-timeout\")")
+            .within("popup-menu")
+            .click(2_usize, cx);
+    })
+    .unwrap();
+    for invalid in ["", "0", "-1", "2147483648"] {
+        cx.update_window(window, |_, window, cx| {
+            let input = doc.read(cx).timeout_input.clone();
+            input.update(cx, |input, cx| input.set_value(invalid, window, cx));
+            window.click("ok", cx);
+            assert_eq!(doc.read(cx).statement_timeout, StatementTimeout::NoTimeout);
+        })
+        .unwrap();
+        cx.wait_for(window, Duration::from_secs(2), |window, _| {
+            window
+                .try_find("timeout-validation")
+                .is_some_and(|element| {
+                    element.label()
+                        == Some("Enter a whole number from 1 to 2147483647 milliseconds.")
+                })
+        })
+        .await;
+    }
+    cx.update_window(window, |_, window, cx| {
         let input = doc.read(cx).timeout_input.clone();
         input.update(cx, |input, cx| input.set_value("200", window, cx));
         window.click("ok", cx);

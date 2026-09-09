@@ -55,6 +55,14 @@ Final diff check clean; designated cluster stopped after all test work settled.
 
 ## Limits and explicit semantics
 
+Parent integration validation passed all four database timeout tests, both native
+timeout tests, and the storage round-trip test. Independent review found silent
+invalid-duration rejection. The parent added a live inline validation message and
+native coverage for empty, zero, negative, and excessive values, preserving the
+previous preference and correcting to a valid value. Initial UI assertions could
+not observe the plain div; adding the existing GPUI test-support observation hook
+made the rendered alert testable. Both native timeout tests then passed.
+
 - These settings cover SQL execution, including binds and transaction commands; explorer metadata, table mutation APIs, and administration have no new timeout controls.
 - PostgreSQL manual `SET statement_timeout` within a raw script controls later statements in that script; the selected preference is reapplied on the next submission. Recovery in Failed state cannot accept configuration SQL, so it uses the current backend policy until recovery completes. Standalone Rollback likewise uses the active policy.
 - SQLite manual `PRAGMA busy_timeout` within a script can replace its busy handler; the outer scope restores the pre-execution busy policy. This explicit manual override is documented. Computation deadlines remain active. Inherit/NoTimeout preserve SQLite's existing lock policy (normally five seconds), which is not an execution deadline.

@@ -86,6 +86,20 @@ enum QueryOutcome {
 }
 
 pub struct DocumentChanged;
+struct TimeoutValidation(String);
+
+impl Render for TimeoutValidation {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("timeout-validation")
+            .test_support()
+            .role(Role::Alert)
+            .aria_label(self.0.clone())
+            .text_color(cx.theme().danger)
+            .child(self.0.clone())
+    }
+}
+
 impl EventEmitter<DocumentChanged> for Document {}
 pub struct OpenRelated(pub RelationshipScope);
 impl EventEmitter<OpenRelated> for Document {}
@@ -852,15 +866,25 @@ impl Document {
                             this.timeout_input.update(cx, |input, cx| input.set_value(value, window, cx));
                             let input = this.timeout_input.clone();
                             let view = cx.entity().downgrade();
+                            let validation = cx.new(|_| TimeoutValidation(String::new()));
                             window.open_alert_dialog(cx, move |dialog, _, _| {
                                 let input = input.clone();
                                 let view = view.clone();
+                                let validation = validation.clone();
                                 dialog.title("Statement timeout")
                                     .child("Positive duration in milliseconds (maximum 2147483647). Applies separately to each statement.")
                                     .child(Input::new(&input))
-                                    .button_props(DialogButtonProps::default().ok_text("Apply").show_cancel(true)).on_ok(move |_, _, cx| {
+                                    .child(validation.clone())
+                                    .button_props(DialogButtonProps::default().ok_text("Apply").show_cancel(true)).on_ok(move |_, window, cx| {
                                         let timeout = input.read(cx).value().parse::<u32>().ok().and_then(|ms| StatementTimeout::custom(ms).ok());
-                                        let Some(timeout) = timeout else { return false; };
+                                        let Some(timeout) = timeout else {
+                                            validation.update(cx, |message, cx| {
+                                                message.0 = "Enter a whole number from 1 to 2147483647 milliseconds.".into();
+                                                cx.notify();
+                                            });
+                                            input.read(cx).focus_handle(cx).focus(window, cx);
+                                            return false;
+                                        };
                                         let _ = view.update(cx, |this, cx| this.set_timeout(timeout, cx));
                                         true
                                     })
