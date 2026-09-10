@@ -18,6 +18,8 @@ async fn history_delete_requires_confirmation(cx: &mut TestAppContext) {
     let id = Uuid::new_v4();
     store
         .save_profile(&ConnectionProfile {
+            environment: None,
+            policy: ExecutionPolicy::Normal,
             id,
             name: "History fixture".into(),
             notes: String::new(),

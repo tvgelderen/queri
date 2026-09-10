@@ -33,8 +33,47 @@ pub enum ConnectionConfig {
     },
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Environment {
+    Development,
+    Staging,
+    Production,
+}
+
+impl Environment {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Development => "Development",
+            Self::Staging => "Staging",
+            Self::Production => "Production",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExecutionPolicy {
+    #[default]
+    Normal,
+    ConfirmExecutions,
+    ReadOnlyByDefault,
+}
+
+impl ExecutionPolicy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::ConfirmExecutions => "Confirm executions",
+            Self::ReadOnlyByDefault => "PostgreSQL Read-only by default",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConnectionProfile {
+    #[serde(default)]
+    pub environment: Option<Environment>,
+    #[serde(default)]
+    pub policy: ExecutionPolicy,
     pub id: Uuid,
     pub name: String,
     pub notes: String,
@@ -70,7 +109,30 @@ impl std::fmt::Display for ConnectionValidationError {
 impl std::error::Error for ConnectionValidationError {}
 
 impl ConnectionProfile {
+    pub fn display_name(&self) -> String {
+        match self.environment {
+            Some(environment) => format!("{} · {}", self.name, environment.label()),
+            None => self.name.clone(),
+        }
+    }
+
+    pub fn context(&self) -> String {
+        format!("{} / {}", self.display_name(), self.database())
+    }
+
+    pub fn blocks_mutations(&self) -> bool {
+        match self.config {
+            ConnectionConfig::Postgres { .. } => self.policy == ExecutionPolicy::ReadOnlyByDefault,
+            ConnectionConfig::Sqlite { read_only, .. } => read_only,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.policy != ExecutionPolicy::ReadOnlyByDefault
+                || matches!(self.config, ConnectionConfig::Postgres { .. }),
+            "Read-only by default is a PostgreSQL policy. For SQLite, use its read-only file option."
+        );
         ensure!(
             !self.name.trim().is_empty(),
             ConnectionValidationError {

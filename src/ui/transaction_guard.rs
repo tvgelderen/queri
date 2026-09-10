@@ -56,6 +56,14 @@ pub(super) fn release<V: 'static>(
                 complete(this, window, cx);
                 return;
             }
+            let affected = documents
+                .iter()
+                .map(|doc| {
+                    let doc = doc.read(cx);
+                    format!("{} — {}", doc.profile.context(), doc.title())
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             let unknown = states.contains(&TransactionStatus::Unknown);
             let complete = Rc::new(RefCell::new(Some(complete)));
             let view = cx.entity().downgrade();
@@ -67,6 +75,7 @@ pub(super) fn release<V: 'static>(
             let view = view.clone();
             let services = services.clone();
             dialog.title("Close database sessions?")
+                .child(affected.clone())
                 .child(if unknown {
                     "A transaction outcome is unknown. A COMMIT may already have taken effect. Closing cannot undo or confirm it; Queri will not retry it. Other open transactions will be rolled back."
                 } else {

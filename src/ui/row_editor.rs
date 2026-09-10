@@ -4,6 +4,7 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Sizable, WindowExt,
     button::{Button, ButtonVariants},
+    dialog::DialogButtonProps,
     h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder;
@@ -86,7 +87,7 @@ impl RowEditor {
     }
 
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.busy || self.session.read_only() {
             return;
         }
         let sqlite = matches!(self.session.profile.config, ConnectionConfig::Sqlite { .. });
@@ -132,6 +133,44 @@ impl RowEditor {
             },
             None => RowChange::Insert(values),
         };
+        if self.session.profile.policy == ExecutionPolicy::ConfirmExecutions {
+            let view = cx.entity();
+            let context = self.session.profile.context();
+            let operation = if self.original.is_some() {
+                "Update row"
+            } else {
+                "Insert row"
+            };
+            let table = format!("{}.{}", self.table.schema, self.table.name);
+            window.open_alert_dialog(cx, move |dialog, _, _| {
+                let view = view.clone();
+                let change = change.clone();
+                dialog
+                    .title(format!("{operation}?"))
+                    .child(format!(
+                        "{operation} in {table} on {context}. Cancel makes no changes."
+                    ))
+                    .button_props(
+                        DialogButtonProps::default()
+                            .ok_text("Save row")
+                            .show_cancel(true),
+                    )
+                    .on_ok(move |_, window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.save_confirmed(change.clone(), window, cx)
+                        });
+                        true
+                    })
+            });
+        } else {
+            self.save_confirmed(change, window, cx);
+        }
+    }
+
+    fn save_confirmed(&mut self, change: RowChange, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.session.read_only() {
+            return;
+        }
         let session = self.session.clone();
         let table = self.table.clone();
         self.busy = true;
@@ -254,11 +293,12 @@ impl Render for RowEditor {
             })
             .collect::<Vec<_>>();
         v_flex().gap_4()
+            .child(div().text_sm().child(self.session.profile.context()))
             .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Choose Value, NULL, or Default for each field. Binary SQLite values use hexadecimal."))
             .child(div().id("row-fields").max_h((window.viewport_size().height - px(280.)).clamp(px(120.),px(470.))).child(v_flex().gap_4().children(rows)).overflow_y_scrollbar())
             .when(!self.error.is_empty(), |view| view.child(div().id("row-save-error").role(Role::Alert).text_sm().text_color(cx.theme().danger).child(self.error.clone())))
             .child(h_flex().gap_2().justify_end()
                 .child(Button::new("cancel-row").label("Cancel").disabled(self.busy).on_click(|_, window, cx| window.close_dialog(cx)))
-                .child(Button::new("save-row").primary().label(if self.original.is_some(){"Save changes"}else{"Insert row"}).loading(self.busy).disabled(self.busy).on_click(cx.listener(|this,_,window,cx|this.save(window,cx)))))
+                .child(Button::new("save-row").primary().label(if self.original.is_some(){"Save changes"}else{"Insert row"}).loading(self.busy).disabled(self.busy || self.session.read_only()).on_click(cx.listener(|this,_,window,cx|this.save(window,cx)))))
     }
 }

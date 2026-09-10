@@ -70,6 +70,17 @@ SQL results are limited to **10,000 rows / 32 MiB per script** and marked when t
 | Ctrl+Q | Quit with transaction checks |
 | Arrow keys / Enter | Navigate / open explorer items |
 
+## Connection safeguards
+
+Connection forms offer an optional **Development**, **Staging**, or **Production** label, shown as text beside the connection name and in document and confirmation context. The existing connection color remains a visual cue. Labels and policy are independent: selecting Production never changes execution. Older profiles default to no label and **Normal** policy.
+
+- **Normal** preserves ordinary execution and existing destructive-SQL warnings.
+- **Confirm executions** asks before each SQL submission, including selections and the shared submission path for bound parameters. Begin and Commit also ask. Toolbar Rollback and rollback during session-loss recovery remain available without an extra execution prompt; manually submitted rollback SQL still asks. Generated inserts and updates ask before saving. Row deletion and database administration use their existing operation-specific confirmation with connection, environment, and database context. Cancel sends no operation and makes no database changes. Explorer reads, refreshes, connection tests, and session inspection do not ask.
+- **PostgreSQL Read-only by default** sets `default_transaction_read_only=on` when each session connects, including reconnects. PostgreSQL rejects ordinary persistent writes by default. Queri also blocks generated row mutations and database administration in the UI and Session API. **This is an accident-prevention default, not a security boundary.** Raw SQL can use `BEGIN READ WRITE` or change the default; PostgreSQL permits writes to existing temporary tables in read-only transactions. Queri observes current read-only settings after submissions when the transaction is not failed, and reports observed read-write overrides. It cannot report every transient change inside a script or promise immutable state. Generated changes remain blocked even after a raw SQL override. Use PostgreSQL role permissions for hard enforcement.
+- SQLite retains its existing read-only file-opening option; the PostgreSQL default policy is not offered for SQLite. Normal policy does not reset PostgreSQL server, database, or role defaults.
+
+Editing a connection checks its affected document sessions using the transaction-loss guard. The prompt identifies the sessions; keep them open or acknowledge rollback before editing. Saving refreshes profiles on all affected documents, and sessions reconnect with the saved policy. Uncommitted work is never silently discarded. No environment or transaction state is inferred from connection color.
+
 ## Storage
 
 Application data lives in `$XDG_DATA_HOME/queri/queri.sqlite3` (normally `~/.local/share/queri/queri.sqlite3`). Set `QUERI_DATA_DIR` to choose another directory. Connection metadata, preferences, drafts, saved queries, and SQL history are stored locally. Remembered passwords use XChaCha20-Poly1305 encryption in the same database, with a random key in `queri.sqlite3.key` beside it. The key file has owner-only permissions (`0600`). Anyone who can read both files can decrypt the passwords. SQL text itself may contain sensitive values and is retained in drafts, saved queries, and history.

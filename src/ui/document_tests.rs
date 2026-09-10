@@ -25,6 +25,8 @@ impl Fixture {
         let directory = tempfile::tempdir().expect("temporary data directory");
         let store = Store::open(directory.path().join("app.db")).expect("open app database");
         let profile = ConnectionProfile {
+            environment: None,
+            policy: ExecutionPolicy::Normal,
             remember_password: false,
             id: Uuid::new_v4(),
             name: "UI fixture".into(),
@@ -1464,4 +1466,297 @@ async fn statement_timeout_settings_preserve_failed_transaction_recovery(cx: &mu
         assert_ne!(window.find("rollback-transaction").disabled(), Some(true));
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+async fn safeguards_confirmation_selection_transactions_and_cancel(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let mut fixture = Fixture::new();
+    fixture.profile.environment = Some(Environment::Production);
+    fixture.profile.policy = ExecutionPolicy::ConfirmExecutions;
+    let (window, doc) = fixture.open(false, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window
+                .find("document-context")
+                .label()
+                .unwrap()
+                .contains("Production")
+        );
+        window.input("INSERT INTO items VALUES(2,'confirmed');", cx);
+        window.press("ctrl-enter", cx);
+        window.render_frame(cx);
+        let confirmation = window.find("sql-confirmation-context");
+        let message = confirmation.label().unwrap();
+        assert!(message.contains("UI fixture · Production"));
+        assert!(message.contains("INSERT INTO items"));
+        assert!(message.contains(&fixture.profile.database()));
+        window.click("cancel", cx);
+        assert!(!doc.read(cx).busy());
+    })
+    .unwrap();
+    assert_eq!(
+        fixture
+            .services
+            .runtime
+            .block_on(fixture.session.query("SELECT count(*) FROM items".into()))
+            .unwrap()
+            .sets[0]
+            .rows[0][0],
+        Cell::Integer(1)
+    );
+    assert!(
+        fixture
+            .services
+            .store
+            .history(fixture.profile.id, "", 0)
+            .unwrap()
+            .is_empty()
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.click("run-query", cx);
+        window.click("ok", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    assert_eq!(
+        fixture
+            .services
+            .runtime
+            .block_on(fixture.session.query("SELECT count(*) FROM items".into()))
+            .unwrap()
+            .sets[0]
+            .rows[0][0],
+        Cell::Integer(2)
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.click("begin-transaction", cx);
+        window.click("cancel", cx);
+        assert_eq!(doc.read(cx).transaction, TransactionStatus::Idle);
+        window.click("begin-transaction", cx);
+        window.click("ok", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(doc.read(cx).transaction, TransactionStatus::Open);
+        window.click("commit-transaction", cx);
+        window.click("cancel", cx);
+        assert_eq!(doc.read(cx).transaction, TransactionStatus::Open);
+        window.click("rollback-transaction", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(doc.read(cx).transaction, TransactionStatus::Idle);
+        assert!(window.try_find("ok").is_none());
+        // Selected SQL and destructive warnings share exactly one confirmation.
+        doc.update(cx, |doc, cx| {
+            let DocumentKind::Sql { editor } = &doc.kind else {
+                panic!()
+            };
+            editor.update(cx, |editor, cx| {
+                editor.set_value("DELETE FROM items; SELECT 99;", window, cx);
+                editor.set_selected_range(0..18, cx);
+            });
+            doc.run(window, cx);
+        });
+        window.click("ok", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        assert!(window.try_find("ok").is_none());
+        assert_eq!(doc.read(cx).results.len(), 1);
+    })
+    .unwrap();
+    assert_eq!(
+        fixture
+            .services
+            .runtime
+            .block_on(fixture.session.query("SELECT count(*) FROM items".into()))
+            .unwrap()
+            .sets[0]
+            .rows[0][0],
+        Cell::Integer(0)
+    );
+}
+
+#[gpui_kit::test]
+async fn safeguards_row_editor_confirm_cancel_and_delete(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let mut fixture = Fixture::new();
+    fixture.profile.policy = ExecutionPolicy::ConfirmExecutions;
+    fixture.profile.environment = Some(Environment::Staging);
+    fixture.session = fixture
+        .services
+        .runtime
+        .block_on(Session::connect(fixture.profile.clone(), String::new()))
+        .unwrap();
+    let (window, doc) = fixture.open(true, cx);
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("insert", cx);
+        window.click("save-row", cx);
+        window.click("cancel", cx);
+        assert!(window.find("save-row").visible());
+    })
+    .unwrap();
+    assert_eq!(
+        fixture
+            .services
+            .runtime
+            .block_on(fixture.session.query("SELECT count(*) FROM items".into()))
+            .unwrap()
+            .sets[0]
+            .rows[0][0],
+        Cell::Integer(1)
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.click("save-row", cx);
+        window.click("ok", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        doc.read(cx).grid.read(cx).delegate().data.rows.len() == 2
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        doc.read(cx)
+            .grid
+            .clone()
+            .update(cx, |grid, cx| grid.set_selected_row(1, cx));
+        doc.update(cx, |doc, cx| doc.delete_rows(window, cx));
+        window.click("cancel", cx);
+        doc.update(cx, |doc, cx| doc.delete_rows(window, cx));
+        window.click("ok", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        doc.read(cx).grid.read(cx).delegate().data.rows.len() == 1
+    })
+    .await;
+    cx.update_window(window, |_, window, _| {
+        assert!(window.try_find("ok").is_none())
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+async fn safeguards_read_only_row_actions_cannot_bypass(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let mut fixture = Fixture::new();
+    if let ConnectionConfig::Sqlite {
+        read_only, create, ..
+    } = &mut fixture.profile.config
+    {
+        *read_only = true;
+        *create = false;
+    }
+    fixture.session = fixture
+        .services
+        .runtime
+        .block_on(Session::connect(fixture.profile.clone(), String::new()))
+        .unwrap();
+    let (window, doc) = fixture.open(true, cx);
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("insert").disabled(), Some(true));
+        doc.update(cx, |doc, cx| {
+            doc.edit_row(true, window, cx);
+            doc.delete_rows(window, cx);
+        });
+        assert!(window.try_find("save-row").is_none());
+        assert!(window.try_find("ok").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+#[ignore = "requires QUERI_TEST_POSTGRES"]
+async fn postgres_safeguards_parameter_submission_and_read_only_ui(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let mut fixture = Fixture::new();
+    let config = std::env::var("QUERI_TEST_POSTGRES")
+        .unwrap()
+        .parse::<tokio_postgres::Config>()
+        .unwrap();
+    fixture.profile.config = ConnectionConfig::Postgres {
+        host: match &config.get_hosts()[0] {
+            tokio_postgres::config::Host::Tcp(host) => host.clone(),
+            _ => panic!("TCP required"),
+        },
+        port: config.get_ports()[0],
+        database: config.get_dbname().unwrap_or("postgres").into(),
+        user: config.get_user().unwrap().into(),
+        tls: TlsMode::Disable,
+        timeout_seconds: 5,
+    };
+    fixture.profile.policy = ExecutionPolicy::ConfirmExecutions;
+    let password = String::from_utf8(config.get_password().unwrap_or_default().to_vec()).unwrap();
+    fixture.session = fixture
+        .services
+        .runtime
+        .block_on(Session::connect(fixture.profile.clone(), password.clone()))
+        .unwrap();
+    let (window, doc) = fixture.open(false, cx);
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| {
+            doc.submit_sql(
+                "SELECT $1::text".into(),
+                Some(vec![Some("confirmed parameter".into())]),
+                window,
+                cx,
+            )
+        });
+        window.click("cancel", cx);
+        assert!(doc.read(cx).results.is_empty());
+        doc.update(cx, |doc, cx| {
+            doc.submit_sql(
+                "SELECT $1::text".into(),
+                Some(vec![Some("confirmed parameter".into())]),
+                window,
+                cx,
+            )
+        });
+        window.click("ok", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update(|cx| {
+        assert_eq!(
+            doc.read(cx).results[0].rows[0][0],
+            Cell::Text("confirmed parameter".into())
+        )
+    });
+    fixture.profile.policy = ExecutionPolicy::ReadOnlyByDefault;
+    let session = fixture
+        .services
+        .runtime
+        .block_on(Session::connect(fixture.profile.clone(), password))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| {
+            doc.profile = fixture.profile.clone();
+            doc.session = Some(session.clone());
+            doc.execute("SET default_transaction_read_only=off".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    assert!(session.read_write_observed());
+    assert!(
+        session.read_only(),
+        "Generated changes remain blocked after a raw SQL override"
+    );
 }

@@ -43,6 +43,8 @@ pub struct ConnectionForm {
     color: Entity<InputState>,
     timeout: Entity<InputState>,
     tls: TlsMode,
+    environment: Option<Environment>,
+    policy: ExecutionPolicy,
     read_only: bool,
     create: bool,
     wal: bool,
@@ -107,6 +109,8 @@ impl ConnectionForm {
                 cx,
             ),
             timeout: input("5", window, cx),
+            environment: existing.as_ref().and_then(|p| p.environment),
+            policy: existing.as_ref().map(|p| p.policy).unwrap_or_default(),
             tls: TlsMode::Verify,
             read_only: false,
             create: false,
@@ -228,6 +232,8 @@ impl ConnectionForm {
             }
         };
         let profile = ConnectionProfile {
+            environment: self.environment,
+            policy: self.policy,
             remember_password: !self.sqlite && self.remember,
             id: self.id,
             name: self.name.read(cx).value().to_string(),
@@ -654,6 +660,23 @@ impl Render for ConnectionForm {
                 ));
         }
         form = form
+            .child(h_flex().gap_2().flex_wrap()
+                .child(choice(
+                    Button::new("connection-environment").label(format!("Environment: {}", self.environment.map(Environment::label).unwrap_or("None")))
+                        .tooltip("A label only; choosing Production never changes policy.").disabled(self.busy),
+                    self.environment,
+                    [(None, "None".into()), (Some(Environment::Development), "Development".into()), (Some(Environment::Staging), "Staging".into()), (Some(Environment::Production), "Production".into())],
+                    cx.listener(|this, value, _, cx| { this.environment = *value; cx.notify(); }),
+                ))
+                .child(choice(
+                    Button::new("connection-policy").label(format!("Policy: {}", self.policy.label())).disabled(self.busy),
+                    self.policy,
+                    [ExecutionPolicy::Normal, ExecutionPolicy::ConfirmExecutions, ExecutionPolicy::ReadOnlyByDefault].into_iter()
+                        .filter(|policy| !self.sqlite || *policy != ExecutionPolicy::ReadOnlyByDefault)
+                        .map(|policy| (policy, policy.label().into())),
+                    cx.listener(|this, value, _, cx| { this.policy = *value; cx.notify(); }),
+                )))
+            .when(self.policy == ExecutionPolicy::ReadOnlyByDefault, |form| form.child(div().text_sm().text_color(cx.theme().muted_foreground).child("PostgreSQL read-only is a session default: SQL can override it and temporary objects have exceptions. Generated changes and administration stay blocked. Use database role permissions for enforcement.")))
             .child(
                 disclosure_button("connection-advanced", "Advanced settings", self.advanced)
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -750,6 +773,9 @@ impl Render for ConnectionForm {
                     )
                     .on_click(cx.listener(|this, index, _, cx| {
                         this.sqlite = *index == 1;
+                        if this.sqlite && this.policy == ExecutionPolicy::ReadOnlyByDefault {
+                            this.policy = ExecutionPolicy::Normal;
+                        }
                         this.error = false;
                         this.field_error = None;
                         this.message.clear();
@@ -775,5 +801,63 @@ impl Render for ConnectionForm {
                             .child(div().flex_1().min_w_0().whitespace_normal().child(self.message.clone()))),
                 )
             })
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use super::ConnectionForm;
+    use crate::{database::runtime, storage::Store, ui::test_support::click_label};
+    use crate::{
+        model::{Environment, ExecutionPolicy},
+        ui::Services,
+    };
+    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use gpui_kit::{AppContext, TestAppContext, WindowOptions};
+
+    #[gpui_kit::test]
+    async fn safeguards_form_labels_and_policy_are_independent(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        let services = Services::new(
+            runtime().unwrap(),
+            Store::open(directory.path().join("app.db")).unwrap(),
+        );
+        let (window, form) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| ConnectionForm::new(services, None, None, window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.click("connection-environment", cx);
+            click_label(window, "Production", cx);
+            assert_eq!(form.read(cx).environment, Some(Environment::Production));
+            assert_eq!(form.read(cx).policy, ExecutionPolicy::Normal);
+            window.click("connection-policy", cx);
+            click_label(window, "Confirm executions", cx);
+            assert_eq!(form.read(cx).environment, Some(Environment::Production));
+            assert_eq!(form.read(cx).policy, ExecutionPolicy::ConfirmExecutions);
+            form.update(cx, |form, cx| {
+                form.name.update(cx, |name, cx| {
+                    name.set_value("Production fixture", window, cx)
+                })
+            });
+            let profile = form.read(cx).config(cx).unwrap();
+            assert_eq!(profile.environment, Some(Environment::Production));
+            assert_eq!(profile.policy, ExecutionPolicy::ConfirmExecutions);
+        })
+        .unwrap();
+        cx.wait_for(window, std::time::Duration::from_secs(5), |window, _| {
+            window.try_find("popup-menu").is_none()
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| {
+            window.click("connection-policy", cx);
+            click_label(window, "PostgreSQL Read-only by default", cx);
+            assert!(form.read(cx).config(cx).unwrap().blocks_mutations());
+        })
+        .unwrap();
     }
 }

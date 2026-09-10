@@ -77,6 +77,9 @@ impl Postgres {
             .password(password)
             .application_name("Queri")
             .connect_timeout(Duration::from_secs(*timeout_seconds));
+        if profile.policy == ExecutionPolicy::ReadOnlyByDefault {
+            config.options("-c default_transaction_read_only=on");
+        }
         if !database.is_empty() {
             config.dbname(database);
         }

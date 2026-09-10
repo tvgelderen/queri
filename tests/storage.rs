@@ -15,6 +15,8 @@ use uuid::Uuid;
 
 fn profile() -> ConnectionProfile {
     ConnectionProfile {
+        environment: None,
+        policy: ExecutionPolicy::Normal,
         id: Uuid::new_v4(),
         name: "Remembered PostgreSQL".into(),
         notes: String::new(),
@@ -447,5 +449,42 @@ fn statement_timeout_drafts_are_backward_compatible_and_persistent() -> Result<(
     assert!(StatementTimeout::custom(0).is_err());
     assert!(StatementTimeout::custom(u32::MAX).is_err());
     assert!(serde_json::from_str::<StatementTimeout>(r#"{"Custom":0}"#).is_err());
+    Ok(())
+}
+
+#[test]
+fn safeguards_old_profile_defaults_and_roundtrip() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("app.db");
+    let store = Store::open(path.clone())?;
+    let mut profile = profile();
+    let mut legacy = serde_json::to_value(&profile)?;
+    legacy.as_object_mut().unwrap().remove("environment");
+    legacy.as_object_mut().unwrap().remove("policy");
+    Connection::open(path)?.execute(
+        "INSERT INTO connections(id, profile) VALUES(?1, ?2)",
+        params![profile.id.to_string(), legacy.to_string()],
+    )?;
+    let loaded = store.profiles()?.remove(0);
+    assert_eq!(loaded.environment, None);
+    assert_eq!(loaded.policy, ExecutionPolicy::Normal);
+    for environment in [
+        Environment::Development,
+        Environment::Staging,
+        Environment::Production,
+    ] {
+        for policy in [
+            ExecutionPolicy::Normal,
+            ExecutionPolicy::ConfirmExecutions,
+            ExecutionPolicy::ReadOnlyByDefault,
+        ] {
+            profile.environment = Some(environment);
+            profile.policy = policy;
+            store.save_profile(&profile)?;
+            let loaded = store.profiles()?.remove(0);
+            assert_eq!(loaded.environment, Some(environment));
+            assert_eq!(loaded.policy, policy);
+        }
+    }
     Ok(())
 }

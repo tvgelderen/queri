@@ -167,7 +167,9 @@ impl DatabaseAdmin {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.busy
+            || (self.profile.blocks_mutations() && !matches!(self.action, AdminAction::Sessions(_)))
+        {
             return;
         }
         self.error.clear();
@@ -229,7 +231,7 @@ impl DatabaseAdmin {
     }
 
     pub fn execute(&mut self, action: DatabaseAction, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.busy || self.profile.blocks_mutations() {
             return;
         }
         let maintenance = self.maintenance.read(cx).value().to_string();
@@ -292,7 +294,11 @@ impl DatabaseAdmin {
                     .when(destructive, |button| button.danger().icon(IconName::Trash))
                     .when(!destructive, |button| button.primary())
                     .loading(self.busy)
-                    .disabled(self.busy)
+                    .disabled(
+                        self.busy
+                            || (self.profile.blocks_mutations()
+                                && !matches!(self.action, AdminAction::Sessions(_))),
+                    )
                     .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
             )
             .into_any_element()
@@ -306,7 +312,12 @@ impl Render for DatabaseAdmin {
         v_flex().gap_4()
             .child(h_flex().gap_2().text_sm().text_color(cx.theme().muted_foreground)
                 .child(Icon::new(IconName::Database).small())
-                .child(format!("{}{}", self.profile.name, self.action.source().map(|name| format!(" / {name}")).unwrap_or_default())))
+                .child(format!("{}{}", self.profile.display_name(), self.action.source().map(|name| format!(" / {name}")).unwrap_or_default())))
+            .when(!sessions, |view| view.child(div().id("admin-confirmation-context").text_sm().child(format!(
+                "{} on {} via maintenance database {}. Review the database name above/below before confirming. Cancel makes no changes.",
+                self.action.label(), self.profile.display_name(), self.maintenance.read(cx).value()
+            ))))
+            .when(self.profile.blocks_mutations() && !sessions, |view| view.child("Connection policy blocks database administration."))
             .when(delete, |view| view
                 .child("This permanently deletes the database and all of its tables and data. This cannot be undone.")
                 .child(field(format!("Type {} to confirm", self.action.source().unwrap_or_default()), &self.confirmation)))
@@ -324,5 +335,75 @@ impl Render for DatabaseAdmin {
                     .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Disconnecting other sessions rolls back their uncommitted work.")))))
             .when(!self.message.is_empty(), |view| view.child(div().id("database-message").role(Role::Status).max_h(px(200.)).overflow_y_scroll().p_3().rounded(cx.theme().radius).bg(cx.theme().muted).text_sm().font_family(cx.theme().mono_font_family.clone()).child(self.message.clone())))
             .when(!self.error.is_empty(), |view| view.child(div().id("database-error").role(Role::Alert).text_sm().text_color(cx.theme().danger).child(self.error.clone())))
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use super::{AdminAction, DatabaseAdmin};
+    use crate::{database::runtime, model::*, storage::Store, ui::Services};
+    use gpui_kit::{AppContext, TestAppContext, WindowOptions};
+
+    #[gpui_kit::test]
+    fn safeguards_read_only_admin_direct_paths_are_blocked(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let services = Services::new(
+            runtime().unwrap(),
+            Store::open(directory.path().join("app.db")).unwrap(),
+        );
+        let profile = ConnectionProfile {
+            id: uuid::Uuid::new_v4(),
+            name: "Protected".into(),
+            notes: String::new(),
+            color: String::new(),
+            environment: Some(Environment::Production),
+            policy: ExecutionPolicy::ReadOnlyByDefault,
+            remember_password: false,
+            config: ConnectionConfig::Postgres {
+                host: "127.0.0.1".into(),
+                port: 1,
+                database: "postgres".into(),
+                user: "unused".into(),
+                tls: TlsMode::Disable,
+                timeout_seconds: 1,
+            },
+        };
+        let (window, admin) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    DatabaseAdmin::new(
+                        services,
+                        profile,
+                        String::new(),
+                        AdminAction::Create,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap()
+        });
+        cx.update_window(window, |_, window, cx| {
+            admin.update(cx, |admin, cx| {
+                admin
+                    .name
+                    .update(cx, |name, cx| name.set_value("must_not_create", window, cx));
+                admin.submit(window, cx);
+                assert!(!admin.busy());
+                admin.execute(
+                    DatabaseAction::Create {
+                        name: "must_not_create".into(),
+                    },
+                    window,
+                    cx,
+                );
+                assert!(
+                    !admin.busy(),
+                    "Direct execution must not even start a connection"
+                );
+            })
+        })
+        .unwrap();
     }
 }

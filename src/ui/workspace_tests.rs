@@ -15,6 +15,8 @@ async fn middle_click_closes_tabs_without_selecting_them(cx: &mut TestAppContext
     let path = directory.path().join("catalog.sqlite");
     rusqlite::Connection::open(&path).expect("database");
     let profile = ConnectionProfile {
+        environment: None,
+        policy: ExecutionPolicy::Normal,
         id: Uuid::new_v4(),
         name: "Catalog".into(),
         notes: String::new(),
@@ -124,6 +126,8 @@ async fn find_unopened_table_and_use_history_in_compact_workspace(cx: &mut TestA
         .execute_batch("CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT); INSERT INTO products VALUES(1,'Keyboard'); CREATE TABLE orders(id INTEGER PRIMARY KEY);")
         .expect("tables");
     let profile = ConnectionProfile {
+        environment: None,
+        policy: ExecutionPolicy::Normal,
         id: Uuid::new_v4(),
         name: "Catalog".into(),
         notes: String::new(),
@@ -321,7 +325,7 @@ async fn explorer_switching_keyboard_navigation_and_restart(cx: &mut TestAppCont
     let profiles = ["first", "second"].map(|name| {
         let path = directory.path().join(format!("{name}.db"));
         rusqlite::Connection::open(&path).expect("fixture database").execute_batch("CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT); INSERT INTO items VALUES(1,'fixture');").expect("fixture table");
-        let profile = ConnectionProfile { id: Uuid::new_v4(), name: name.into(), notes: String::new(), color: String::new(), remember_password: false,
+        let profile = ConnectionProfile { environment: None, policy: ExecutionPolicy::Normal, id: Uuid::new_v4(), name: name.into(), notes: String::new(), color: String::new(), remember_password: false,
             config: ConnectionConfig::Sqlite { path, read_only: false, create: false, wal: true, foreign_keys: true } };
         store.save_profile(&profile).expect("save profile");
         profile
@@ -774,6 +778,8 @@ async fn sidebar_retry_recovers_after_dismissing_the_connection_error(cx: &mut T
     let directory = tempfile::tempdir().expect("fixture directory");
     let path = directory.path().join("restored.sqlite");
     let profile = ConnectionProfile {
+        environment: None,
+        policy: ExecutionPolicy::Normal,
         id: Uuid::new_v4(),
         name: "Archive".into(),
         notes: String::new(),
@@ -854,6 +860,8 @@ async fn missing_passwords_prompt_before_connecting_and_on_document_retry(cx: &m
         let directory = tempfile::tempdir().expect("directory");
         let store = Store::open(directory.path().join("app.db")).expect("store");
         let profile = ConnectionProfile {
+            environment: None,
+            policy: ExecutionPolicy::Normal,
             id: Uuid::new_v4(),
             name: "Needs a password".into(),
             notes: String::new(),
@@ -1018,6 +1026,8 @@ fn postgres_test_profile() -> (ConnectionProfile, String) {
         String::from_utf8(config.get_password().unwrap_or_default().to_vec()).expect("password");
     (
         ConnectionProfile {
+            environment: None,
+            policy: ExecutionPolicy::Normal,
             id: Uuid::new_v4(),
             name: "Test PostgreSQL".into(),
             notes: String::new(),
@@ -1208,9 +1218,11 @@ async fn postgres_remembered_password_reconnects_after_restart_and_remember_off(
 
 #[gpui_kit::test]
 #[ignore = "requires QUERI_TEST_POSTGRES with CREATEDB"]
-async fn postgres_contextual_database_lifecycle_retains_drafts(cx: &mut TestAppContext) {
+async fn postgres_safeguards_contextual_database_lifecycle_retains_drafts(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
-    let (profile, password) = postgres_test_profile();
+    let (mut profile, password) = postgres_test_profile();
+    profile.policy = ExecutionPolicy::ConfirmExecutions;
+    profile.environment = Some(Environment::Production);
     let directory = tempfile::tempdir().expect("directory");
     let store = Store::open(directory.path().join("app.db")).expect("store");
     store.save_profile(&profile).expect("save profile");
@@ -1248,6 +1260,11 @@ async fn postgres_contextual_database_lifecycle_retains_drafts(cx: &mut TestAppC
     let renamed = format!("{name}_new");
     let cloned = format!("{name}_copy");
     cx.update_window(window, |_, window, cx| {
+        window.click("create-database", cx);
+        window.click("Database name", cx);
+        window.input(&name, cx);
+        window.click("cancel-admin", cx);
+        assert!(!workspace.read(cx).databases.contains(&name));
         window.click("create-database", cx);
         window.click("Database name", cx);
         window.input(&name, cx);
@@ -1385,6 +1402,27 @@ async fn postgres_contextual_database_lifecycle_retains_drafts(cx: &mut TestAppC
         assert!(doc.session.is_none());
         assert_eq!(doc.draft(cx).sql, "SELECT 'preserved draft';");
     });
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.profiles[0].policy = ExecutionPolicy::ReadOnlyByDefault;
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("create-database").disabled(), Some(true));
+        workspace.update(cx, |workspace, cx| {
+            for action in [
+                super::AdminAction::Create,
+                super::AdminAction::Rename("postgres".into()),
+                super::AdminAction::Clone("postgres".into()),
+                super::AdminAction::Delete("postgres".into()),
+            ] {
+                workspace.admin(action, window, cx);
+            }
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("database-operation").is_none());
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]
@@ -1401,6 +1439,8 @@ async fn saved_library_sql_files_and_related_tabs_keep_work_separate(cx: &mut Te
         )
         .unwrap();
     let profile = ConnectionProfile {
+        environment: None,
+        policy: ExecutionPolicy::Normal,
         id: Uuid::new_v4(),
         name: "Test".into(),
         notes: String::new(),
@@ -1586,6 +1626,8 @@ async fn workspace_search_live_drafts_selects_text_offline_and_drops_closed_tabs
     cx.executor().allow_parking();
     let directory = tempfile::tempdir().unwrap();
     let profile = ConnectionProfile {
+        environment: None,
+        policy: ExecutionPolicy::Normal,
         id: Uuid::new_v4(),
         name: "Offline drafts".into(),
         notes: String::new(),
@@ -1788,10 +1830,12 @@ async fn workspace_search_live_drafts_selects_text_offline_and_drops_closed_tabs
 }
 
 #[gpui_kit::test]
-async fn transaction_close_reconnect_profile_and_quit_guards(cx: &mut TestAppContext) {
+async fn safeguards_transaction_close_reconnect_profile_and_quit_guards(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let directory = tempfile::tempdir().unwrap();
     let profile = ConnectionProfile {
+        environment: None,
+        policy: ExecutionPolicy::Normal,
         id: Uuid::new_v4(),
         name: "Transactions".into(),
         notes: String::new(),
@@ -1918,6 +1962,64 @@ async fn transaction_close_reconnect_profile_and_quit_guards(cx: &mut TestAppCon
     );
     cx.update_window(window, |_, window, cx| {
         window.click("begin-transaction", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.connection_form(Some(profile.clone()), window, cx)
+        });
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.try_find_by_label("Roll back and close").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        click_label(window, "Roll back and close", cx)
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.try_find("save-connection").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("connection-environment", cx);
+        click_label(window, "Production", cx);
+        window.click("connection-policy", cx);
+        click_label(window, "Confirm executions", cx);
+        window.click("save-connection", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |window, cx| {
+        window.try_find("save-connection").is_none()
+            && doc
+                .read(cx)
+                .session
+                .as_ref()
+                .is_some_and(|session| session.profile.policy == ExecutionPolicy::ConfirmExecutions)
+            && !doc.read(cx).busy()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(
+            doc.read(cx).profile.environment,
+            Some(Environment::Production)
+        );
+        assert_eq!(
+            doc.read(cx).profile.policy,
+            ExecutionPolicy::ConfirmExecutions
+        );
+        assert!(
+            window
+                .find("connection-picker")
+                .label()
+                .unwrap()
+                .contains("Production")
+        );
+        window.click("begin-transaction", cx);
+        window.click("ok", cx);
     })
     .unwrap();
     cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())

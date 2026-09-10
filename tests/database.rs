@@ -9,6 +9,8 @@ use uuid::Uuid;
 
 fn sqlite_profile(path: std::path::PathBuf) -> ConnectionProfile {
     ConnectionProfile {
+        environment: None,
+        policy: ExecutionPolicy::Normal,
         remember_password: false,
         id: Uuid::new_v4(),
         name: "Fixture".into(),
@@ -570,6 +572,8 @@ fn postgres_profile() -> Result<(ConnectionProfile, String)> {
     };
     Ok((
         ConnectionProfile {
+            environment: None,
+            policy: ExecutionPolicy::Normal,
             remember_password: false,
             id: Uuid::new_v4(),
             name: "Integration".into(),
@@ -849,7 +853,7 @@ fn postgres_authoritative_transaction_status() -> Result<()> {
             TransactionStatus::Unknown
         );
         assert!(session.query("SELECT 1".into()).await.is_err());
-        let reconnected = Session::connect(profile, password).await?;
+        let reconnected = Session::connect(profile, password.clone()).await?;
         assert_eq!(
             reconnected.transaction_status().await?,
             TransactionStatus::Idle
@@ -1339,5 +1343,53 @@ fn postgres_statement_timeout_inherit_restores_initial_role_policy() -> Result<(
         }.await;
         admin.query(format!("DROP ROLE {role}")).await?;
         result
+    })
+}
+
+#[test]
+#[ignore = "requires QUERI_TEST_POSTGRES pointing at a disposable PostgreSQL database"]
+fn postgres_safeguards_defaults_overrides_boundaries_and_reconnect() -> Result<()> {
+    runtime()?.block_on(async {
+        let (mut profile, password) = postgres_profile()?;
+        let ordinary = Session::connect(profile.clone(), password.clone()).await?;
+        let name = format!("safeguards_{}", Uuid::new_v4().simple());
+        ordinary.query(format!("CREATE TABLE {name}(id integer PRIMARY KEY)")).await?;
+        profile.environment = Some(Environment::Production);
+        // Environment alone never changes execution.
+        let labelled = Session::connect(profile.clone(), password.clone()).await?;
+        labelled.query(format!("INSERT INTO {name} VALUES(1)")).await?;
+        profile.policy = ExecutionPolicy::ReadOnlyByDefault;
+        let session = Session::connect(profile.clone(), password.clone()).await?;
+        assert!(session.query(format!("INSERT INTO {name} VALUES(2)")).await.is_err());
+        let table = TableRef { schema: "public".into(), name: name.clone(), kind: RelationKind::Table };
+        assert!(session.change_rows(table.clone(), RowChange::Insert(vec![FieldValue::Value(Cell::Integer(2))])).await.is_err());
+        assert!(session.database_action(DatabaseAction::Create { name: format!("{name}_db") }).await.is_err());
+        // Raw SQL remains deliberately overridable, including explicit read-write transactions.
+        session.query("BEGIN READ WRITE".into()).await?;
+        assert!(session.read_write_observed());
+        session.query(format!("INSERT INTO {name} VALUES(2); ROLLBACK")).await?;
+        assert!(!session.read_write_observed());
+        session.query("SET default_transaction_read_only=off".into()).await?;
+        assert!(session.read_write_observed());
+        session.query_postgres_params(format!("INSERT INTO {name} VALUES($1::int)"), vec![Some("3".into())]).await?;
+        assert!(session.change_rows(table, RowChange::Insert(vec![FieldValue::Value(Cell::Integer(4))])).await.is_err());
+        // PostgreSQL allows writes to existing temporary tables in read-only transactions.
+        session.query("CREATE TEMP TABLE temporary_safeguard(id int); SET default_transaction_read_only=on".into()).await?;
+        session.query("INSERT INTO temporary_safeguard VALUES(1)".into()).await?;
+        drop(session);
+        let reconnected = Session::connect(profile, password.clone()).await?;
+        assert!(!reconnected.read_write_observed());
+        assert!(reconnected.query_postgres_params(format!("INSERT INTO {name} VALUES($1::int)"), vec![Some("4".into())]).await.is_err());
+        assert!(reconnected.query("CREATE TEMP TABLE another_temporary(id int)".into()).await.is_err());
+        ordinary.query(format!("DROP TABLE {name}")).await?;
+        // Normal policy must not clear a database/server read-only default.
+        let database = format!("{name}_default");
+        ordinary.database_action(DatabaseAction::Create { name: database.clone() }).await?;
+        ordinary.query(format!("ALTER DATABASE {database} SET default_transaction_read_only=on")).await?;
+        let inherited = Session::connect(ordinary.profile.for_database(&database), password).await?;
+        assert!(inherited.query("CREATE TABLE persistent(id int)".into()).await.is_err());
+        drop(inherited);
+        ordinary.database_action(DatabaseAction::Delete { name: database, force: true }).await?;
+        Ok(())
     })
 }

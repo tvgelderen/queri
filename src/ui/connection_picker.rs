@@ -39,6 +39,7 @@ struct ConnectionItem {
     endpoint: String,
     subtitle: String,
     logo: &'static str,
+    color: Option<u32>,
 }
 
 impl From<&ConnectionProfile> for ConnectionItem {
@@ -57,7 +58,11 @@ impl From<&ConnectionProfile> for ConnectionItem {
         };
         Self {
             id: profile.id,
-            name: profile.name.clone(),
+            name: profile.display_name(),
+            color: profile
+                .color
+                .strip_prefix('#')
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok()),
             provider: profile.provider(),
             endpoint,
             subtitle,
@@ -77,6 +82,9 @@ impl ConnectionItem {
             .min_w_0()
             .gap_3()
             .line_height(relative(1.2))
+            .when_some(self.color, |view, color| {
+                view.child(div().size_2().rounded_full().bg(rgb(color)))
+            })
             .child(
                 svg()
                     .path(self.logo)

@@ -5,7 +5,10 @@ use crate::model::*;
 use crate::sql::quote_identifier;
 use anyhow::{Context, Result, bail};
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex as AsyncMutex;
@@ -14,6 +17,7 @@ pub struct Session {
     backend: Backend,
     pub profile: ConnectionProfile,
     timeout: Mutex<StatementTimeout>,
+    read_write_observed: AtomicBool,
 }
 
 enum Backend {
@@ -76,6 +80,7 @@ impl Session {
             backend,
             profile,
             timeout: Mutex::new(StatementTimeout::Inherit),
+            read_write_observed: AtomicBool::new(false),
         }))
     }
 
@@ -115,9 +120,9 @@ impl Session {
                 pg.apply_timeout(&client, timeout, &sql)
                     .await
                     .map_err(classify_postgres_error)?;
-                postgres::query(&client, &sql)
-                    .await
-                    .map_err(classify_postgres_error)?
+                let result = postgres::query(&client, &sql).await;
+                self.observe_read_only(&client).await;
+                result.map_err(classify_postgres_error)?
             }
             Backend::Sqlite { .. } => {
                 self.with_sqlite(move |conn| sqlite::query(conn, &sql, timeout))
@@ -177,9 +182,9 @@ impl Session {
             .query_text_raw(&sql, &params)
             .await
             .map_err(|e| classify_postgres_error(e.into()))?;
-        let sets = postgres::collect_results(stream)
-            .await
-            .map_err(classify_postgres_error)?;
+        let result = postgres::collect_results(stream).await;
+        self.observe_read_only(&client).await;
+        let sets = result.map_err(classify_postgres_error)?;
         Ok(QueryOutput {
             sets,
             elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -256,7 +261,10 @@ impl Session {
     }
 
     pub async fn change_rows(&self, table: TableRef, change: RowChange) -> Result<u64> {
-        anyhow::ensure!(!self.read_only(), "This connection is read-only.");
+        anyhow::ensure!(
+            !self.read_only(),
+            "Connection policy blocks generated row changes."
+        );
         match &self.backend {
             Backend::Postgres(pg) => {
                 postgres::change_rows(&mut *pg.client.lock().await, &table, change).await
@@ -278,6 +286,10 @@ impl Session {
     }
 
     pub async fn database_action(&self, action: DatabaseAction) -> Result<()> {
+        anyhow::ensure!(
+            !self.read_only(),
+            "Connection policy blocks database administration."
+        );
         match &self.backend {
             Backend::Postgres(pg) => {
                 postgres::database_action(&*pg.client.lock().await, action).await
@@ -286,14 +298,32 @@ impl Session {
         }
     }
 
+    /// Whether generated changes are blocked, independently of raw SQL overrides.
     pub fn read_only(&self) -> bool {
-        matches!(
-            self.profile.config,
-            ConnectionConfig::Sqlite {
-                read_only: true,
-                ..
-            }
-        )
+        self.profile.blocks_mutations()
+    }
+
+    pub fn read_write_observed(&self) -> bool {
+        self.read_write_observed.load(Ordering::Relaxed)
+    }
+
+    async fn observe_read_only(&self, client: &tokio_postgres::Client) {
+        if self.profile.policy != ExecutionPolicy::ReadOnlyByDefault {
+            return;
+        }
+        // SHOW does not acquire a data snapshot or interfere with transaction setup.
+        // Never inject inspection SQL into an aborted transaction.
+        if matches!(client.transaction_status().await, Ok(b'I' | b'T'))
+            && let Ok(messages) = client
+                .simple_query("SHOW default_transaction_read_only; SHOW transaction_read_only")
+                .await
+        {
+            let read_write = messages.iter().any(|message| {
+                matches!(message, tokio_postgres::SimpleQueryMessage::Row(row) if row.get(0) == Some("off"))
+            });
+            self.read_write_observed
+                .store(read_write, Ordering::Relaxed);
+        }
     }
 }
 

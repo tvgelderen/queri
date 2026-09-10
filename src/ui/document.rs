@@ -637,33 +637,83 @@ impl Document {
             cx.notify();
             return;
         }
-        if self.warn_destructive && sql::destructive(&sql) {
+        self.execute(sql, window, cx);
+    }
+
+    fn execute(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_sql(sql, None, window, cx);
+    }
+
+    // The parameter-entry UI must use this same submission boundary.
+    fn submit_sql(
+        &mut self,
+        sql: String,
+        params: Option<Vec<Option<String>>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy() || self.session.is_none() {
+            return;
+        }
+        let destructive = self.warn_destructive && sql::destructive(&sql);
+        if self.profile.policy == ExecutionPolicy::ConfirmExecutions || destructive {
             let view = cx.entity();
-            let database = self.profile.database();
+            let generation = self.session_generation;
+            let context = self.profile.context();
+            let preview: String = sql.chars().take(2000).collect();
+            let preview = if preview.len() < sql.len() {
+                format!("{preview}… (preview truncated)")
+            } else {
+                preview
+            };
+            let message = format!(
+                "Submit SQL to {context}. Cancel sends nothing to the database.\n\n{preview}"
+            );
             window.open_alert_dialog(cx, move |dialog, _, _| {
                 let sql = sql.clone();
+                let params = params.clone();
                 let view = view.clone();
                 dialog
-                    .title("Run destructive SQL?")
-                    .child(format!(
-                        "This statement can remove data or database objects in {database}."
-                    ))
+                    .title(if destructive {
+                        "Run destructive SQL?"
+                    } else {
+                        "Run SQL?"
+                    })
+                    .child(
+                        div()
+                            .id("sql-confirmation-context")
+                            .test_support()
+                            .aria_label(message.clone())
+                            .max_h(px(240.))
+                            .overflow_y_scroll()
+                            .child(message.clone()),
+                    )
                     .button_props(
                         DialogButtonProps::default()
                             .ok_text("Run SQL")
                             .show_cancel(true),
                     )
                     .on_ok(move |_, window, cx| {
-                        view.update(cx, |this, cx| this.execute(sql.clone(), window, cx));
+                        view.update(cx, |this, cx| {
+                            if this.session_generation == generation {
+                                this.execute_confirmed(sql.clone(), params.clone(), window, cx);
+                            }
+                        });
                         true
                     })
             });
         } else {
-            self.execute(sql, window, cx);
+            self.execute_confirmed(sql, params, window, cx);
         }
     }
 
-    fn execute(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn execute_confirmed(
+        &mut self,
+        sql: String,
+        params: Option<Vec<Option<String>>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.busy() {
             return;
         }
@@ -686,7 +736,10 @@ impl Document {
             async move {
                 let start = Instant::now();
                 let result = match session.set_statement_timeout(timeout) {
-                    Ok(()) => session.query(sql.clone()).await,
+                    Ok(()) => match params {
+                        Some(params) => session.query_postgres_params(sql.clone(), params).await,
+                        None => session.query(sql.clone()).await,
+                    },
                     Err(error) => Err(error),
                 };
                 let transaction = session
@@ -821,7 +874,12 @@ impl Document {
             _ => false,
         };
         if allowed && !self.busy() && self.session.is_some() {
-            self.execute(command.into(), window, cx);
+            if command == "ROLLBACK" {
+                // Recovery must remain available without another confirmation.
+                self.execute_confirmed(command.into(), None, window, cx);
+            } else {
+                self.execute(command.into(), window, cx);
+            }
         }
     }
 
@@ -917,6 +975,20 @@ impl Document {
             .pb_2()
             .gap_2()
             .child(self.timeout_controls(cx))
+            .when(
+                self.profile.policy == ExecutionPolicy::ReadOnlyByDefault,
+                |view| {
+                    view.child(
+                div().id("read-only-policy").text_xs().child(
+                    if self.session.as_ref().is_some_and(|session| session.read_write_observed()) {
+                        "Read-write override observed · generated changes blocked"
+                    } else {
+                        "Read-only by default · SQL can override · generated changes blocked"
+                    }
+                )
+            )
+                },
+            )
             .flex_wrap()
             .child(
                 div()
@@ -1382,8 +1454,10 @@ impl Document {
             dialog
                 .title(format!("Delete {} rows?", originals.len()))
                 .child(format!(
-                    "Delete the selected rows from {}.{}?",
-                    table.schema, table.name
+                    "Delete the selected rows from {}.{} on {}? Cancel makes no changes.",
+                    table.schema,
+                    table.name,
+                    session.profile.context()
                 ))
                 .button_props(
                     DialogButtonProps::default()
@@ -1539,7 +1613,7 @@ impl Document {
                 } else if read_only {
                     (
                         "This table is empty",
-                        "This connection is read-only. Refresh to check for new rows.",
+                        "Connection policy blocks generated changes. Refresh to check for new rows.",
                     )
                 } else {
                     (
@@ -1602,12 +1676,12 @@ impl Document {
                 } else if *section == Section::Indexes && read_only {
                     (
                         "No indexes",
-                        "This table has no indexes. This connection is read-only.",
+                        "This table has no indexes. Connection policy blocks generated changes.",
                     )
                 } else if read_only {
                     (
                         "No constraints",
-                        "This table has no constraints. This connection is read-only.",
+                        "This table has no constraints. Connection policy blocks generated changes.",
                     )
                 } else if *section == Section::Indexes {
                     (
@@ -2488,7 +2562,7 @@ impl Document {
                                     .as_ref()
                                     .is_some_and(|session| session.read_only())
                                 {
-                                    "Read-only connection"
+                                    "Generated changes blocked by connection policy"
                                 } else if !table.is_table() {
                                     "Views are read-only"
                                 } else {
@@ -2615,7 +2689,7 @@ impl Render for Document {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let context = format!(
             "{} / {}{}",
-            self.profile.name,
+            self.profile.display_name(),
             self.profile.database(),
             self.table_ref()
                 .map(|table| format!(" / {}", table.schema))
@@ -2720,7 +2794,8 @@ impl Render for Document {
                             )
                             .child(
                                 div()
-                                    .id("document-context")
+                                    .id("document-context").test_support()
+                                    .aria_label(context.clone())
                                     .text_ellipsis()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
@@ -2777,7 +2852,7 @@ impl Render for Document {
                                     view.update(cx, |this, cx| {
                                         let context = format!(
                                             "{} / {}",
-                                            this.profile.name,
+                                            this.profile.display_name(),
                                             this.profile.database()
                                         );
                                         let menu = menu

@@ -1079,6 +1079,20 @@ impl Workspace {
             cx.notify();
             return;
         }
+        let affected = self
+            .documents
+            .iter()
+            .filter(|doc| {
+                profile
+                    .as_ref()
+                    .is_some_and(|profile| doc.read(cx).profile.id == profile.id)
+            })
+            .map(|doc| {
+                let doc = doc.read(cx);
+                format!("{} — {}", doc.profile.context(), doc.title())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let password = profile
             .as_ref()
             .and_then(|profile| self.passwords.get(&profile.id))
@@ -1099,8 +1113,9 @@ impl Workspace {
                     .insert(saved.profile.id, saved.password.clone());
                 for doc in &this.documents {
                     if doc.read(cx).profile.id == saved.profile.id {
-                        doc.update(cx, |doc, _| {
-                            doc.reconfigure(&saved.profile, saved.password.clone())
+                        doc.update(cx, |doc, cx| {
+                            doc.reconfigure(&saved.profile, saved.password.clone());
+                            cx.notify();
                         });
                     }
                 }
@@ -1128,6 +1143,18 @@ impl Workspace {
                 .close_button(!form.read(cx).busy())
                 .keyboard(!form.read(cx).busy())
                 .footer(form.update(cx, |form, cx| form.render_footer(cx)))
+                .when(!affected.is_empty(), |dialog| {
+                    dialog.child(
+                        div()
+                            .id("affected-connection-tabs")
+                            .text_sm()
+                            .max_h(px(96.))
+                            .overflow_y_scroll()
+                            .child(format!(
+                                "Affected tabs (reconnect after saving):\n{affected}"
+                            )),
+                    )
+                })
                 .child(form.clone())
         });
     }
@@ -1175,7 +1202,7 @@ impl Workspace {
             let view = view.clone();
             let profile = profile.clone();
             dialog
-                .title(format!("Remove {}?", profile.name))
+                .title(format!("Remove {}?", profile.display_name()))
                 .child("Its saved connection, SQL drafts, and query history will be removed. Saved queries and the database itself are retained.")
                 .button_props(
                     DialogButtonProps::default()
@@ -1399,6 +1426,9 @@ impl Workspace {
         let Some(profile) = self.selected_profile() else {
             return;
         };
+        if profile.blocks_mutations() && !matches!(action, AdminAction::Sessions(_)) {
+            return;
+        }
         let title = action.label();
         let sessions = matches!(action, AdminAction::Sessions(_));
         let password = self.passwords.get(&profile.id).cloned().unwrap_or_default();
@@ -1605,20 +1635,29 @@ impl Workspace {
                 (AdminAction::Clone(database.into()), IconName::Copy),
                 (AdminAction::Sessions(database.into()), IconName::Activity),
             ] {
-                menu = menu.item(menu_item(action.label(), icon).on_click(
-                    cx.listener(move |this, _, window, cx| this.admin(action.clone(), window, cx)),
-                ));
+                menu = menu.item(
+                    menu_item(action.label(), icon)
+                        .disabled(
+                            self.selected_profile()
+                                .is_some_and(|p| p.blocks_mutations())
+                                && !matches!(action, AdminAction::Sessions(_)),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.admin(action.clone(), window, cx)
+                        })),
+                );
             }
             let database = database.to_owned();
-            menu = menu
-                .separator()
-                .item(
-                    destructive_menu_item("Delete database", false).on_click(cx.listener(
-                        move |this, _, window, cx| {
-                            this.admin(AdminAction::Delete(database.clone()), window, cx)
-                        },
-                    )),
-                );
+            menu = menu.separator().item(
+                destructive_menu_item(
+                    "Delete database",
+                    self.selected_profile()
+                        .is_some_and(|p| p.blocks_mutations()),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.admin(AdminAction::Delete(database.clone()), window, cx)
+                })),
+            );
         }
         menu
     }
@@ -2179,7 +2218,7 @@ impl Render for Workspace {
                                     .small()
                                     .icon(IconName::Plus)
                                     .label("Create")
-                                    .disabled(self.connection_state != ConnectionState::Ready)
+                                    .disabled(self.connection_state != ConnectionState::Ready || selected_profile.as_ref().is_some_and(|p| p.blocks_mutations()))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.admin(AdminAction::Create, window, cx)
                                     })),
