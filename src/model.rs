@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 mod filter;
-pub use filter::{FilterKind, FilterOperator, FilterPredicate, TableFilter};
+pub use filter::{FilterExpression, FilterKind, FilterOperator, FilterPredicate, TableFilter};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TlsMode {
@@ -372,8 +372,8 @@ pub struct BrowseOptions {
     pub relationship: Option<RelationshipScope>,
     pub offset: u64,
     pub limit: u32,
-    pub filter: Option<TableFilter>,
-    pub sort: Option<(String, bool)>,
+    pub filter: Option<FilterExpression>,
+    pub sort: Vec<(String, bool)>,
 }
 
 #[derive(Clone, Debug)]

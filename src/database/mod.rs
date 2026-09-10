@@ -363,33 +363,39 @@ pub(super) fn push_row(set: &mut ResultSet, row: Vec<Cell>, bytes: &mut usize, c
     }
 }
 
-fn browse_ordering(metadata: &TableMetadata, sort: &Option<(String, bool)>) -> Result<String> {
-    match sort {
-        Some((column, descending)) => {
-            anyhow::ensure!(
-                metadata.columns.iter().any(|col| &col.name == column),
-                "Unknown sort column."
-            );
-            Ok(format!(
-                " ORDER BY {} {}",
-                quote_identifier(column)?,
-                if *descending { "DESC" } else { "ASC" }
-            ))
-        }
-        None => {
-            let keys = metadata
-                .columns
-                .iter()
-                .filter(|col| col.primary_key)
-                .map(|col| quote_identifier(&col.name))
-                .collect::<Result<Vec<_>>>()?;
-            Ok(if keys.is_empty() {
-                String::new()
-            } else {
-                format!(" ORDER BY {}", keys.join(","))
-            })
+fn browse_ordering(metadata: &TableMetadata, sort: &[(String, bool)]) -> Result<String> {
+    let mut columns = Vec::new();
+    for (column, descending) in sort {
+        anyhow::ensure!(
+            metadata.columns.iter().any(|col| &col.name == column),
+            "Sort column ‘{column}’ no longer exists. Remove or replace it."
+        );
+        anyhow::ensure!(
+            !columns.iter().any(|(name, _)| name == column),
+            "Duplicate sort column: {column}"
+        );
+        columns.push((column.clone(), *descending));
+    }
+    for column in metadata.columns.iter().filter(|col| col.primary_key) {
+        if !columns.iter().any(|(name, _)| name == &column.name) {
+            columns.push((column.name.clone(), false));
         }
     }
+    let terms = columns
+        .iter()
+        .map(|(name, descending)| {
+            Ok(format!(
+                "{} {}",
+                quote_identifier(name)?,
+                if *descending { "DESC" } else { "ASC" }
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(if terms.is_empty() {
+        String::new()
+    } else {
+        format!(" ORDER BY {}", terms.join(","))
+    })
 }
 
 pub(super) fn validate_original(

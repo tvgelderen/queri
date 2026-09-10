@@ -25,6 +25,8 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::{sync::Arc, time::Instant};
 
+#[path = "table_views.rs"]
+mod table_views;
 #[cfg(all(test, feature = "test-support"))]
 #[path = "document_tests.rs"]
 mod tests;
@@ -66,6 +68,9 @@ enum DocumentKind {
         filter_operator: FilterOperator,
         filter_apply_focus: FocusHandle,
         filter_open: bool,
+        filter_draft: Option<FilterExpression>,
+        filter_target: Vec<usize>,
+        pending_filter: Option<Option<FilterExpression>>,
     },
 }
 #[derive(Clone, Copy, PartialEq)]
@@ -182,6 +187,9 @@ impl Document {
                 filter_operator: FilterOperator::Contains,
                 filter_apply_focus: cx.focus_handle(),
                 filter_open: false,
+                filter_draft: None,
+                filter_target: vec![],
+                pending_filter: None,
             },
             None => DocumentKind::Sql {
                 editor: cx.new(|cx| {
@@ -207,11 +215,17 @@ impl Document {
                 }
                 let GridEvent::Sort(column, sort) = event;
                 if let DocumentKind::Table { options, .. } = &mut this.kind {
-                    options.sort = match sort {
-                        ColumnSort::Default => None,
-                        ColumnSort::Ascending => Some((column.clone(), false)),
-                        ColumnSort::Descending => Some((column.clone(), true)),
-                    };
+                    if let Some(index) = options.sort.iter().position(|(name, _)| name == column) {
+                        if *sort == ColumnSort::Default {
+                            options.sort.remove(index);
+                        } else {
+                            options.sort[index].1 = *sort == ColumnSort::Descending;
+                        }
+                    } else if *sort != ColumnSort::Default {
+                        options
+                            .sort
+                            .push((column.clone(), *sort == ColumnSort::Descending));
+                    }
                     options.offset = 0;
                     this.refresh(window, cx);
                 }
@@ -440,11 +454,21 @@ impl Document {
             self.connect(window, cx);
             return;
         };
-        let DocumentKind::Table { table, options, .. } = &self.kind else {
+        let DocumentKind::Table {
+            table,
+            options,
+            pending_filter,
+            ..
+        } = &self.kind
+        else {
             return;
         };
         let table = table.clone();
-        let options = options.as_ref().clone();
+        let mut options = options.as_ref().clone();
+        if let Some(filter) = pending_filter {
+            options.filter = filter.clone();
+            options.offset = 0;
+        }
         let filtered = options.filter.is_some();
         self.operation = Operation::Running;
         self.error.clear();
@@ -485,11 +509,17 @@ impl Document {
                         );
                         if let DocumentKind::Table {
                             page: current,
+                            options,
+                            pending_filter,
                             filter_column,
                             filter_operator,
                             ..
                         } = &mut this.kind
                         {
+                            if let Some(filter) = pending_filter.take() {
+                                options.filter = filter;
+                                options.offset = 0;
+                            }
                             let kind = page
                                 .metadata
                                 .columns
@@ -509,6 +539,9 @@ impl Document {
                         this.update_grid(cx);
                     }
                     Err(error) => {
+                        if let DocumentKind::Table { pending_filter, .. } = &mut this.kind {
+                            pending_filter.take();
+                        }
                         let recovery = if filtered {
                             "Check the filter value, change the operator, or clear the filter."
                         } else {
@@ -598,8 +631,10 @@ impl Document {
             grid.checkable = checkable;
             grid.sortable = sortable;
             grid.sort = match &self.kind {
-                DocumentKind::Table { options, .. } => {
-                    options.sort.as_ref().map(|(column, descending)| {
+                DocumentKind::Table { options, .. } => options
+                    .sort
+                    .iter()
+                    .map(|(column, descending)| {
                         (
                             column.clone(),
                             if *descending {
@@ -609,8 +644,8 @@ impl Document {
                             },
                         )
                     })
-                }
-                _ => None,
+                    .collect(),
+                _ => vec![],
             };
             state.clear_selection(cx);
             state.refresh(cx);
@@ -1221,6 +1256,17 @@ impl Document {
 
     fn data_actions(&self, cx: &mut Context<Self>) -> AnyElement {
         h_flex()
+            .when(self.table_ref().is_some(), |row| {
+                row.child(
+                    Button::new("filter-from-cell")
+                        .small()
+                        .label("Filter from cell")
+                        .disabled(self.busy())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.filter_from_cell(window, cx)),
+                        ),
+                )
+            })
             .gap_1()
             .child(
                 Button::new("export-data")
@@ -1498,39 +1544,32 @@ impl Document {
         if self.busy() {
             return;
         }
-        if let DocumentKind::Table {
-            page: Some(page),
-            options,
-            filter,
-            filter_column,
-            filter_operator,
-            ..
-        } = &mut self.kind
-        {
-            let value = filter.read(cx).value().to_string();
-            options.filter = if value.is_empty() && *filter_operator == FilterOperator::Contains {
-                None
-            } else {
-                page.metadata
-                    .columns
-                    .get(*filter_column)
-                    .map(|col| TableFilter {
-                        column: col.name.clone(),
-                        predicate: filter_operator.predicate(value),
-                    })
-            };
-            options.offset = 0;
+        let candidate = match &self.kind {
+            DocumentKind::Table {
+                filter_draft: Some(draft),
+                ..
+            } => Some(draft.clone()),
+            _ => self.filter_input(cx).map(Into::into),
+        };
+        if let DocumentKind::Table { pending_filter, .. } = &mut self.kind {
+            *pending_filter = Some(candidate);
         }
         self.refresh(window, cx);
     }
 
     fn clear_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let DocumentKind::Table {
-            options, filter, ..
+            options,
+            filter,
+            filter_draft,
+            filter_target,
+            ..
         } = &mut self.kind
         {
             filter.update(cx, |filter, cx| filter.set_value("", window, cx));
             options.filter = None;
+            *filter_draft = None;
+            filter_target.clear();
             options.offset = 0;
         }
         self.refresh(window, cx);
@@ -2379,7 +2418,9 @@ impl Document {
                         )
                     }),
             )
+            .when(*section == Section::Data, |view| view.child(self.sort_controls(cx)))
             .when(*section == Section::Data && *filter_open, |view| {
+                let view = view.child(self.filter_tree(cx));
                 let column_picker = choice(
                     Button::new("filter-column")
                         .small()
@@ -2481,6 +2522,9 @@ impl Document {
                                 .gap_2()
                                 .flex_shrink_0()
                                 .child(
+                                    Button::new("add-filter-condition").small().label("Add / replace condition").disabled(self.busy() || page.is_none()).on_click(cx.listener(|this, _, _, cx| this.add_filter_condition(cx)))
+                                )
+                                .child(
                                     Button::new("apply-filter")
                                         .track_focus(filter_apply_focus)
                                         .small()
@@ -2507,17 +2551,7 @@ impl Document {
             })
             .when(*section == Section::Data && !*filter_open, |view| {
                 view.when_some(options.filter.as_ref(), |view, filter| {
-                    let kind = page
-                        .as_ref()
-                        .and_then(|page| {
-                            page.metadata
-                                .columns
-                                .iter()
-                                .find(|column| column.name == filter.column)
-                        })
-                        .map(|column| column.filter_kind(sqlite))
-                        .unwrap_or(FilterKind::Text);
-                    let summary = filter.summary(kind);
+                    let summary = filter.summary(&page.as_ref().map(|page| page.metadata.clone()).unwrap_or_default(), sqlite);
                     view.child(
                         h_flex()
                             .pt_2()

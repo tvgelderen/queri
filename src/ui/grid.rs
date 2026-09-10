@@ -20,7 +20,7 @@ pub struct Grid {
     pub search_cell: Option<(usize, usize)>,
     pub checked: BTreeSet<usize>,
     pub sortable: bool,
-    pub sort: Option<(String, ColumnSort)>,
+    pub sort: Vec<(String, ColumnSort)>,
     numeric_columns: BTreeSet<usize>,
 }
 
@@ -32,7 +32,7 @@ impl Grid {
             search_cell: None,
             checked: BTreeSet::new(),
             sortable: false,
-            sort: None,
+            sort: vec![],
             numeric_columns: BTreeSet::new(),
         };
         grid.replace(data);
@@ -140,7 +140,13 @@ impl TableDelegate for Grid {
                 .clamp(10, 36),
         )
         .unwrap_or(36);
-        let mut col = Column::new(format!("column-{i}"), name)
+        let label = self
+            .sort
+            .iter()
+            .position(|(column, _)| column == &name)
+            .map(|position| format!("{} · {}", position + 1, name))
+            .unwrap_or(name);
+        let mut col = Column::new(format!("column-{i}"), label)
             .width(px(f32::from(characters) * 7.5 + 24.))
             .min_width(px(80.))
             .movable(false);
@@ -150,8 +156,8 @@ impl TableDelegate for Grid {
         if self.sortable {
             col.sort(
                 self.sort
-                    .as_ref()
-                    .filter(|(column, _)| Some(column) == self.data.columns.get(i))
+                    .iter()
+                    .find(|(column, _)| Some(column) == self.data.columns.get(i))
                     .map(|(_, sort)| *sort)
                     .unwrap_or(ColumnSort::Default),
             )

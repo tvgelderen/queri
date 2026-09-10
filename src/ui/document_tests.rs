@@ -1760,3 +1760,88 @@ async fn postgres_safeguards_parameter_submission_and_read_only_ui(cx: &mut Test
         "Generated changes remain blocked after a raw SQL override"
     );
 }
+
+#[gpui_kit::test]
+async fn grouped_filter_draft_apply_and_sort_precedence(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(true, cx);
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("toggle-filter", cx);
+        window.click("add-filter-condition", cx);
+        doc.update(cx, |doc, cx| {
+            if let DocumentKind::Table { filter_draft, .. } = &mut doc.kind {
+                *filter_draft = Some(FilterExpression::Any(vec![
+                    TableFilter {
+                        column: "id".into(),
+                        predicate: FilterPredicate::Equals("1".into()),
+                    }
+                    .into(),
+                    TableFilter {
+                        column: "id".into(),
+                        predicate: FilterPredicate::Equals("2".into()),
+                    }
+                    .into(),
+                ]));
+            }
+            cx.notify();
+        });
+        assert_eq!(doc.read(cx).grid.read(cx).delegate().data.rows.len(), 1);
+        let DocumentKind::Table { options, .. } = &doc.read(cx).kind else {
+            panic!()
+        };
+        assert!(options.filter.is_none());
+        window.click("apply-filter", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| {
+            if let DocumentKind::Table {
+                filter_draft,
+                options,
+                ..
+            } = &mut doc.kind
+            {
+                assert!(options.filter.is_some());
+                *filter_draft = Some(
+                    TableFilter {
+                        column: "id".into(),
+                        predicate: FilterPredicate::Equals("invalid".into()),
+                    }
+                    .into(),
+                );
+                options.sort = vec![("name".into(), false), ("id".into(), true)];
+            }
+            cx.notify();
+        });
+        window.click("apply-filter", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        let DocumentKind::Table { options, .. } = &doc.read(cx).kind else {
+            panic!()
+        };
+        assert!(matches!(options.filter, Some(FilterExpression::Any(_))));
+        assert!(doc.read(cx).error.contains("Invalid filter"));
+        window.click("sort-earlier-1", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update(|cx| {
+        let DocumentKind::Table { options, .. } = &doc.read(cx).kind else {
+            panic!()
+        };
+        assert_eq!(
+            options.sort,
+            vec![("id".into(), true), ("name".into(), false)]
+        );
+        assert!(doc.read(cx).error.is_empty());
+    });
+}

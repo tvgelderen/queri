@@ -238,62 +238,71 @@ pub async fn browse(
 ) -> Result<TablePage> {
     let metadata = metadata(client, table).await?;
     let table_name = qualified(&table.schema, &table.name)?;
-    let mut params: Vec<&(dyn ToSql + Sync)> = vec![];
-    let text = options
-        .filter
-        .as_ref()
-        .and_then(|filter| filter.predicate.value());
+    let mut values = Vec::<String>::new();
     let mut filter = match &options.filter {
-        Some(filter) => {
-            let column = filter.validate(&metadata, false)?;
-            let name = quote_identifier(&column.name)?;
-            if filter.predicate.value().is_some() {
-                params.push(&text);
-            }
-            let (left, right) = match column.filter_kind(false) {
-                FilterKind::Number => {
-                    let base = column.data_type.split('(').next().unwrap_or("numeric");
-                    let native_type = match base {
-                        "smallint" => "smallint",
-                        "integer" => "integer",
-                        "bigint" => "bigint",
-                        "real" => "real",
-                        "double precision" => "double precision",
-                        _ => "numeric",
-                    };
-                    (name.clone(), format!("$1::text::{native_type}"))
+        Some(expression) => format!(
+            " WHERE ({})",
+            expression.compile(&mut |filter| {
+                let column = filter.validate(&metadata, false)?;
+                let name = quote_identifier(&column.name)?;
+                if filter.predicate.value().is_some() {
+                    values.push(filter.predicate.value().unwrap().to_owned());
                 }
-                FilterKind::Date => {
-                    let native_type = if column.data_type == "date" {
-                        "date"
-                    } else if column.data_type.contains("with time zone") {
-                        "timestamp with time zone"
-                    } else {
-                        "timestamp without time zone"
-                    };
-                    (name.clone(), format!("$1::text::{native_type}"))
-                }
-                FilterKind::Boolean => (name.clone(), "$1::text::boolean".into()),
-                FilterKind::Text => (format!("lower({name}::text)"), "lower($1::text)".into()),
-            };
-            let predicate = match &filter.predicate {
-                FilterPredicate::Contains(_) => format!("strpos({left},{right}) > 0"),
-                FilterPredicate::NotContains(_) => format!("strpos({left},{right}) = 0"),
-                FilterPredicate::Equals(_) => format!("{left} = {right}"),
-                FilterPredicate::NotEquals(_) => format!("{left} <> {right}"),
-                FilterPredicate::StartsWith(_) => format!("starts_with({left},{right})"),
-                FilterPredicate::EndsWith(_) => format!("right({left},length({right})) = {right}"),
-                FilterPredicate::GreaterThan(_) => format!("{left} > {right}"),
-                FilterPredicate::GreaterOrEqual(_) => format!("{left} >= {right}"),
-                FilterPredicate::LessThan(_) => format!("{left} < {right}"),
-                FilterPredicate::LessOrEqual(_) => format!("{left} <= {right}"),
-                FilterPredicate::IsNull => format!("{name} IS NULL"),
-                FilterPredicate::IsNotNull => format!("{name} IS NOT NULL"),
-            };
-            format!(" WHERE {predicate}")
-        }
+                let parameter = format!("${}", values.len());
+                let (left, right) = match column.filter_kind(false) {
+                    FilterKind::Number => {
+                        let base = column.data_type.split('(').next().unwrap_or("numeric");
+                        let native_type = match base {
+                            "smallint" => "smallint",
+                            "integer" => "integer",
+                            "bigint" => "bigint",
+                            "real" => "real",
+                            "double precision" => "double precision",
+                            _ => "numeric",
+                        };
+                        (name.clone(), format!("{parameter}::text::{native_type}"))
+                    }
+                    FilterKind::Date => {
+                        let native_type = if column.data_type == "date" {
+                            "date"
+                        } else if column.data_type.contains("with time zone") {
+                            "timestamp with time zone"
+                        } else {
+                            "timestamp without time zone"
+                        };
+                        (name.clone(), format!("{parameter}::text::{native_type}"))
+                    }
+                    FilterKind::Boolean => (name.clone(), format!("{parameter}::text::boolean")),
+                    FilterKind::Text => (
+                        format!("lower({name}::text)"),
+                        format!("lower({parameter}::text)"),
+                    ),
+                };
+                let predicate = match &filter.predicate {
+                    FilterPredicate::Contains(_) => format!("strpos({left},{right}) > 0"),
+                    FilterPredicate::NotContains(_) => format!("strpos({left},{right}) = 0"),
+                    FilterPredicate::Equals(_) => format!("{left} = {right}"),
+                    FilterPredicate::NotEquals(_) => format!("{left} <> {right}"),
+                    FilterPredicate::StartsWith(_) => format!("starts_with({left},{right})"),
+                    FilterPredicate::EndsWith(_) => {
+                        format!("right({left},length({right})) = {right}")
+                    }
+                    FilterPredicate::GreaterThan(_) => format!("{left} > {right}"),
+                    FilterPredicate::GreaterOrEqual(_) => format!("{left} >= {right}"),
+                    FilterPredicate::LessThan(_) => format!("{left} < {right}"),
+                    FilterPredicate::LessOrEqual(_) => format!("{left} <= {right}"),
+                    FilterPredicate::IsNull => format!("{name} IS NULL"),
+                    FilterPredicate::IsNotNull => format!("{name} IS NOT NULL"),
+                };
+                Ok(predicate)
+            })?
+        ),
         None => String::new(),
     };
+    let mut params: Vec<&(dyn ToSql + Sync)> = values
+        .iter()
+        .map(|value| value as &(dyn ToSql + Sync))
+        .collect();
     let relation = match &options.relationship {
         Some(scope) => Some(relationship_predicate(client, table, scope, params.len() + 1).await?),
         None => None,

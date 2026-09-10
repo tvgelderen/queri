@@ -79,11 +79,14 @@ fn sqlite_metadata_filter_sort_pagination_and_exact_values() -> Result<()> {
                 BrowseOptions {
                     limit: 1,
                     offset: 1,
-                    filter: Some(TableFilter {
-                        column: "name".into(),
-                        predicate: FilterPredicate::Contains("al".into()),
-                    }),
-                    sort: Some(("quantity".into(), true)),
+                    filter: Some(
+                        TableFilter {
+                            column: "name".into(),
+                            predicate: FilterPredicate::Contains("al".into()),
+                        }
+                        .into(),
+                    ),
+                    sort: vec![("quantity".into(), true)],
                     relationship: None,
                 },
             )
@@ -207,10 +210,13 @@ async fn filter_workflows(session: &Session, schema: &str) -> Result<()> {
             .browse(
                 table.clone(),
                 BrowseOptions {
-                    filter: Some(TableFilter {
-                        column: column.into(),
-                        predicate,
-                    }),
+                    filter: Some(
+                        TableFilter {
+                            column: column.into(),
+                            predicate,
+                        }
+                        .into(),
+                    ),
                     ..page()
                 },
             )
@@ -234,11 +240,14 @@ async fn filter_workflows(session: &Session, schema: &str) -> Result<()> {
             BrowseOptions {
                 limit: 1,
                 offset: 1,
-                filter: Some(TableFilter {
-                    column: label.into(),
-                    predicate: StartsWith("al".into()),
-                }),
-                sort: Some(("id".into(), true)),
+                filter: Some(
+                    TableFilter {
+                        column: label.into(),
+                        predicate: StartsWith("al".into()),
+                    }
+                    .into(),
+                ),
+                sort: vec![("id".into(), true)],
                 relationship: None,
             },
         )
@@ -260,10 +269,13 @@ async fn filter_workflows(session: &Session, schema: &str) -> Result<()> {
                 .browse(
                     table.clone(),
                     BrowseOptions {
-                        filter: Some(TableFilter {
-                            column: column.into(),
-                            predicate
-                        }),
+                        filter: Some(
+                            TableFilter {
+                                column: column.into(),
+                                predicate
+                            }
+                            .into()
+                        ),
                         ..page()
                     }
                 )
@@ -285,10 +297,13 @@ fn sqlite_type_aware_filters() -> Result<()> {
             .browse(
                 table(),
                 BrowseOptions {
-                    filter: Some(TableFilter {
-                        column: "quantity".into(),
-                        predicate: FilterPredicate::GreaterThan("20".into()),
-                    }),
+                    filter: Some(
+                        TableFilter {
+                            column: "quantity".into(),
+                            predicate: FilterPredicate::GreaterThan("20".into()),
+                        }
+                        .into(),
+                    ),
                     ..page()
                 },
             )
@@ -326,10 +341,13 @@ fn sqlite_filters_preserve_integers_and_do_not_guess_date_encodings() -> Result<
                 .browse(
                     table.clone(),
                     BrowseOptions {
-                        filter: Some(TableFilter {
-                            column: column.into(),
-                            predicate,
-                        }),
+                        filter: Some(
+                            TableFilter {
+                                column: column.into(),
+                                predicate,
+                            }
+                            .into(),
+                        ),
                         ..page()
                     },
                 )
@@ -613,7 +631,7 @@ fn postgres_real_database_workflows() -> Result<()> {
         assert_eq!(data.data.rows[0][3].text(), "12345678901234567890.1234567890");
         assert_eq!(data.data.rows[0][5].text(), "\\x00ff");
         let exact = session.browse(table.clone(), BrowseOptions {
-            filter: Some(TableFilter { column: "amount".into(), predicate: FilterPredicate::Equals("12345678901234567890.12345678901".into()) }),
+            filter: Some(TableFilter { column: "amount".into(), predicate: FilterPredicate::Equals("12345678901234567890.12345678901".into()) }.into()),
             ..page()
         }).await?;
         assert_eq!(exact.total, 0, "filter input must not be rounded to the column's scale");
@@ -622,7 +640,7 @@ fn postgres_real_database_workflows() -> Result<()> {
         values[2] = FieldValue::Value(Cell::Text("Changed".into()));
         session.change_rows(table.clone(), RowChange::Update { original: original.clone(), values: values.clone() }).await?;
         assert!(session.change_rows(table.clone(), RowChange::Update { original, values }).await.is_err());
-        let filtered = session.browse(table.clone(), BrowseOptions { filter: Some(TableFilter { column: "name".into(), predicate: FilterPredicate::Contains("hang".into()) }), ..page() }).await?;
+        let filtered = session.browse(table.clone(), BrowseOptions { filter: Some(TableFilter { column: "name".into(), predicate: FilterPredicate::Contains("hang".into()) }.into()), ..page() }).await?;
         assert_eq!(filtered.total, 1);
         session.change_rows(table.clone(), RowChange::Insert(vec![FieldValue::Value(Cell::Text("3".into())),FieldValue::Value(Cell::Text("9223372036854775807".into())),FieldValue::Default,FieldValue::Null,FieldValue::Value(Cell::Text("{\"nested\":[1,2]}".into())),FieldValue::Null])).await?;
         let data = session.browse(table.clone(), page()).await?;
@@ -711,7 +729,7 @@ fn sqlite_relationship_navigation_preserves_composite_keys_and_affinity() -> Res
         let incoming=RelationshipScope {key:keys[0].clone(),incoming:true,values:vec![Cell::Integer(1),Cell::Text("Alpha".into())]};
         let result=session.browse(child.clone(),BrowseOptions{relationship:Some(incoming.clone()),..page()}).await?;
         assert_eq!(result.total,1);assert_eq!(result.data.rows[0][0],Cell::Integer(1));
-        let filtered=session.browse(child.clone(),BrowseOptions{relationship:Some(incoming),filter:Some(TableFilter{column:"id".into(),predicate:FilterPredicate::Equals("2".into())}),..page()}).await?;
+        let filtered=session.browse(child.clone(),BrowseOptions{relationship:Some(incoming),filter:Some(TableFilter{column:"id".into(),predicate:FilterPredicate::Equals("2".into())}.into()),..page()}).await?;
         assert_eq!(filtered.total,0);
         Ok(())
     })
@@ -1391,5 +1409,129 @@ fn postgres_safeguards_defaults_overrides_boundaries_and_reconnect() -> Result<(
         drop(inherited);
         ordinary.database_action(DatabaseAction::Delete { name: database, force: true }).await?;
         Ok(())
+    })
+}
+
+async fn grouped_views(session: &Session, schema: &str) -> Result<()> {
+    let table = TableRef {
+        schema: schema.into(),
+        name: "view_items".into(),
+        kind: RelationKind::Table,
+    };
+    session.query(format!("CREATE TABLE {schema}.view_items(tenant INTEGER, id INTEGER, label TEXT, amount INTEGER, PRIMARY KEY(tenant,id)); INSERT INTO {schema}.view_items VALUES(2,1,'Alpha',10),(1,2,'ALPHA',10),(1,1,NULL,10),(1,3,'Beta',20),(3,1,'x'' OR 1=1 --',30);")).await?;
+    let leaf = |column: &str, predicate| {
+        FilterExpression::from(TableFilter {
+            column: column.into(),
+            predicate,
+        })
+    };
+    let filter = FilterExpression::All(vec![
+        FilterExpression::Any(vec![
+            leaf("label", FilterPredicate::Equals("alpha".into())),
+            leaf("label", FilterPredicate::IsNull),
+        ]),
+        leaf("amount", FilterPredicate::GreaterOrEqual("10".into())),
+    ]);
+    let options = BrowseOptions {
+        filter: Some(filter),
+        sort: vec![("amount".into(), true), ("tenant".into(), false)],
+        limit: 1,
+        ..Default::default()
+    };
+    for (offset, expected) in [(0, ("1", "1")), (1, ("1", "2")), (2, ("2", "1"))] {
+        let result = session
+            .browse(
+                table.clone(),
+                BrowseOptions {
+                    offset,
+                    ..options.clone()
+                },
+            )
+            .await?;
+        assert_eq!(result.total, 3);
+        assert_eq!(
+            (result.data.rows[0][0].text(), result.data.rows[0][1].text()),
+            (expected.0.into(), expected.1.into())
+        );
+    }
+    let result = session
+        .browse(
+            table.clone(),
+            BrowseOptions {
+                filter: Some(leaf(
+                    "label",
+                    FilterPredicate::Equals("x' OR 1=1 --".into()),
+                )),
+                ..page()
+            },
+        )
+        .await?;
+    assert_eq!(result.total, 1);
+    let result = session
+        .browse(
+            table.clone(),
+            BrowseOptions {
+                filter: Some(FilterExpression::All(vec![
+                    leaf("label", FilterPredicate::NotEquals("beta".into())),
+                    leaf("amount", FilterPredicate::LessThan("20".into())),
+                ])),
+                ..page()
+            },
+        )
+        .await?;
+    assert_eq!(result.total, 2, "negative comparisons exclude NULL");
+    for filter in [
+        FilterExpression::Any(vec![]),
+        leaf("missing", FilterPredicate::IsNull),
+    ] {
+        assert!(
+            session
+                .browse(
+                    table.clone(),
+                    BrowseOptions {
+                        filter: Some(filter),
+                        ..page()
+                    }
+                )
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        session
+            .browse(
+                table,
+                BrowseOptions {
+                    sort: vec![("missing".into(), false)],
+                    ..page()
+                }
+            )
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn sqlite_grouped_views() -> Result<()> {
+    runtime()?.block_on(async {
+        let session = Session::connect(sqlite_profile(":memory:".into()), String::new()).await?;
+        grouped_views(&session, "main").await
+    })
+}
+
+#[test]
+#[ignore = "requires disposable PostgreSQL"]
+fn postgres_grouped_views() -> Result<()> {
+    runtime()?.block_on(async {
+        let (profile, password) = postgres_profile()?;
+        let session = Session::connect(profile, password).await?;
+        let schema = format!("views_{}", Uuid::new_v4().simple());
+        session.query(format!("CREATE SCHEMA {schema}")).await?;
+        let result = grouped_views(&session, &schema).await;
+        session
+            .query(format!("DROP SCHEMA {schema} CASCADE"))
+            .await?;
+        result
     })
 }

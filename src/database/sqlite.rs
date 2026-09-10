@@ -245,7 +245,7 @@ pub fn browse(conn: &Connection, table: &TableRef, options: &BrowseOptions) -> R
     let qualified = qualified(&table.schema, &table.name)?;
     let mut values = vec![];
     let mut filter = match &options.filter {
-        Some(filter) => {
+        Some(expression) => format!(" WHERE ({})", expression.compile(&mut |filter| {
             let column = filter.validate(&metadata, true)?;
             let name = quote_identifier(&column.name)?;
             let kind = column.filter_kind(true);
@@ -255,17 +255,18 @@ pub fn browse(conn: &Connection, table: &TableRef, options: &BrowseOptions) -> R
                         .with_context(|| format!("Invalid filter value for {}", column.name))?,
                 );
             }
+            let parameter = format!("?{}", values.len());
             let (left, right) = match kind {
-                FilterKind::Number | FilterKind::Boolean => (name.clone(), "?1"),
+                FilterKind::Number | FilterKind::Boolean => (name.clone(), parameter.clone()),
                 // SQLite has no date storage class. Only interpret ISO text, never guess
                 // whether numeric dates are Unix timestamps or Julian day numbers.
                 FilterKind::Date => (
                     format!(
                         "julianday(CASE WHEN typeof({name})='text' AND {name} GLOB '????-??-??*' THEN {name} END)"
                     ),
-                    "julianday(?1)",
+                    format!("julianday({parameter})"),
                 ),
-                FilterKind::Text => (format!("lower(CAST({name} AS TEXT))"), "lower(?1)"),
+                FilterKind::Text => (format!("lower(CAST({name} AS TEXT))"), format!("lower({parameter})")),
             };
             let predicate = match &filter.predicate {
                 FilterPredicate::Contains(_) => format!("instr({left},{right}) > 0"),
@@ -286,11 +287,11 @@ pub fn browse(conn: &Connection, table: &TableRef, options: &BrowseOptions) -> R
                 FilterPredicate::IsNotNull => format!("{name} IS NOT NULL"),
             };
             if kind == FilterKind::Number && filter.predicate.value().is_some() {
-                format!(" WHERE typeof({name}) IN ('integer','real') AND ({predicate})")
+                Ok(format!("(typeof({name}) IN ('integer','real') AND ({predicate}))"))
             } else {
-                format!(" WHERE {predicate}")
+                Ok(predicate)
             }
-        }
+        })?),
         None => String::new(),
     };
     if let Some(scope) = &options.relationship {

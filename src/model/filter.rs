@@ -1,5 +1,6 @@
 use super::{Column, TableMetadata};
 use anyhow::{Result, ensure};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilterKind {
@@ -186,7 +187,7 @@ impl FilterOperator {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FilterPredicate {
     Contains(String),
     NotContains(String),
@@ -237,7 +238,7 @@ impl FilterPredicate {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TableFilter {
     pub column: String,
     pub predicate: FilterPredicate,
@@ -265,5 +266,58 @@ impl TableFilter {
             Some(value) => format!("{} {label} “{value}”", self.column),
             None => format!("{} {label}", self.column),
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum FilterExpression {
+    Predicate(TableFilter),
+    All(Vec<FilterExpression>),
+    Any(Vec<FilterExpression>),
+}
+
+impl FilterExpression {
+    pub fn compile(&self, leaf: &mut impl FnMut(&TableFilter) -> Result<String>) -> Result<String> {
+        match self {
+            Self::Predicate(filter) => leaf(filter),
+            Self::All(children) | Self::Any(children) => {
+                ensure!(
+                    !children.is_empty(),
+                    "Empty filter group. Add a condition or remove the group."
+                );
+                let separator = if matches!(self, Self::All(_)) {
+                    " AND "
+                } else {
+                    " OR "
+                };
+                Ok(format!(
+                    "({})",
+                    children
+                        .iter()
+                        .map(|child| child.compile(leaf))
+                        .collect::<Result<Vec<_>>>()?
+                        .join(separator)
+                ))
+            }
+        }
+    }
+
+    pub fn summary(&self, metadata: &TableMetadata, sqlite: bool) -> String {
+        self.compile(&mut |filter| {
+            Ok(filter.summary(
+                metadata
+                    .columns
+                    .iter()
+                    .find(|col| col.name == filter.column)
+                    .map(|col| col.filter_kind(sqlite))
+                    .unwrap_or(FilterKind::Text),
+            ))
+        })
+        .unwrap_or_else(|error| error.to_string())
+    }
+}
+impl From<TableFilter> for FilterExpression {
+    fn from(filter: TableFilter) -> Self {
+        Self::Predicate(filter)
     }
 }
