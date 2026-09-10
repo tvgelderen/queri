@@ -1776,7 +1776,7 @@ async fn grouped_filter_draft_apply_and_sort_precedence(cx: &mut TestAppContext)
         window.click("add-filter-condition", cx);
         doc.update(cx, |doc, cx| {
             if let DocumentKind::Table { filter_draft, .. } = &mut doc.kind {
-                *filter_draft = Some(FilterExpression::Any(vec![
+                *filter_draft = Some(Box::new(FilterExpression::Any(vec![
                     TableFilter {
                         column: "id".into(),
                         predicate: FilterPredicate::Equals("1".into()),
@@ -1787,7 +1787,7 @@ async fn grouped_filter_draft_apply_and_sort_precedence(cx: &mut TestAppContext)
                         predicate: FilterPredicate::Equals("2".into()),
                     }
                     .into(),
-                ]));
+                ])));
             }
             cx.notify();
         });
@@ -1810,13 +1810,13 @@ async fn grouped_filter_draft_apply_and_sort_precedence(cx: &mut TestAppContext)
             } = &mut doc.kind
             {
                 assert!(options.filter.is_some());
-                *filter_draft = Some(
+                *filter_draft = Some(Box::new(
                     TableFilter {
                         column: "id".into(),
                         predicate: FilterPredicate::Equals("invalid".into()),
                     }
                     .into(),
-                );
+                ));
                 options.sort = vec![("name".into(), false), ("id".into(), true)];
             }
             cx.notify();
@@ -1965,4 +1965,371 @@ async fn restored_missing_predicate_remains_repairable_without_unfiltered_rows(
     cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
         .await;
     cx.update(|cx| assert_eq!(doc.read(cx).grid.read(cx).delegate().data.rows.len(), 1));
+}
+
+#[gpui_kit::test]
+async fn named_views_explicit_save_load_conflict_and_save_as(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(true, cx);
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("view-columns", cx);
+        window.click("column-earlier-1", cx);
+        window.click("save-table-view-as", cx);
+        window.click("saved-view-name", cx);
+        window.input("By name", cx);
+        window.click("confirm-save-view", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        doc.read(cx).draft(cx).saved_table_view.is_some()
+    })
+    .await;
+    let saved = fixture
+        .services
+        .store
+        .saved_table_views()
+        .unwrap()
+        .remove(0);
+    assert_eq!(saved.settings.columns[0].name, "name");
+    cx.update_window(window, |_, window, cx| {
+        window.click("column-visible-0", cx);
+    })
+    .unwrap();
+    assert!(
+        !fixture.services.store.saved_table_views().unwrap()[0]
+            .settings
+            .columns[0]
+            .hidden,
+        "unsaved changes do not update library"
+    );
+    let mut changed = saved.clone();
+    changed.name = "Changed elsewhere".into();
+    fixture.services.store.save_table_view(&changed).unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.click("save-table-view", cx);
+        window.click("confirm-save-view", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window
+            .find("saved-view-error")
+            .label()
+            .is_some_and(|text| text.contains("changed"))
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("close", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.try_find("saved-view-name").is_none()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("save-table-view-as", cx);
+        window.click("saved-view-name", cx);
+        window.input("My changes", cx);
+        window.click("confirm-save-view", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        doc.read(cx)
+            .draft(cx)
+            .saved_table_view
+            .as_ref()
+            .is_some_and(|view| view.name == "My changes")
+    })
+    .await;
+    assert_eq!(fixture.services.store.saved_table_views().unwrap().len(), 2);
+    cx.update_window(window, |_, window, cx| {
+        window.click("saved-table-views", cx)
+    })
+    .unwrap();
+    let id = format!("load-view-{}", saved.id);
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.try_find(id.clone()).is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| window.click(id.clone(), cx))
+        .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update(|cx| {
+        assert_eq!(
+            doc.read(cx).draft(cx).saved_table_view.unwrap().name,
+            "Changed elsewhere"
+        );
+        assert_eq!(
+            doc.read(cx).grid.read(cx).delegate().display_columns,
+            [1, 0]
+        );
+    });
+}
+
+#[gpui_kit::test]
+async fn named_relationship_view_requires_explicit_scope_choice(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    fixture.services.runtime.block_on(fixture.session.query("ALTER TABLE items ADD COLUMN parent INTEGER REFERENCES items(id); UPDATE items SET parent=1".into())).unwrap();
+    let table = TableRef {
+        schema: "main".into(),
+        name: "items".into(),
+        kind: RelationKind::Table,
+    };
+    let key = fixture
+        .services
+        .runtime
+        .block_on(fixture.session.foreign_keys(table, false))
+        .unwrap()
+        .remove(0);
+    let scope = RelationshipScope {
+        key,
+        incoming: false,
+        values: vec![Cell::Integer(1)],
+    };
+    let (window, doc) = fixture.open(true, cx);
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, _| doc.set_relationship(Some(scope.clone())));
+        window.click("save-table-view-as", cx);
+        window.click("saved-view-name", cx);
+        window.input("Reusable", cx);
+        window.click("confirm-save-view", cx);
+        assert!(
+            window
+                .find("saved-view-error")
+                .label()
+                .unwrap()
+                .contains("Choose whether")
+        );
+        assert!(
+            fixture
+                .services
+                .store
+                .saved_table_views()
+                .unwrap()
+                .is_empty()
+        );
+        window.click("saved-view-scope", cx);
+        crate::ui::test_support::click_label(window, "Reusable settings only", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.try_find("popup-menu").is_none()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("confirm-save-view", cx)
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        doc.read(cx).draft(cx).saved_table_view.is_some()
+    })
+    .await;
+    assert!(
+        fixture.services.store.saved_table_views().unwrap()[0]
+            .relationship
+            .is_none()
+    );
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(
+            doc.read(cx).relationship(),
+            Some(&scope),
+            "saving reusable settings does not change active scope"
+        );
+        window.click("save-table-view-as", cx);
+        window.click("saved-view-name", cx);
+        window.input("Record", cx);
+        window.click("saved-view-scope", cx);
+        crate::ui::test_support::click_label(
+            window,
+            "Include this record’s relationship scope",
+            cx,
+        );
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.try_find("popup-menu").is_none()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("confirm-save-view", cx)
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        doc.read(cx)
+            .draft(cx)
+            .saved_table_view
+            .as_ref()
+            .is_some_and(|view| view.name == "Record")
+    })
+    .await;
+    assert!(
+        fixture
+            .services
+            .store
+            .saved_table_views()
+            .unwrap()
+            .iter()
+            .any(|view| view.relationship == Some(scope.clone()))
+    );
+}
+
+#[gpui_kit::test]
+async fn nested_filter_controls_and_null_cell_filter_are_drafts(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    fixture
+        .services
+        .runtime
+        .block_on(
+            fixture
+                .session
+                .query("ALTER TABLE items ADD COLUMN note TEXT".into()),
+        )
+        .unwrap();
+    let (window, doc) = fixture.open(true, cx);
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("toggle-filter", cx);
+        window.click("filter-value", cx);
+        window.input("1", cx);
+        window.click("add-any-group", cx);
+        window.click("filter-node-[0]", cx);
+        window.click("add-filter-condition", cx);
+        window.click("filter-node-[]", cx);
+        window.click("add-filter-condition", cx);
+        let DocumentKind::Table { options, .. } = &doc.read(cx).kind else {
+            panic!()
+        };
+        assert!(options.filter.is_none());
+        window.click("apply-filter", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        assert!(doc.read(cx).error.is_empty());
+        let DocumentKind::Table { options, .. } = &doc.read(cx).kind else {
+            panic!()
+        };
+        let Some(FilterExpression::All(children)) = &options.filter else {
+            panic!()
+        };
+        assert!(matches!(children[0], FilterExpression::Any(_)));
+        assert_eq!(children.len(), 2);
+        doc.read(cx)
+            .grid
+            .clone()
+            .update(cx, |grid, cx| grid.set_selected_cell(0, 3, cx));
+        window.click("filter-from-cell", cx);
+        let DocumentKind::Table { filter_draft, .. } = &doc.read(cx).kind else {
+            panic!()
+        };
+        let Some(FilterExpression::All(children)) = filter_draft.as_deref() else {
+            panic!()
+        };
+        assert!(matches!(
+            &children[1],
+            FilterExpression::Predicate(TableFilter {
+                predicate: FilterPredicate::IsNull,
+                ..
+            })
+        ));
+        window.click("apply-filter", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update(|cx| assert_eq!(doc.read(cx).grid.read(cx).delegate().data.rows.len(), 1));
+}
+
+#[gpui_kit::test]
+async fn adding_condition_preserves_previously_applied_predicate(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(true, cx);
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("toggle-filter", cx);
+        window.click("filter-value", cx);
+        window.input("1", cx);
+        window.click("apply-filter", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("filter-value", cx);
+        window.press("ctrl-a", cx);
+        window.input("2", cx);
+        window.click("add-filter-condition", cx);
+        let DocumentKind::Table { filter_draft, .. } = &doc.read(cx).kind else {
+            panic!()
+        };
+        let Some(FilterExpression::All(children)) = filter_draft.as_deref() else {
+            panic!()
+        };
+        assert_eq!(children.len(), 2);
+        window.click("apply-filter", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update(|cx| assert!(doc.read(cx).grid.read(cx).delegate().data.rows.is_empty()));
+}
+
+#[gpui_kit::test]
+async fn missing_layout_column_requires_explicit_repair(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(true, cx);
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| {
+            doc.restore_table_view(Some(TableViewSettings {
+                filter: None,
+                sort: vec![],
+                columns: vec![ViewColumn {
+                    name: "removed".into(),
+                    hidden: true,
+                }],
+                page_size: 100,
+            }));
+            doc.refresh(window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        assert!(doc.read(cx).error.contains("Layout column ‘removed’"));
+        assert!(
+            doc.read(cx)
+                .grid
+                .read(cx)
+                .delegate()
+                .display_columns
+                .is_empty()
+        );
+        assert_eq!(
+            doc.read(cx).table_view_settings().unwrap().columns[0].name,
+            "removed"
+        );
+        window.click("view-columns", cx);
+        window.click("column-remove-0", cx);
+        assert!(doc.read(cx).error.is_empty());
+        assert_eq!(
+            doc.read(cx).grid.read(cx).delegate().display_columns,
+            [0, 1]
+        );
+    })
+    .unwrap();
 }

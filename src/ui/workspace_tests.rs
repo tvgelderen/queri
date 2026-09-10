@@ -894,6 +894,7 @@ async fn missing_passwords_prompt_before_connecting_and_on_document_retry(cx: &m
                         Preferences {
                             active_connection: Some(profile.id),
                             drafts: vec![Draft {
+                                saved_table_view: None,
                                 table_view: None,
                                 statement_timeout: StatementTimeout::Inherit,
                                 relationship: None,
@@ -1647,6 +1648,7 @@ async fn workspace_search_live_drafts_selects_text_offline_and_drops_closed_tabs
     };
     let drafts = (1..=2)
         .map(|number| Draft {
+            saved_table_view: None,
             table_view: None,
             statement_timeout: StatementTimeout::custom(number * 1000).unwrap(),
             relationship: None,

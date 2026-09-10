@@ -1509,6 +1509,35 @@ async fn grouped_views(session: &Session, schema: &str) -> Result<()> {
             .await
             .is_err()
     );
+    session.query(format!("CREATE TABLE {schema}.view_parent(tenant INTEGER, id INTEGER, PRIMARY KEY(tenant,id)); CREATE TABLE {schema}.view_child(id INTEGER PRIMARY KEY, tenant INTEGER, parent INTEGER, FOREIGN KEY(tenant,parent) REFERENCES {schema}.view_parent(tenant,id)); INSERT INTO {schema}.view_parent VALUES(1,1),(2,1); INSERT INTO {schema}.view_child VALUES(1,1,1),(2,2,1),(3,NULL,NULL);").replace("REFERENCES main.", "REFERENCES ")).await?;
+    let child = TableRef {
+        schema: schema.into(),
+        name: "view_child".into(),
+        kind: RelationKind::Table,
+    };
+    let key = session.foreign_keys(child.clone(), false).await?.remove(0);
+    let scoped = session
+        .browse(
+            child,
+            BrowseOptions {
+                relationship: Some(RelationshipScope {
+                    key,
+                    incoming: true,
+                    values: vec![Cell::Integer(1), Cell::Integer(1)],
+                }),
+                filter: Some(FilterExpression::Any(vec![
+                    leaf("id", FilterPredicate::Equals("1".into())),
+                    leaf("id", FilterPredicate::Equals("2".into())),
+                ])),
+                ..page()
+            },
+        )
+        .await?;
+    assert_eq!(
+        scoped.total, 1,
+        "relationship scope must AND the entire OR group"
+    );
+    assert_eq!(scoped.data.rows[0][0].text(), "1");
     Ok(())
 }
 

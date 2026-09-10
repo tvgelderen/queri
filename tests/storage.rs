@@ -167,6 +167,7 @@ fn version_one_migration_preserves_settings_drafts_and_history() -> Result<()> {
     let preferences = Preferences {
         active_connection: Some(profile.id),
         drafts: vec![Draft {
+            saved_table_view: None,
             table_view: None,
             statement_timeout: StatementTimeout::Inherit,
             saved_query: None,
@@ -202,7 +203,7 @@ fn version_one_migration_preserves_settings_drafts_and_history() -> Result<()> {
     let store = Store::open(&path)?;
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-        3
+        4
     );
     assert_eq!(
         serde_json::to_value(&store.profiles()?[0])?,
@@ -527,5 +528,103 @@ fn table_view_drafts_survive_restart_and_old_drafts_default() -> Result<()> {
     drop(store);
     let reopened = Store::open(path)?;
     assert_eq!(reopened.preferences()?.drafts[0].table_view, Some(settings));
+    Ok(())
+}
+
+#[test]
+fn named_table_views_migrate_conflict_restart_and_retain_orphans() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("app.db");
+    let profile = profile();
+    let store = Store::open(&path)?;
+    store.save_profile(&profile)?;
+    let query = store.save_query(&SavedQuery {
+        id: Uuid::new_v4(),
+        name: "Existing query".into(),
+        sql: "SELECT 1".into(),
+        favorite: true,
+        connection_id: Some(profile.id),
+        database: "postgres".into(),
+        revision: 0,
+    })?;
+    drop(store);
+    let conn = Connection::open(&path)?;
+    conn.execute_batch("DROP TABLE saved_table_views; PRAGMA user_version=3;")?;
+    drop(conn);
+    let store = Store::open(&path)?;
+    assert_eq!(store.saved_queries("", None)?[0].sql, query.sql);
+    let view = SavedTableView {
+        id: Uuid::new_v4(),
+        name: "  My table  ".into(),
+        connection_id: Some(profile.id),
+        database: "postgres".into(),
+        table: TableRef {
+            schema: "public".into(),
+            name: "items".into(),
+            kind: RelationKind::Table,
+        },
+        settings: TableViewSettings {
+            filter: Some(
+                TableFilter {
+                    column: "removed_column".into(),
+                    predicate: FilterPredicate::IsNull,
+                }
+                .into(),
+            ),
+            sort: vec![("id".into(), false)],
+            columns: vec![ViewColumn {
+                name: "name".into(),
+                hidden: true,
+            }],
+            page_size: 50,
+        },
+        relationship: None,
+        revision: 0,
+    };
+    let saved = store.save_table_view(&view)?;
+    assert_eq!(saved.name, "My table");
+    assert_eq!(saved.revision, 1);
+    let mut updated = saved.clone();
+    updated.settings.page_size = 250;
+    let updated = store.save_table_view(&updated)?;
+    assert!(
+        store
+            .save_table_view(&saved)
+            .unwrap_err()
+            .to_string()
+            .contains("changed")
+    );
+    assert!(store.delete_table_view(saved.id, saved.revision).is_err());
+    let mut reassigned = updated.clone();
+    reassigned.table.name = "other".into();
+    assert!(store.save_table_view(&reassigned).is_err());
+    drop(store);
+    let store = Store::open(&path)?;
+    assert_eq!(store.saved_table_views()?, vec![updated.clone()]);
+    let mut duplicate = updated.clone();
+    duplicate.id = Uuid::new_v4();
+    duplicate.revision = 0;
+    duplicate.name = "Copy".into();
+    store.save_table_view(&duplicate)?;
+    store.rename_query_database(profile.id, "postgres", "renamed")?;
+    assert!(
+        store
+            .saved_table_views()?
+            .iter()
+            .all(|view| view.database == "renamed")
+    );
+    store.delete_profile(profile.id)?;
+    let orphans = store.saved_table_views()?;
+    assert_eq!(orphans.len(), 2);
+    assert!(orphans.iter().all(|view| view.connection_id.is_none()));
+    assert_eq!(
+        orphans[0].settings.filter, saved.settings.filter,
+        "schema-invalid conditions remain repairable"
+    );
+    assert!(
+        store.save_table_view(&updated).is_err(),
+        "stale editors cannot reassign orphans"
+    );
+    assert_eq!(store.saved_queries("", None)?.len(), 1);
     Ok(())
 }

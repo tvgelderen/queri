@@ -39,7 +39,7 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         ensure!(
-            version <= 3,
+            version <= 4,
             "This application database was created by a newer Queri version."
         );
         if version == 0 {
@@ -71,6 +71,20 @@ impl Store {
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             PRAGMA user_version=3;",
+            )?;
+        }
+        if version < 4 {
+            tx.execute_batch(
+                "CREATE TABLE saved_table_views (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                connection_id TEXT REFERENCES connections(id) ON DELETE SET NULL,
+                database_name TEXT NOT NULL,
+                table_ref TEXT NOT NULL,
+                settings TEXT NOT NULL,
+                relationship TEXT,
+                revision INTEGER NOT NULL DEFAULT 1
+            ); PRAGMA user_version=4;",
             )?;
         }
         tx.commit()?;
@@ -182,6 +196,88 @@ impl Store {
             updated_at=CURRENT_TIMESTAMP WHERE connection_id=?1 AND database_name=?2",
             params![connection.to_string(), source, target],
         )?;
+        self.connection()?.execute("UPDATE saved_table_views SET database_name=?3,revision=revision+1 WHERE connection_id=?1 AND database_name=?2", params![connection.to_string(), source, target])?;
+        Ok(())
+    }
+
+    pub fn saved_table_views(&self) -> Result<Vec<SavedTableView>> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare("SELECT id,name,connection_id,database_name,table_ref,settings,relationship,revision FROM saved_table_views ORDER BY name COLLATE NOCASE,id")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, name, connection, database, table, settings, relationship, revision) = row?;
+            Ok(SavedTableView {
+                id: id.parse()?,
+                name,
+                connection_id: connection.map(|id| id.parse()).transpose()?,
+                database,
+                table: serde_json::from_str(&table)?,
+                settings: serde_json::from_str(&settings)?,
+                relationship: relationship
+                    .map(|scope| serde_json::from_str(&scope))
+                    .transpose()?,
+                revision,
+            })
+        })
+        .collect()
+    }
+
+    pub fn save_table_view(&self, view: &SavedTableView) -> Result<SavedTableView> {
+        ensure!(!view.name.trim().is_empty(), "Enter a view name.");
+        ensure!(
+            (1..=1000).contains(&view.settings.page_size),
+            "Page size must be 1–1000 rows."
+        );
+        ensure!(
+            view.relationship
+                .as_ref()
+                .is_none_or(|scope| scope.destination() == &view.table),
+            "Relationship scope belongs to another table."
+        );
+        let conn = self.connection()?;
+        let table = serde_json::to_string(&view.table)?;
+        let settings = serde_json::to_string(&view.settings)?;
+        let relationship = view
+            .relationship
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let connection = view.connection_id.map(|id| id.to_string());
+        if view.revision == 0 {
+            conn.execute("INSERT INTO saved_table_views(id,name,connection_id,database_name,table_ref,settings,relationship) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![view.id.to_string(), view.name.trim(), connection, view.database, table, settings, relationship])?;
+        } else {
+            let changed = conn.execute("UPDATE saved_table_views SET name=?2,settings=?6,relationship=?7,revision=revision+1 WHERE id=?1 AND revision=?8 AND connection_id IS ?3 AND database_name=?4 AND table_ref=?5", params![view.id.to_string(), view.name.trim(), connection, view.database, table, settings, relationship, view.revision])?;
+            ensure!(
+                changed == 1,
+                "This saved view changed, was deleted, or its association changed elsewhere. Reopen it from Saved views, or use Save as. Your current settings are retained."
+            );
+        }
+        let mut saved = view.clone();
+        saved.name = saved.name.trim().into();
+        saved.revision += 1;
+        Ok(saved)
+    }
+
+    pub fn delete_table_view(&self, id: Uuid, revision: i64) -> Result<()> {
+        let changed = self.connection()?.execute(
+            "DELETE FROM saved_table_views WHERE id=?1 AND revision=?2",
+            params![id.to_string(), revision],
+        )?;
+        ensure!(
+            changed == 1,
+            "This saved view changed or was deleted elsewhere. Reopen Saved views."
+        );
         Ok(())
     }
 

@@ -25,6 +25,8 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::{sync::Arc, time::Instant};
 
+#[path = "named_table_views.rs"]
+mod named_table_views;
 #[path = "table_views.rs"]
 mod table_views;
 #[cfg(all(test, feature = "test-support"))]
@@ -70,9 +72,10 @@ enum DocumentKind {
         filter_open: bool,
         columns: Vec<ViewColumn>,
         columns_open: bool,
-        filter_draft: Option<FilterExpression>,
+        saved_view: Option<Box<SavedTableView>>,
+        filter_draft: Option<Box<FilterExpression>>,
         filter_target: Vec<usize>,
-        pending_filter: Option<Option<FilterExpression>>,
+        pending_filter: Option<Box<Option<FilterExpression>>>,
     },
 }
 #[derive(Clone, Copy, PartialEq)]
@@ -191,6 +194,7 @@ impl Document {
                 filter_open: false,
                 columns: vec![],
                 columns_open: false,
+                saved_view: None,
                 filter_draft: None,
                 filter_target: vec![],
                 pending_filter: None,
@@ -332,6 +336,10 @@ impl Document {
     }
     pub fn draft(&self, cx: &App) -> Draft {
         Draft {
+            saved_table_view: match &self.kind {
+                DocumentKind::Table { saved_view, .. } => saved_view.as_deref().cloned(),
+                _ => None,
+            },
             table_view: self.table_view_settings(),
             statement_timeout: self.statement_timeout,
             relationship: self.relationship().cloned(),
@@ -471,7 +479,7 @@ impl Document {
         let table = table.clone();
         let mut options = options.as_ref().clone();
         if let Some(filter) = pending_filter {
-            options.filter = filter.clone();
+            options.filter = (**filter).clone();
             options.offset = 0;
         }
         let filtered = options.filter.is_some();
@@ -527,7 +535,7 @@ impl Document {
                         } = &mut this.kind
                         {
                             if let Some(filter) = pending_filter.take() {
-                                options.filter = filter;
+                                options.filter = *filter;
                                 options.offset = 0;
                             }
                             let kind = page
@@ -664,14 +672,13 @@ impl Document {
                 section: Section::Data,
                 ..
             } = &self.kind
+                && let Some(settings) = self.table_view_settings()
             {
-                if let Some(settings) = self.table_view_settings() {
-                    match settings.display_columns(&grid.data.columns) {
-                        Ok(columns) => grid.display_columns = columns,
-                        Err(error) => {
-                            grid.display_columns.clear();
-                            self.error = error.to_string();
-                        }
+                match settings.display_columns(&grid.data.columns) {
+                    Ok(columns) => grid.display_columns = columns,
+                    Err(error) => {
+                        grid.display_columns.clear();
+                        self.error = error.to_string();
                     }
                 }
             }
@@ -1621,11 +1628,11 @@ impl Document {
             DocumentKind::Table {
                 filter_draft: Some(draft),
                 ..
-            } => Some(draft.clone()),
+            } => Some((**draft).clone()),
             _ => self.filter_input(cx).map(Into::into),
         };
         if let DocumentKind::Table { pending_filter, .. } = &mut self.kind {
-            *pending_filter = Some(candidate);
+            *pending_filter = Some(Box::new(candidate));
         }
         self.refresh(window, cx);
     }
@@ -2491,7 +2498,7 @@ impl Document {
                         )
                     }),
             )
-            .when(*section == Section::Data, |view| view.child(self.sort_controls(cx)).child(self.column_controls(cx)))
+            .when(*section == Section::Data, |view| view.child(self.named_view_controls(cx)).child(self.sort_controls(cx)).child(self.column_controls(cx)))
             .when(*section == Section::Data && *filter_open, |view| {
                 let view = view.child(self.filter_tree(cx));
                 let column_picker = choice(

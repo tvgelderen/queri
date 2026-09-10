@@ -545,6 +545,8 @@ impl StatementTimeout {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Draft {
     #[serde(default)]
+    pub saved_table_view: Option<SavedTableView>,
+    #[serde(default)]
     pub table_view: Option<TableViewSettings>,
     #[serde(default)]
     pub statement_timeout: StatementTimeout,
@@ -663,4 +665,16 @@ impl RelationshipScope {
             self.key.name
         )
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedTableView {
+    pub id: Uuid,
+    pub name: String,
+    pub connection_id: Option<Uuid>,
+    pub database: String,
+    pub table: TableRef,
+    pub settings: TableViewSettings,
+    pub relationship: Option<RelationshipScope>,
+    pub revision: i64,
 }

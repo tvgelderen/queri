@@ -37,10 +37,15 @@ impl Document {
         if let DocumentKind::Table {
             filter_draft,
             filter_target,
+            options,
             ..
         } = &mut self.kind
         {
-            let root = filter_draft.get_or_insert_with(|| FilterExpression::All(vec![]));
+            let root = filter_draft.get_or_insert_with(|| {
+                Box::new(FilterExpression::All(
+                    options.filter.clone().into_iter().collect(),
+                ))
+            });
             if let Some(target) = node_mut(root, filter_target) {
                 match target {
                     FilterExpression::All(children) | FilterExpression::Any(children) => {
@@ -90,9 +95,9 @@ impl Document {
             ..
         } = &mut self.kind
         {
-            *filter_draft = Some(FilterExpression::All(
+            *filter_draft = Some(Box::new(FilterExpression::All(
                 options.filter.clone().into_iter().collect(),
-            ));
+            )));
             filter_target.clear();
             *filter_open = true;
         }
@@ -129,7 +134,7 @@ impl Document {
             .child(h_flex().gap_2()
                 .children([(false, "Add All group"), (true, "Add Any group")].into_iter().map(|(any, label)| Button::new(if any { "add-any-group" } else { "add-all-group" }).small().label(label).disabled(self.busy() || page.is_none()).on_click(cx.listener(move |this, _, _, cx| this.add_filter_node(if any { FilterExpression::Any(vec![]) } else { FilterExpression::All(vec![]) }, cx)))))
                 .child(Button::new("reset-filter-draft").small().label("Reset draft").disabled(self.busy()).on_click(cx.listener(|this, _, _, cx| {
-                    if let DocumentKind::Table { filter_draft, filter_target, options, .. } = &mut this.kind { *filter_draft = options.filter.clone().map(|filter| FilterExpression::All(vec![filter])); filter_target.clear(); }
+                    if let DocumentKind::Table { filter_draft, filter_target, options, .. } = &mut this.kind { *filter_draft = options.filter.clone().map(|filter| Box::new(FilterExpression::All(vec![filter]))); filter_target.clear(); }
                     cx.notify();
                 }))))
             .child(div().text_xs().child(format!("Adding to group {}", if filter_target.is_empty() { "root".into() } else { filter_target.iter().map(|i| (i+1).to_string()).collect::<Vec<_>>().join(".") })))
@@ -192,29 +197,29 @@ impl Document {
                                 page,
                                 ..
                             } = &mut this.kind
+                                && let Some(node) = node_mut(root, &select_path)
                             {
-                                if let Some(node) = node_mut(root, &select_path) {
-                                    match node {
-                                        FilterExpression::Predicate(predicate) => {
-                                            *filter_target = select_path.clone();
-                                            if let Some(index) = page.as_ref().and_then(|page| {
-                                                page.metadata.columns.iter().position(|column| {
-                                                    column.name == predicate.column
-                                                })
-                                            }) {
-                                                *filter_column = index;
-                                                *filter_operator = predicate.predicate.operator();
-                                                filter.update(cx, |input, cx| {
-                                                    input.set_value(
-                                                        predicate.predicate.value().unwrap_or(""),
-                                                        window,
-                                                        cx,
-                                                    )
-                                                });
-                                            }
+                                match node {
+                                    FilterExpression::Predicate(predicate) => {
+                                        *filter_target = select_path.clone();
+                                        if let Some(index) = page.as_ref().and_then(|page| {
+                                            page.metadata
+                                                .columns
+                                                .iter()
+                                                .position(|column| column.name == predicate.column)
+                                        }) {
+                                            *filter_column = index;
+                                            *filter_operator = predicate.predicate.operator();
+                                            filter.update(cx, |input, cx| {
+                                                input.set_value(
+                                                    predicate.predicate.value().unwrap_or(""),
+                                                    window,
+                                                    cx,
+                                                )
+                                            });
                                         }
-                                        _ => *filter_target = select_path.clone(),
                                     }
+                                    _ => *filter_target = select_path.clone(),
                                 }
                             }
                             cx.notify();
@@ -231,18 +236,17 @@ impl Document {
                                     filter_draft: Some(root),
                                     ..
                                 } = &mut this.kind
+                                    && let Some(node) = node_mut(root, &toggle_path)
                                 {
-                                    if let Some(node) = node_mut(root, &toggle_path) {
-                                        *node = match node {
-                                            FilterExpression::All(children) => {
-                                                FilterExpression::Any(std::mem::take(children))
-                                            }
-                                            FilterExpression::Any(children) => {
-                                                FilterExpression::All(std::mem::take(children))
-                                            }
-                                            _ => return,
-                                        };
-                                    }
+                                    *node = match node {
+                                        FilterExpression::All(children) => {
+                                            FilterExpression::Any(std::mem::take(children))
+                                        }
+                                        FilterExpression::Any(children) => {
+                                            FilterExpression::All(std::mem::take(children))
+                                        }
+                                        _ => return,
+                                    };
                                 }
                                 cx.notify();
                             })),
@@ -261,15 +265,14 @@ impl Document {
                             } = &mut this.kind
                             {
                                 if remove_path.is_empty() {
-                                    *filter_draft = None;
-                                } else if let Some(root) = filter_draft {
-                                    if let Some(
+                                    *filter_draft = Some(Box::new(FilterExpression::All(vec![])));
+                                } else if let Some(root) = filter_draft
+                                    && let Some(
                                         FilterExpression::All(children)
                                         | FilterExpression::Any(children),
                                     ) = node_mut(root, &remove_path[..remove_path.len() - 1])
-                                    {
-                                        children.remove(*remove_path.last().unwrap());
-                                    }
+                                {
+                                    children.remove(*remove_path.last().unwrap());
                                 }
                                 filter_target.clear();
                             }
@@ -387,7 +390,7 @@ impl Document {
             options.filter = settings.filter.clone();
             *filter_draft = settings
                 .filter
-                .map(|filter| FilterExpression::All(vec![filter]));
+                .map(|filter| Box::new(FilterExpression::All(vec![filter])));
             options.sort = settings.sort;
             options.limit = settings.page_size;
             options.offset = 0;
