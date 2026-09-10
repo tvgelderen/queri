@@ -250,7 +250,7 @@ impl TableFilter {
             .columns
             .iter()
             .find(|column| column.name == self.column)
-            .ok_or_else(|| anyhow::anyhow!("Unknown filter column."))?;
+            .ok_or_else(|| anyhow::anyhow!("Unknown filter column ‘{}’. Replace or remove this condition in the filter editor.", self.column))?;
         let kind = column.filter_kind(sqlite);
         ensure!(
             kind.operators().contains(&self.predicate.operator()),

@@ -189,7 +189,10 @@ pub async fn tables(client: &Client, schema: &str) -> Result<Vec<TableRef>> {
         .collect()
 }
 
-async fn metadata(client: &impl GenericClient, table: &TableRef) -> Result<TableMetadata> {
+pub(super) async fn metadata(
+    client: &impl GenericClient,
+    table: &TableRef,
+) -> Result<TableMetadata> {
     let rows = client.query("SELECT a.attname, format_type(a.atttypid,a.atttypmod), NOT a.attnotnull, pg_get_expr(d.adbin,d.adrelid), EXISTS(SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid AND i.indisprimary AND a.attnum=ANY(i.indkey)), a.attgenerated <> '' OR a.attidentity='a' FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid LEFT JOIN pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum WHERE n.nspname=$1 AND c.relname=$2 AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum", &[&table.schema, &table.name]).await?;
     let columns = rows
         .iter()

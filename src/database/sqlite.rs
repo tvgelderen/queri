@@ -179,7 +179,7 @@ pub fn tables(conn: &Connection, schema: &str) -> Result<Vec<TableRef>> {
     Ok(tables)
 }
 
-fn metadata(conn: &Connection, table: &TableRef) -> Result<TableMetadata> {
+pub(super) fn metadata(conn: &Connection, table: &TableRef) -> Result<TableMetadata> {
     let mut stmt = conn.prepare(
         "SELECT name,type,\"notnull\",dflt_value,pk,hidden FROM pragma_table_xinfo(?1,?2)",
     )?;

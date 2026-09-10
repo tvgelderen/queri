@@ -67,6 +67,9 @@ impl Document {
         let Some(column) = column.checked_sub(usize::from(state.delegate().checkable)) else {
             return;
         };
+        let Some(column) = state.delegate().display_columns.get(column).copied() else {
+            return;
+        };
         let data = &state.delegate().data;
         let Some(value) = data.rows.get(row).and_then(|row| row.get(column)) else {
             return;
@@ -351,5 +354,90 @@ impl Document {
                     }),
             )
             .into_any_element()
+    }
+}
+
+impl Document {
+    pub(super) fn table_view_settings(&self) -> Option<TableViewSettings> {
+        let DocumentKind::Table {
+            options, columns, ..
+        } = &self.kind
+        else {
+            return None;
+        };
+        Some(TableViewSettings {
+            filter: options.filter.clone(),
+            sort: options.sort.clone(),
+            columns: columns.clone(),
+            page_size: options.limit,
+        })
+    }
+
+    pub fn restore_table_view(&mut self, settings: Option<TableViewSettings>) {
+        if let (
+            Some(settings),
+            DocumentKind::Table {
+                options,
+                columns,
+                filter_draft,
+                ..
+            },
+        ) = (settings, &mut self.kind)
+        {
+            options.filter = settings.filter.clone();
+            *filter_draft = settings
+                .filter
+                .map(|filter| FilterExpression::All(vec![filter]));
+            options.sort = settings.sort;
+            options.limit = settings.page_size;
+            options.offset = 0;
+            *columns = settings.columns;
+        }
+    }
+
+    pub(super) fn column_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        let DocumentKind::Table {
+            columns_open,
+            columns,
+            page,
+            ..
+        } = &self.kind
+        else {
+            return Empty.into_any_element();
+        };
+        let mut all = columns.clone();
+        if let Some(page) = page {
+            for column in &page.metadata.columns {
+                if !all.iter().any(|entry| entry.name == column.name) {
+                    all.push(ViewColumn {
+                        name: column.name.clone(),
+                        hidden: false,
+                    });
+                }
+            }
+        }
+        v_flex().gap_1().child(Button::new("view-columns").small().label("Columns").selected(*columns_open).on_click(cx.listener(|this, _, _, cx| {
+            if let DocumentKind::Table { columns_open, .. } = &mut this.kind { *columns_open = !*columns_open; } cx.notify();
+        })))
+        .when(*columns_open, |view| view
+            .child(div().text_xs().child("Presentation only · copy, export and search use visible column order. Row actions retain complete source rows."))
+            .children(all.iter().enumerate().map(|(index, column)| {
+                let name = column.name.clone(); let current = all.clone(); let previous = all.clone(); let remove = all.clone();
+                let missing = page.as_ref().is_some_and(|page| !page.metadata.columns.iter().any(|col| col.name == name));
+                h_flex().gap_2()
+                    .child(Button::new(SharedString::from(format!("column-visible-{index}"))).small().label(format!("{} {}{}", if column.hidden { "Show" } else { "Hide" }, name, if missing { " (missing)" } else { "" })).disabled(self.busy() || missing).on_click(cx.listener(move |this, _, _, cx| {
+                        if let DocumentKind::Table { columns, .. } = &mut this.kind { *columns = current.clone(); columns[index].hidden = !columns[index].hidden; } this.update_grid(cx); cx.emit(DocumentChanged); cx.notify();
+                    })))
+                    .child(Button::new(SharedString::from(format!("column-earlier-{index}"))).small().label("Earlier").disabled(self.busy() || index == 0).on_click(cx.listener(move |this, _, _, cx| {
+                        if let DocumentKind::Table { columns, .. } = &mut this.kind { *columns = previous.clone(); columns.swap(index, index-1); } this.update_grid(cx); cx.emit(DocumentChanged); cx.notify();
+                    })))
+                    .when(missing, |row| row.child(Button::new(SharedString::from(format!("column-remove-{index}"))).small().label("Remove missing column").on_click(cx.listener(move |this, _, _, cx| {
+                        if let DocumentKind::Table { columns, .. } = &mut this.kind { *columns = remove.clone(); columns.remove(index); } this.error.clear(); this.update_grid(cx); cx.emit(DocumentChanged); cx.notify();
+                    }))))
+            }))
+            .child(Button::new("reset-columns").small().label("Reset column layout").disabled(self.busy()).on_click(cx.listener(|this, _, _, cx| {
+                if let DocumentKind::Table { columns, .. } = &mut this.kind { columns.clear(); } this.error.clear(); this.update_grid(cx); cx.emit(DocumentChanged); cx.notify();
+            }))))
+        .into_any_element()
     }
 }

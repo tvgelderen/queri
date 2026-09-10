@@ -16,6 +16,7 @@ impl EventEmitter<GridEvent> for TableState<Grid> {}
 
 pub struct Grid {
     pub data: Arc<ResultSet>,
+    pub display_columns: Vec<usize>,
     pub checkable: bool,
     pub search_cell: Option<(usize, usize)>,
     pub checked: BTreeSet<usize>,
@@ -28,6 +29,7 @@ impl Grid {
     pub fn new(data: Arc<ResultSet>) -> Self {
         let mut grid = Self {
             data: Arc::new(ResultSet::default()),
+            display_columns: vec![],
             checkable: false,
             search_cell: None,
             checked: BTreeSet::new(),
@@ -39,6 +41,7 @@ impl Grid {
         grid
     }
     pub fn replace(&mut self, data: Arc<ResultSet>) {
+        self.display_columns = (0..data.columns.len()).collect();
         self.data = data;
         self.search_cell = None;
         self.checked.clear();
@@ -55,6 +58,27 @@ impl Grid {
                     && cells.all(|cell| matches!(cell, Cell::Integer(_) | Cell::Real(_)))
             })
             .collect();
+    }
+
+    pub fn displayed_data(&self) -> ResultSet {
+        let mut data = (*self.data).clone();
+        data.columns = self
+            .display_columns
+            .iter()
+            .map(|index| self.data.columns[*index].clone())
+            .collect();
+        data.rows = self
+            .data
+            .rows
+            .iter()
+            .map(|row| {
+                self.display_columns
+                    .iter()
+                    .map(|index| row[*index].clone())
+                    .collect()
+            })
+            .collect();
+        data
     }
 
     pub fn set_column_types(&mut self, columns: &[crate::model::Column]) {
@@ -94,7 +118,12 @@ impl Grid {
                 "Not selected".into()
             };
         }
-        let col = col.saturating_sub(usize::from(self.checkable));
+        let Some(col) = col
+            .checked_sub(usize::from(self.checkable))
+            .and_then(|index| self.display_columns.get(index).copied())
+        else {
+            return String::new();
+        };
         self.data
             .rows
             .get(row)
@@ -106,7 +135,7 @@ impl Grid {
 
 impl TableDelegate for Grid {
     fn columns_count(&self, _: &App) -> usize {
-        self.data.columns.len() + usize::from(self.checkable)
+        self.display_columns.len() + usize::from(self.checkable)
     }
     fn rows_count(&self, _: &App) -> usize {
         self.data.rows.len()
@@ -119,7 +148,7 @@ impl TableDelegate for Grid {
                 .selectable(false)
                 .movable(false);
         }
-        let i = index.saturating_sub(usize::from(self.checkable));
+        let i = self.display_columns[index.saturating_sub(usize::from(self.checkable))];
         let name = self.data.columns.get(i).cloned().unwrap_or_default();
         let content_width = self
             .data
@@ -175,7 +204,7 @@ impl TableDelegate for Grid {
         if let Some(name) = self
             .data
             .columns
-            .get(index.saturating_sub(usize::from(self.checkable)))
+            .get(self.display_columns[index.saturating_sub(usize::from(self.checkable))])
         {
             cx.emit(GridEvent::Sort(name.clone(), sort));
         }
@@ -207,7 +236,7 @@ impl TableDelegate for Grid {
                 }))
                 .into_any_element();
         }
-        let index = col.saturating_sub(usize::from(self.checkable));
+        let index = self.display_columns[col.saturating_sub(usize::from(self.checkable))];
         let cell = self.data.rows.get(row).and_then(|row| row.get(index));
         div()
             .when(self.search_cell == Some((row, index)), |view| {

@@ -167,6 +167,7 @@ fn version_one_migration_preserves_settings_drafts_and_history() -> Result<()> {
     let preferences = Preferences {
         active_connection: Some(profile.id),
         drafts: vec![Draft {
+            table_view: None,
             statement_timeout: StatementTimeout::Inherit,
             saved_query: None,
             relationship: None,
@@ -486,5 +487,45 @@ fn safeguards_old_profile_defaults_and_roundtrip() -> Result<()> {
             assert_eq!(loaded.policy, policy);
         }
     }
+    Ok(())
+}
+
+#[test]
+fn table_view_drafts_survive_restart_and_old_drafts_default() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("app.db");
+    let store = Store::open(&path)?;
+    let old = serde_json::json!({"connection_id": Uuid::new_v4(), "database":"main", "sql":"", "table":{"schema":"main", "name":"items", "kind":"table"}});
+    let mut draft: Draft = serde_json::from_value(old)?;
+    assert!(draft.table_view.is_none());
+    let settings = TableViewSettings {
+        filter: Some(FilterExpression::Any(vec![
+            TableFilter {
+                column: "removed".into(),
+                predicate: FilterPredicate::IsNull,
+            }
+            .into(),
+        ])),
+        sort: vec![("id".into(), true), ("name".into(), false)],
+        columns: vec![
+            ViewColumn {
+                name: "name".into(),
+                hidden: false,
+            },
+            ViewColumn {
+                name: "id".into(),
+                hidden: true,
+            },
+        ],
+        page_size: 250,
+    };
+    draft.table_view = Some(settings.clone());
+    store.save_preferences(&Preferences {
+        drafts: vec![draft],
+        ..Default::default()
+    })?;
+    drop(store);
+    let reopened = Store::open(path)?;
+    assert_eq!(reopened.preferences()?.drafts[0].table_view, Some(settings));
     Ok(())
 }

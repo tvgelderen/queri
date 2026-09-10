@@ -894,6 +894,7 @@ async fn missing_passwords_prompt_before_connecting_and_on_document_retry(cx: &m
                         Preferences {
                             active_connection: Some(profile.id),
                             drafts: vec![Draft {
+                                table_view: None,
                                 statement_timeout: StatementTimeout::Inherit,
                                 relationship: None,
                                 saved_query: None,
@@ -1571,7 +1572,10 @@ async fn saved_library_sql_files_and_related_tabs_keep_work_separate(cx: &mut Te
     .await;
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
-        window.click("table-cell-0:2", cx);
+        window.click("view-columns", cx);
+        window.click("column-earlier-1", cx);
+        window.click("column-visible-1", cx);
+        window.click("table-cell-0:1", cx);
         window.click("row-actions", cx);
         click_label(window, "Open referenced row…", cx);
     })
@@ -1643,6 +1647,7 @@ async fn workspace_search_live_drafts_selects_text_offline_and_drops_closed_tabs
     };
     let drafts = (1..=2)
         .map(|number| Draft {
+            table_view: None,
             statement_timeout: StatementTimeout::custom(number * 1000).unwrap(),
             relationship: None,
             saved_query: None,

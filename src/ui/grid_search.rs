@@ -24,6 +24,8 @@ pub struct GridSearch {
     data: Arc<ResultSet>,
     open: bool,
     case_sensitive: bool,
+    include_hidden: bool,
+    display_columns: Vec<usize>,
     matches: Vec<(usize, usize)>,
     current: usize,
     generation: u64,
@@ -77,7 +79,9 @@ impl GridSearch {
             }),
             cx.observe(&grid, |this, grid, cx| {
                 let data = grid.read(cx).delegate().data.clone();
-                if !Arc::ptr_eq(&this.data, &data) {
+                let columns = grid.read(cx).delegate().display_columns.clone();
+                if !Arc::ptr_eq(&this.data, &data) || this.display_columns != columns {
+                    this.display_columns = columns;
                     this.data = data;
                     this.search(cx);
                 }
@@ -85,6 +89,8 @@ impl GridSearch {
         ];
         Self {
             data: grid.read(cx).delegate().data.clone(),
+            display_columns: grid.read(cx).delegate().display_columns.clone(),
+            include_hidden: false,
             grid,
             input,
             open: false,
@@ -109,7 +115,12 @@ impl GridSearch {
                     self.current + 1
                 },
                 self.matches.len()
-            )
+            ) + &self
+                .matches
+                .get(self.current)
+                .filter(|(_, column)| !self.display_columns.contains(column))
+                .map(|(_, column)| format!(" · hidden: {}", self.data.columns[*column]))
+                .unwrap_or_default()
         }
     }
     pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -140,13 +151,28 @@ impl GridSearch {
         let generation = self.generation;
         let data = self.data.clone();
         let case_sensitive = self.case_sensitive;
+        let columns = self.display_columns.clone();
+        let include_hidden = self.include_hidden;
         // Dropping the previous task cancels this delay before a new scan starts.
         let debounce = cx
             .background_executor()
             .timer(std::time::Duration::from_millis(100));
         let work = cx.background_executor().spawn(async move {
             debounce.await;
-            matching_cells(&data, &query, case_sensitive)
+            let mut matches = matching_cells(&data, &query, case_sensitive);
+            if !include_hidden {
+                matches.retain(|(_, column)| columns.contains(column));
+            }
+            matches.sort_by_key(|(row, column)| {
+                (
+                    *row,
+                    columns
+                        .iter()
+                        .position(|index| index == column)
+                        .unwrap_or(columns.len() + column),
+                )
+            });
+            matches
         });
         self.task = Some(cx.spawn(async move |this, cx| {
             let matches = work.await;
@@ -181,7 +207,14 @@ impl GridSearch {
             grid.delegate_mut().search_cell = current;
             if let Some((row, column)) = current {
                 grid.scroll_to_row(row, cx);
-                grid.scroll_to_col(column + usize::from(grid.delegate().checkable), cx);
+                if let Some(display) = grid
+                    .delegate()
+                    .display_columns
+                    .iter()
+                    .position(|index| *index == column)
+                {
+                    grid.scroll_to_col(display + usize::from(grid.delegate().checkable), cx);
+                }
             }
             cx.notify();
         });
@@ -200,11 +233,12 @@ impl Render for GridSearch {
             .child(h_flex().gap_2()
                 .child(Textarea::new(&self.input).small().flex_1())
                 .child(Button::new("grid-search-case").small().label("Aa").accessibility_label("Match case").selected(self.case_sensitive).toggled(self.case_sensitive).on_click(cx.listener(|this, _, _, cx| { this.case_sensitive = !this.case_sensitive; this.search(cx); })))
+                .child(Button::new("grid-search-hidden").small().label("Include hidden").selected(self.include_hidden).toggled(self.include_hidden).on_click(cx.listener(|this, _, _, cx| { this.include_hidden = !this.include_hidden; this.search(cx); })))
                 .child(div().id("grid-search-count").role(Role::Status).aria_label(count.clone()).text_sm().child(count))
                 .child(Button::new("grid-search-previous").small().label("Previous").disabled(self.matches.is_empty()).on_click(cx.listener(|this, _, _, cx| this.step(true, cx))))
                 .child(Button::new("grid-search-next").small().label("Next").disabled(self.matches.is_empty()).on_click(cx.listener(|this, _, _, cx| this.step(false, cx))))
                 .child(Button::new("grid-search-close").small().ghost().label("Close").on_click(cx.listener(|this, _, window, cx| this.close(window, cx)))))
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Loaded result / page only · visible columns · complete cell text · Enter / Shift+Enter to navigate"))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Loaded result / page only · visible columns by default · complete cell text · Enter / Shift+Enter to navigate"))
             .into_any_element()
     }
 }

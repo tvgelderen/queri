@@ -367,6 +367,46 @@ impl TableMetadata {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ViewColumn {
+    pub name: String,
+    pub hidden: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TableViewSettings {
+    pub filter: Option<FilterExpression>,
+    pub sort: Vec<(String, bool)>,
+    pub columns: Vec<ViewColumn>,
+    pub page_size: u32,
+}
+
+impl TableViewSettings {
+    pub fn display_columns(&self, names: &[String]) -> Result<Vec<usize>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut visible = Vec::new();
+        for column in &self.columns {
+            ensure!(
+                seen.insert(&column.name),
+                "Duplicate layout column: {}",
+                column.name
+            );
+            let index = names.iter().position(|name| name == &column.name).ok_or_else(|| anyhow::anyhow!("Layout column ‘{}’ no longer exists. Remove it in Columns or reset the layout.", column.name))?;
+            if !column.hidden {
+                visible.push(index);
+            }
+        }
+        visible.extend(
+            names
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| !seen.contains(name))
+                .map(|(index, _)| index),
+        );
+        Ok(visible)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct BrowseOptions {
     pub relationship: Option<RelationshipScope>,
@@ -504,6 +544,8 @@ impl StatementTimeout {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Draft {
+    #[serde(default)]
+    pub table_view: Option<TableViewSettings>,
     #[serde(default)]
     pub statement_timeout: StatementTimeout,
     #[serde(default)]

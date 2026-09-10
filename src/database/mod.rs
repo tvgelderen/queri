@@ -244,6 +244,16 @@ impl Session {
         }
     }
 
+    pub async fn table_metadata(&self, table: TableRef) -> Result<TableMetadata> {
+        match &self.backend {
+            Backend::Postgres(pg) => postgres::metadata(&*pg.client.lock().await, &table).await,
+            Backend::Sqlite { .. } => {
+                self.with_sqlite(move |conn| sqlite::metadata(conn, &table))
+                    .await
+            }
+        }
+    }
+
     pub async fn browse(&self, table: TableRef, options: BrowseOptions) -> Result<TablePage> {
         anyhow::ensure!(
             (1..=1000).contains(&options.limit),

@@ -68,6 +68,8 @@ enum DocumentKind {
         filter_operator: FilterOperator,
         filter_apply_focus: FocusHandle,
         filter_open: bool,
+        columns: Vec<ViewColumn>,
+        columns_open: bool,
         filter_draft: Option<FilterExpression>,
         filter_target: Vec<usize>,
         pending_filter: Option<Option<FilterExpression>>,
@@ -187,6 +189,8 @@ impl Document {
                 filter_operator: FilterOperator::Contains,
                 filter_apply_focus: cx.focus_handle(),
                 filter_open: false,
+                columns: vec![],
+                columns_open: false,
                 filter_draft: None,
                 filter_target: vec![],
                 pending_filter: None,
@@ -328,6 +332,7 @@ impl Document {
     }
     pub fn draft(&self, cx: &App) -> Draft {
         Draft {
+            table_view: self.table_view_settings(),
             statement_timeout: self.statement_timeout,
             relationship: self.relationship().cloned(),
             saved_query: self.saved_query.clone(),
@@ -479,20 +484,25 @@ impl Document {
             window,
             cx,
             async move {
-                let result = session.browse(table, options).await;
+                let result = session.browse(table.clone(), options).await;
+                let repair_metadata = if result.is_err() {
+                    session.table_metadata(table).await.ok()
+                } else {
+                    None
+                };
                 let state = session
                     .transaction_status()
                     .await
                     .unwrap_or(TransactionStatus::Unknown);
-                Ok((result, state))
+                Ok((result, state, repair_metadata))
             },
             move |this, observed, _, cx| {
                 if this.session_generation != generation {
                     return;
                 }
-                let (result, state) = match observed {
+                let (result, state, repair_metadata) = match observed {
                     Ok(pair) => pair,
-                    Err(error) => (Err(error), TransactionStatus::Unknown),
+                    Err(error) => (Err(error), TransactionStatus::Unknown, None),
                 };
                 this.observe_transaction(state, cx);
                 this.operation = Operation::Idle;
@@ -537,8 +547,38 @@ impl Document {
                             *current = Some(Box::new(page));
                         }
                         this.update_grid(cx);
+                        cx.emit(DocumentChanged);
                     }
                     Err(error) => {
+                        if let (Some(metadata), DocumentKind::Table { page, .. }) =
+                            (repair_metadata, &mut this.kind)
+                        {
+                            let same_schema = page.as_ref().is_some_and(|page| {
+                                page.metadata
+                                    .columns
+                                    .iter()
+                                    .map(|col| (&col.name, &col.data_type))
+                                    .eq(metadata
+                                        .columns
+                                        .iter()
+                                        .map(|col| (&col.name, &col.data_type)))
+                            });
+                            if !same_schema {
+                                *page = Some(Box::new(TablePage {
+                                    data: ResultSet {
+                                        columns: metadata
+                                            .columns
+                                            .iter()
+                                            .map(|column| column.name.clone())
+                                            .collect(),
+                                        ..Default::default()
+                                    },
+                                    total: 0,
+                                    metadata,
+                                }));
+                                this.update_grid(cx);
+                            }
+                        }
                         if let DocumentKind::Table { pending_filter, .. } = &mut this.kind {
                             pending_filter.take();
                         }
@@ -617,9 +657,24 @@ impl Document {
             }
             _ => return,
         };
-        self.grid.update(cx, |state, cx| {
+        self.grid.clone().update(cx, |state, cx| {
             let grid = state.delegate_mut();
             grid.replace(data);
+            if let DocumentKind::Table {
+                section: Section::Data,
+                ..
+            } = &self.kind
+            {
+                if let Some(settings) = self.table_view_settings() {
+                    match settings.display_columns(&grid.data.columns) {
+                        Ok(columns) => grid.display_columns = columns,
+                        Err(error) => {
+                            grid.display_columns.clear();
+                            self.error = error.to_string();
+                        }
+                    }
+                }
+            }
             if let DocumentKind::Table {
                 page: Some(page),
                 section: Section::Data,
@@ -1197,7 +1252,9 @@ impl Document {
         }
         Some(crate::export::Selection {
             rows: (r1..=r2).collect(),
-            columns: (c1.max(skip) - skip..=c2 - skip).collect(),
+            columns: (c1.max(skip) - skip..=c2 - skip)
+                .filter_map(|index| state.delegate().display_columns.get(index).copied())
+                .collect(),
         })
     }
 
@@ -1233,7 +1290,7 @@ impl Document {
     fn export(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let state = self.grid.read(cx);
         let grid = state.delegate();
-        let data = grid.data.clone();
+        let data = Arc::new(grid.displayed_data());
         let rows: Vec<_> = if grid.checked.is_empty() {
             state.selected_row().into_iter().collect()
         } else {
@@ -1243,7 +1300,18 @@ impl Document {
             rows,
             columns: (0..data.columns.len()).collect(),
         });
-        let cells = self.cell_selection(cx);
+        let cells = self.cell_selection(cx).map(|mut selection| {
+            selection.columns = selection
+                .columns
+                .iter()
+                .filter_map(|source| {
+                    grid.display_columns
+                        .iter()
+                        .position(|index| index == source)
+                })
+                .collect();
+            selection
+        });
         super::export_dialog::open(
             self.services.clone(),
             data,
@@ -1333,7 +1401,12 @@ impl Document {
         };
         let columns = &grid.delegate().data.columns;
         if let Some((_, col)) = grid.selected_cell() {
-            let index = col.saturating_sub(usize::from(grid.delegate().checkable));
+            let Some(index) = col
+                .checked_sub(usize::from(grid.delegate().checkable))
+                .and_then(|index| grid.delegate().display_columns.get(index).copied())
+            else {
+                return;
+            };
             if let Some(cell) = row.get(index) {
                 super::cell_inspector::open(
                     self.services.clone(),
@@ -2418,7 +2491,7 @@ impl Document {
                         )
                     }),
             )
-            .when(*section == Section::Data, |view| view.child(self.sort_controls(cx)))
+            .when(*section == Section::Data, |view| view.child(self.sort_controls(cx)).child(self.column_controls(cx)))
             .when(*section == Section::Data && *filter_open, |view| {
                 let view = view.child(self.filter_tree(cx));
                 let column_picker = choice(

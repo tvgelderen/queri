@@ -281,6 +281,9 @@ async fn row_inspector_inserts_edits_and_deletes_real_rows(cx: &mut TestAppConte
     })
     .await;
     cx.update_window(window, |_, window, cx| {
+        window.click("view-columns", cx);
+        window.click("column-earlier-1", cx);
+        window.click("column-visible-1", cx);
         let grid = doc.read(cx).grid.clone();
         grid.update(cx, |grid, cx| grid.set_selected_row(1, cx));
         window.render_frame(cx);
@@ -1844,4 +1847,122 @@ async fn grouped_filter_draft_apply_and_sort_precedence(cx: &mut TestAppContext)
         );
         assert!(doc.read(cx).error.is_empty());
     });
+}
+
+#[gpui_kit::test]
+async fn table_layout_maps_copy_export_search_and_restores_settings(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(true, cx);
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("view-columns", cx);
+        window.click("column-earlier-1", cx);
+        window.click("column-visible-1", cx);
+        doc.update(cx, |doc, cx| {
+            let grid = doc.grid.read(cx).delegate();
+            assert_eq!(grid.display_columns, vec![1]);
+            assert_eq!(
+                grid.data.rows[0].len(),
+                2,
+                "original row retained for mutation/conflict checking"
+            );
+            let displayed = grid.displayed_data();
+            assert_eq!(displayed.columns, ["name"]);
+            assert_eq!(displayed.rows[0], [Cell::Text("Alpha".into())]);
+            let mut output = Vec::new();
+            crate::export::serialize(
+                &displayed,
+                &crate::export::Selection::all(&displayed),
+                crate::export::Format::Tsv,
+                true,
+                "\\N",
+                &mut output,
+            )
+            .unwrap();
+            assert_eq!(String::from_utf8(output).unwrap(), "name\nAlpha\n");
+            doc.grid
+                .update(cx, |grid, cx| grid.set_selected_cell(0, 1, cx));
+            assert_eq!(doc.cell_selection(cx).unwrap().columns, [1]);
+            doc.copy_cells(crate::export::Format::Tsv, false, cx);
+            assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "Alpha");
+            let settings = doc.draft(cx).table_view.unwrap();
+            doc.restore_table_view(Some(settings.clone()));
+            assert_eq!(doc.table_view_settings().unwrap(), settings);
+            doc.grid_search
+                .update(cx, |search, cx| search.open(window, cx));
+        });
+        window.input("1", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        doc.read(cx).grid_search.read(cx).status() == "0/0 cells"
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("grid-search-hidden", cx)
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        doc.read(cx)
+            .grid_search
+            .read(cx)
+            .status()
+            .contains("hidden: id")
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("column-visible-1", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        doc.read(cx).grid_search.read(cx).status() == "1/1 cells"
+    })
+    .await;
+}
+
+#[gpui_kit::test]
+async fn restored_missing_predicate_remains_repairable_without_unfiltered_rows(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(true, cx);
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| {
+            doc.restore_table_view(Some(TableViewSettings {
+                filter: Some(
+                    TableFilter {
+                        column: "removed".into(),
+                        predicate: FilterPredicate::IsNull,
+                    }
+                    .into(),
+                ),
+                sort: vec![],
+                columns: vec![],
+                page_size: 50,
+            }));
+            if let DocumentKind::Table { page, .. } = &mut doc.kind {
+                *page = None;
+            }
+            doc.refresh(window, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        assert!(doc.read(cx).error.contains("filter column"));
+        assert!(doc.read(cx).grid.read(cx).delegate().data.rows.is_empty());
+        window.click("toggle-filter", cx);
+        window.click("filter-node-[]-remove", cx);
+        window.click("clear-filter", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update(|cx| assert_eq!(doc.read(cx).grid.read(cx).delegate().data.rows.len(), 1));
 }
