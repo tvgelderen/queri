@@ -894,6 +894,7 @@ async fn missing_passwords_prompt_before_connecting_and_on_document_retry(cx: &m
                         Preferences {
                             active_connection: Some(profile.id),
                             drafts: vec![Draft {
+                                parameters: vec![],
                                 saved_table_view: None,
                                 table_view: None,
                                 statement_timeout: StatementTimeout::Inherit,
@@ -1460,6 +1461,7 @@ async fn saved_library_sql_files_and_related_tabs_keep_work_separate(cx: &mut Te
     store.save_profile(&profile).unwrap();
     let query = store
         .save_query(&SavedQuery {
+            parameters: vec![],
             id: Uuid::new_v4(),
             name: "Never execute on open".into(),
             sql: "CREATE TABLE never_run(id INTEGER);".into(),
@@ -1648,6 +1650,7 @@ async fn workspace_search_live_drafts_selects_text_offline_and_drops_closed_tabs
     };
     let drafts = (1..=2)
         .map(|number| Draft {
+            parameters: vec![],
             saved_table_view: None,
             table_view: None,
             statement_timeout: StatementTimeout::custom(number * 1000).unwrap(),

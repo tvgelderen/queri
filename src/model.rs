@@ -545,6 +545,8 @@ impl StatementTimeout {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Draft {
     #[serde(default)]
+    pub parameters: Vec<crate::parameters::Definition>,
+    #[serde(default)]
     pub saved_table_view: Option<SavedTableView>,
     #[serde(default)]
     pub table_view: Option<TableViewSettings>,
@@ -618,6 +620,8 @@ pub fn parse_field(
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedQuery {
+    #[serde(default)]
+    pub parameters: Vec<crate::parameters::Definition>,
     pub id: Uuid,
     pub name: String,
     pub sql: String,

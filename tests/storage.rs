@@ -167,6 +167,7 @@ fn version_one_migration_preserves_settings_drafts_and_history() -> Result<()> {
     let preferences = Preferences {
         active_connection: Some(profile.id),
         drafts: vec![Draft {
+            parameters: vec![],
             saved_table_view: None,
             table_view: None,
             statement_timeout: StatementTimeout::Inherit,
@@ -203,7 +204,7 @@ fn version_one_migration_preserves_settings_drafts_and_history() -> Result<()> {
     let store = Store::open(&path)?;
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-        4
+        5
     );
     assert_eq!(
         serde_json::to_value(&store.profiles()?[0])?,
@@ -405,6 +406,7 @@ fn saved_queries_survive_connection_removal_and_database_rename() -> Result<()> 
     let profile = profile();
     store.save_profile(&profile)?;
     let saved = store.save_query(&SavedQuery {
+        parameters: vec![],
         id: Uuid::new_v4(),
         name: "Find user".into(),
         sql: "SELECT 1".into(),
@@ -539,6 +541,7 @@ fn named_table_views_migrate_conflict_restart_and_retain_orphans() -> Result<()>
     let store = Store::open(&path)?;
     store.save_profile(&profile)?;
     let query = store.save_query(&SavedQuery {
+        parameters: vec![],
         id: Uuid::new_v4(),
         name: "Existing query".into(),
         sql: "SELECT 1".into(),
@@ -549,7 +552,7 @@ fn named_table_views_migrate_conflict_restart_and_retain_orphans() -> Result<()>
     })?;
     drop(store);
     let conn = Connection::open(&path)?;
-    conn.execute_batch("DROP TABLE saved_table_views; PRAGMA user_version=3;")?;
+    conn.execute_batch("DROP TABLE saved_table_views; ALTER TABLE saved_queries DROP COLUMN parameters; PRAGMA user_version=3;")?;
     drop(conn);
     let store = Store::open(&path)?;
     assert_eq!(store.saved_queries("", None)?[0].sql, query.sql);
@@ -626,5 +629,65 @@ fn named_table_views_migrate_conflict_restart_and_retain_orphans() -> Result<()>
         "stale editors cannot reassign orphans"
     );
     assert_eq!(store.saved_queries("", None)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn parameter_definitions_migrate_and_round_trip_without_values() -> Result<()> {
+    use queri::parameters::{Definition, ParameterType};
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("store.db");
+    let store = Store::open(&path)?;
+    let mut query = store.save_query(&SavedQuery {
+        parameters: vec![],
+        id: Uuid::new_v4(),
+        name: "Parameters".into(),
+        sql: "SELECT :name, :count".into(),
+        favorite: false,
+        connection_id: None,
+        database: "main".into(),
+        revision: 0,
+    })?;
+    drop(store);
+    let conn = Connection::open(&path)?;
+    conn.execute_batch("ALTER TABLE saved_queries DROP COLUMN parameters; PRAGMA user_version=4;")?;
+    let store = Store::open(&path)?;
+    assert!(store.saved_queries("", None)?[0].parameters.is_empty());
+    query.parameters = vec![
+        Definition {
+            name: "name".into(),
+            kind: ParameterType::Text,
+        },
+        Definition {
+            name: "count".into(),
+            kind: ParameterType::Integer,
+        },
+    ];
+    let saved = store.save_query(&query)?;
+    assert!(store.save_query(&query).is_err());
+    drop(store);
+    let store = Store::open(&path)?;
+    assert_eq!(
+        store.saved_queries("", None)?[0].parameters,
+        saved.parameters
+    );
+    let json: String =
+        conn.query_row("SELECT parameters FROM saved_queries", [], |row| row.get(0))?;
+    assert!(!json.contains("value"));
+    let parameters =
+        queri::parameters::discover("SELECT :count, :new", queri::sql::SqlDialect::Sqlite)?;
+    assert_eq!(
+        parameters.definitions(&saved.parameters),
+        vec![
+            Definition {
+                name: "count".into(),
+                kind: ParameterType::Integer
+            },
+            Definition {
+                name: "new".into(),
+                kind: ParameterType::Text
+            }
+        ]
+    );
     Ok(())
 }

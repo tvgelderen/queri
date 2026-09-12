@@ -39,7 +39,7 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         ensure!(
-            version <= 4,
+            version <= 5,
             "This application database was created by a newer Queri version."
         );
         if version == 0 {
@@ -87,6 +87,9 @@ impl Store {
             ); PRAGMA user_version=4;",
             )?;
         }
+        if version < 5 {
+            tx.execute_batch("ALTER TABLE saved_queries ADD COLUMN parameters TEXT NOT NULL DEFAULT '[]'; PRAGMA user_version=5;")?;
+        }
         tx.commit()?;
         Ok(store)
     }
@@ -102,7 +105,7 @@ impl Store {
     pub fn saved_queries(&self, search: &str, connection: Option<Uuid>) -> Result<Vec<SavedQuery>> {
         let conn = self.connection()?;
         let mut stmt = conn.prepare(
-            "SELECT id,name,sql,favorite,connection_id,database_name,revision
+            "SELECT id,name,sql,favorite,connection_id,database_name,revision,parameters
             FROM saved_queries WHERE (?2 IS NULL OR connection_id=?2)
             AND (instr(lower(name),lower(?1))>0 OR instr(lower(sql),lower(?1))>0)
             ORDER BY favorite DESC, name COLLATE NOCASE, id",
@@ -118,12 +121,14 @@ impl Store {
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
             },
         )?;
         rows.map(|row| {
-            let (id, name, sql, favorite, connection, database, revision) = row?;
+            let (id, name, sql, favorite, connection, database, revision, parameters) = row?;
             Ok(SavedQuery {
+                parameters: serde_json::from_str(&parameters)?,
                 id: id.parse()?,
                 name,
                 sql,
@@ -142,21 +147,22 @@ impl Store {
         let conn = self.connection()?;
         if query.revision == 0 {
             conn.execute(
-                "INSERT INTO saved_queries(id,name,sql,favorite,connection_id,database_name)
-                VALUES(?1,?2,?3,?4,?5,?6)",
+                "INSERT INTO saved_queries(id,name,sql,favorite,connection_id,database_name,parameters)
+                VALUES(?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     query.id.to_string(),
                     query.name.trim(),
                     query.sql,
                     query.favorite,
                     query.connection_id.map(|id| id.to_string()),
-                    query.database
+                    query.database,
+                    serde_json::to_string(&query.parameters)?
                 ],
             )?;
         } else {
             let changed = conn.execute(
                 "UPDATE saved_queries SET name=?2,sql=?3,favorite=?4,
-                connection_id=?5,database_name=?6,revision=revision+1,updated_at=CURRENT_TIMESTAMP
+                connection_id=?5,database_name=?6,parameters=?8,revision=revision+1,updated_at=CURRENT_TIMESTAMP
                 WHERE id=?1 AND revision=?7",
                 params![
                     query.id.to_string(),
@@ -165,7 +171,8 @@ impl Store {
                     query.favorite,
                     query.connection_id.map(|id| id.to_string()),
                     query.database,
-                    query.revision
+                    query.revision,
+                    serde_json::to_string(&query.parameters)?
                 ],
             )?;
             ensure!(
@@ -525,6 +532,7 @@ mod saved_query_tests {
         let path = dir.path().join("app");
         let store = Store::open(&path).unwrap();
         let query = SavedQuery {
+            parameters: vec![],
             id: Uuid::new_v4(),
             name: " Test ".into(),
             sql: "SELECT 1".into(),

@@ -406,6 +406,7 @@ impl Render for History {
                                                             .on_click(cx.listener(move |this,_,window,cx| {
                                                                 if let Some(entry)=this.entries.iter().find(|e|e.id==id) {
                                                                     super::saved_queries::edit(this.services.clone(),crate::model::SavedQuery {
+            parameters: vec![],
                                                                         id: uuid::Uuid::new_v4(), name: String::new(), sql: entry.sql.clone(),
                                                                         favorite:false,connection_id:Some(entry.connection_id),database:entry.database.clone(),revision:0,
                                                                     },window,cx);

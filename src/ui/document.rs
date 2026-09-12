@@ -27,6 +27,8 @@ use std::{sync::Arc, time::Instant};
 
 #[path = "named_table_views.rs"]
 mod named_table_views;
+#[path = "parameters.rs"]
+mod parameters;
 #[path = "table_views.rs"]
 mod table_views;
 #[cfg(all(test, feature = "test-support"))]
@@ -148,6 +150,8 @@ pub struct Document {
     pub saved_query: Option<SavedQuery>,
     pub statement_timeout: StatementTimeout,
     timeout_input: Entity<InputState>,
+    parameter_definitions: Vec<crate::parameters::Definition>,
+    pub(super) parameter_seed: Option<crate::parameters::BoundQuery>,
     formatting: bool,
     completion: std::rc::Rc<super::completion::SqlCompletion>,
     subscriptions: Vec<Subscription>,
@@ -262,8 +266,10 @@ impl Document {
         ];
         if let DocumentKind::Sql { editor } = &kind {
             subscriptions.push(cx.observe(editor, |_, _, cx| cx.notify()));
-            subscriptions.push(cx.subscribe(editor, |_, _, event: &InputEvent, cx| {
+            subscriptions.push(cx.subscribe(editor, |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
+                    this.parameter_seed = None;
+                    this.parameter_definitions = this.parameter_definitions(cx);
                     cx.emit(DocumentChanged);
                 }
             }));
@@ -305,6 +311,8 @@ impl Document {
             saved_query: None,
             statement_timeout: StatementTimeout::Inherit,
             timeout_input: cx.new(|cx| InputState::new(window, cx).placeholder("Milliseconds")),
+            parameter_definitions: vec![],
+            parameter_seed: None,
             formatting: false,
             completion,
             subscriptions,
@@ -348,6 +356,7 @@ impl Document {
     }
     pub fn draft(&self, cx: &App) -> Draft {
         Draft {
+            parameters: self.parameter_definitions(cx),
             saved_table_view: match &self.kind {
                 DocumentKind::Table { saved_view, .. } => saved_view.as_deref().cloned(),
                 _ => None,
@@ -381,6 +390,7 @@ impl Document {
     ) {
         self.profile = profile.for_database(&self.profile.database());
         self.password = Some(password);
+        self.parameter_seed = None;
         self.session_generation += 1;
         self.operation = Operation::Idle;
         self.cancel_pending = false;
@@ -394,6 +404,7 @@ impl Document {
         self.database_available = true;
     }
     pub fn disconnect(&mut self, cx: &mut Context<Self>) {
+        self.parameter_seed = None;
         self.session_generation += 1;
         self.operation = Operation::Idle;
         self.cancel_pending = false;
@@ -440,6 +451,7 @@ impl Document {
         self.error.clear();
         self.status = "Connecting…".into();
         let profile = self.profile.clone();
+        self.parameter_seed = None;
         self.session_generation += 1;
         let generation = self.session_generation;
         task(
@@ -786,14 +798,23 @@ impl Document {
     }
 
     fn execute(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.submit_sql(sql, None, window, cx);
+        match crate::parameters::discover(&sql, self.parameter_dialect()) {
+            Ok(parameters) if !parameters.names.is_empty() => {
+                self.enter_parameters(sql, parameters, window, cx)
+            }
+            Ok(_) => self.submit_sql(sql, None, window, cx),
+            Err(error) => {
+                self.error = format!("{error:#}");
+                cx.notify();
+            }
+        }
     }
 
     // The parameter-entry UI must use this same submission boundary.
     fn submit_sql(
         &mut self,
         sql: String,
-        params: Option<Vec<Option<String>>>,
+        params: Option<Vec<Cell>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -804,6 +825,7 @@ impl Document {
         if self.profile.policy == ExecutionPolicy::ConfirmExecutions || destructive {
             let view = cx.entity();
             let generation = self.session_generation;
+            let editor_sql = self.sql_editor().map(|e| e.read(cx).value().to_string());
             let context = self.profile.context();
             let preview: String = sql.chars().take(2000).collect();
             let preview = if preview.len() < sql.len() {
@@ -818,6 +840,7 @@ impl Document {
                 let sql = sql.clone();
                 let params = params.clone();
                 let view = view.clone();
+                let editor_sql = editor_sql.clone();
                 dialog
                     .title(if destructive {
                         "Run destructive SQL?"
@@ -840,7 +863,10 @@ impl Document {
                     )
                     .on_ok(move |_, window, cx| {
                         view.update(cx, |this, cx| {
-                            if this.session_generation == generation {
+                            if this.session_generation == generation
+                                && this.sql_editor().map(|e| e.read(cx).value().to_string())
+                                    == editor_sql
+                            {
                                 this.execute_confirmed(sql.clone(), params.clone(), window, cx);
                             }
                         });
@@ -855,7 +881,7 @@ impl Document {
     fn execute_confirmed(
         &mut self,
         sql: String,
-        params: Option<Vec<Option<String>>>,
+        params: Option<Vec<Cell>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -883,9 +909,17 @@ impl Document {
             cx,
             async move {
                 let start = Instant::now();
+                let parameterized = params.is_some();
                 let result = match session.set_statement_timeout(timeout) {
                     Ok(()) => match params {
-                        Some(params) => session.query_postgres_params(sql.clone(), params).await,
+                        Some(values) => {
+                            session
+                                .query_params(crate::parameters::BoundQuery {
+                                    sql: sql.clone(),
+                                    values,
+                                })
+                                .await
+                        }
                         None => session.query(sql.clone()).await,
                     },
                     Err(error) => Err(error),
@@ -905,7 +939,7 @@ impl Document {
                         .as_ref()
                         .map(|output| output.sets.iter().map(|set| set.affected).sum())
                         .unwrap_or(0),
-                    error: result.as_ref().err().map(|error| format!("{error:#}")),
+                    error: result.as_ref().err().map(|error| if parameterized { if crate::database::is_statement_timeout(error) { "Statement timed out".into() } else { "Parameterized query failed. Details were displayed only in the live tab.".into() } } else { format!("{error:#}") }),
                 };
                 let history_error = tokio::task::spawn_blocking(move || store.record(&entry))
                     .await?
@@ -1954,6 +1988,7 @@ impl Document {
             .clone()
             .filter(|_| !new)
             .unwrap_or_else(|| SavedQuery {
+                parameters: vec![],
                 id: uuid::Uuid::new_v4(),
                 name: String::new(),
                 sql: String::new(),
@@ -1962,6 +1997,7 @@ impl Document {
                 database: self.profile.database(),
                 revision: 0,
             });
+        query.parameters = self.parameter_definitions(cx);
         query.sql = sql;
         query.connection_id = Some(self.profile.id);
         query.database = self.profile.database();

@@ -272,6 +272,7 @@ impl Workspace {
                         doc.restore_table_view(draft.table_view);
                         doc.restore_saved_table_view(draft.saved_table_view);
                         doc.set_relationship(draft.relationship);
+                        doc.set_parameter_definitions(draft.parameters);
                         doc.saved_query = draft.saved_query;
                         doc.statement_timeout = draft.statement_timeout;
                         doc.editor_height = draft.editor_height.clamp(100., 1200.);

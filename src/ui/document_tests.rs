@@ -1715,7 +1715,7 @@ async fn postgres_safeguards_parameter_submission_and_read_only_ui(cx: &mut Test
         doc.update(cx, |doc, cx| {
             doc.submit_sql(
                 "SELECT $1::text".into(),
-                Some(vec![Some("confirmed parameter".into())]),
+                Some(vec![Cell::Text("confirmed parameter".into())]),
                 window,
                 cx,
             )
@@ -1725,7 +1725,7 @@ async fn postgres_safeguards_parameter_submission_and_read_only_ui(cx: &mut Test
         doc.update(cx, |doc, cx| {
             doc.submit_sql(
                 "SELECT $1::text".into(),
-                Some(vec![Some("confirmed parameter".into())]),
+                Some(vec![Cell::Text("confirmed parameter".into())]),
                 window,
                 cx,
             )
@@ -1741,6 +1741,38 @@ async fn postgres_safeguards_parameter_submission_and_read_only_ui(cx: &mut Test
             Cell::Text("confirmed parameter".into())
         )
     });
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| {
+            doc.submit_sql(
+                "SELECT :private::integer".into(),
+                Some(vec![Cell::Text("sensitive-invalid-number".into())]),
+                window,
+                cx,
+            )
+        });
+        window.click("ok", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update(|cx| assert!(doc.read(cx).error.contains("sensitive-invalid-number")));
+    let history = fixture
+        .services
+        .store
+        .history(fixture.profile.id, "", 0)
+        .unwrap();
+    assert!(
+        !serde_json::to_string(&history)
+            .unwrap()
+            .contains("sensitive-invalid-number")
+    );
+    assert!(
+        history[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Parameterized query failed")
+    );
     fixture.profile.policy = ExecutionPolicy::ReadOnlyByDefault;
     let session = fixture
         .services
@@ -2571,6 +2603,91 @@ async fn sql_completion_open_popup_preserves_run_and_search_shortcuts(cx: &mut T
         window.input("items", cx);
         window.press("escape", cx);
         assert!(editor.read(cx).focus_handle(cx).is_focused(window));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+async fn parameter_form_keyboard_validation_cancel_and_privacy(cx: &mut TestAppContext) {
+    use crate::ui::test_support::click_label;
+    cx.executor().allow_parking();
+    let mut fixture = Fixture::new();
+    fixture.profile.policy = ExecutionPolicy::ConfirmExecutions;
+    let (window, doc) = fixture.open(false, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.input("SELECT :secret, :secret, :empty, :nothing", cx);
+        window.press("ctrl-enter", cx);
+        window.click("cancel", cx);
+        assert!(doc.read(cx).results.is_empty());
+        doc.update(cx, |doc, cx| doc.focus(window, cx));
+        window.press("ctrl-enter", cx);
+        window.click("parameter-value-0", cx);
+        window.input("private 雪'; DELETE FROM items; --", cx);
+        window.click(("parameter-type", 0usize), cx);
+        click_label(window, "Integer", cx);
+    })
+    .unwrap();
+    cx.executor().run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.click("ok", cx);
+        assert!(
+            window
+                .find("parameter-error")
+                .label()
+                .unwrap()
+                .contains("integer")
+        );
+        window.click(("parameter-type", 0usize), cx);
+        click_label(window, "Text", cx);
+    })
+    .unwrap();
+    cx.executor().run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.click(("parameter-null", 2usize), cx);
+        window.click("ok", cx);
+        assert!(doc.read(cx).results.is_empty());
+        assert_eq!(window.find("ok").label(), Some("Run SQL"));
+        window.click("ok", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update(|cx| {
+        assert_eq!(
+            doc.read(cx).results[0].rows[0],
+            vec![
+                Cell::Text("private 雪'; DELETE FROM items; --".into()),
+                Cell::Text("private 雪'; DELETE FROM items; --".into()),
+                Cell::Text("".into()),
+                Cell::Null
+            ]
+        );
+        let draft = serde_json::to_string(&doc.read(cx).draft(cx)).unwrap();
+        assert!(!draft.contains("private"));
+        assert_eq!(doc.read(cx).draft(cx).parameters.len(), 3);
+    });
+    let history = fixture
+        .services
+        .store
+        .history(fixture.profile.id, "", 0)
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].sql, "SELECT :secret, :secret, :empty, :nothing");
+    assert!(!serde_json::to_string(&history).unwrap().contains("private"));
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| doc.focus(window, cx));
+        window.press("ctrl-enter", cx);
+        window.click("ok", cx);
+        // Editing while a confirmation is open invalidates its captured submission.
+        doc.update(cx, |doc, cx| {
+            doc.sql_editor()
+                .unwrap()
+                .update(cx, |editor, cx| editor.set_value("SELECT 99", window, cx))
+        });
+        window.click("ok", cx);
+        assert!(!doc.read(cx).busy());
+        assert_eq!(doc.read(cx).results[0].rows[0][3], Cell::Null);
     })
     .unwrap();
 }
