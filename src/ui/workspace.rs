@@ -1116,7 +1116,7 @@ impl Workspace {
                 for doc in &this.documents {
                     if doc.read(cx).profile.id == saved.profile.id {
                         doc.update(cx, |doc, cx| {
-                            doc.reconfigure(&saved.profile, saved.password.clone());
+                            doc.reconfigure(&saved.profile, saved.password.clone(), cx);
                             cx.notify();
                         });
                     }

@@ -149,12 +149,18 @@ pub struct Document {
     pub statement_timeout: StatementTimeout,
     timeout_input: Entity<InputState>,
     formatting: bool,
+    completion: std::rc::Rc<super::completion::SqlCompletion>,
     subscriptions: Vec<Subscription>,
 }
 
 impl Document {
     pub fn init(cx: &mut App) {
         cx.bind_keys([
+            KeyBinding::new(
+                "ctrl-space",
+                gpui_kit::component::input::ShowCompletions,
+                Some("QueriDocument > Input && mode == editor"),
+            ),
             KeyBinding::new("ctrl-f", FindGrid, Some("QueriDocument")),
             KeyBinding::new("ctrl-f", FindGrid, Some("QueriDocument > DataTable")),
             KeyBinding::new("ctrl-shift-f", FormatSql, Some("QueriDocument")),
@@ -178,6 +184,9 @@ impl Document {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let completion = std::rc::Rc::new(super::completion::SqlCompletion::new(
+            services.runtime.clone(),
+        ));
         let kind = match table {
             Some(table) => DocumentKind::Table {
                 table,
@@ -201,11 +210,13 @@ impl Document {
             },
             None => DocumentKind::Sql {
                 editor: cx.new(|cx| {
-                    EditorState::new(window, cx)
+                    let mut editor = EditorState::new(window, cx)
                         .language("sql")
                         .searchable(true)
                         .default_value(sql)
-                        .placeholder("Write SQL, then press Ctrl+Enter")
+                        .placeholder("Write SQL, then press Ctrl+Enter");
+                    editor.lsp_mut().completion_provider = Some(completion.clone());
+                    editor
                 }),
             },
         };
@@ -295,6 +306,7 @@ impl Document {
             statement_timeout: StatementTimeout::Inherit,
             timeout_input: cx.new(|cx| InputState::new(window, cx).placeholder("Milliseconds")),
             formatting: false,
+            completion,
             subscriptions,
         }
     }
@@ -361,13 +373,22 @@ impl Document {
     pub fn set_password(&mut self, password: String) {
         self.password = Some(password);
     }
-    pub fn reconfigure(&mut self, profile: &ConnectionProfile, password: String) {
+    pub fn reconfigure(
+        &mut self,
+        profile: &ConnectionProfile,
+        password: String,
+        cx: &mut Context<Self>,
+    ) {
         self.profile = profile.for_database(&self.profile.database());
         self.password = Some(password);
         self.session_generation += 1;
         self.operation = Operation::Idle;
         self.cancel_pending = false;
         self.session = None;
+        self.completion.set_session(None);
+        if let Some(editor) = self.sql_editor() {
+            editor.update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
+        }
         self.transaction = TransactionStatus::Unknown;
         self.transaction_started = None;
         self.database_available = true;
@@ -377,6 +398,10 @@ impl Document {
         self.operation = Operation::Idle;
         self.cancel_pending = false;
         self.session = None;
+        self.completion.set_session(None);
+        if let Some(editor) = self.sql_editor() {
+            editor.update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
+        }
         self.transaction = TransactionStatus::Unknown;
         self.transaction_started = None;
         self.status = "Disconnected".into();
@@ -439,6 +464,7 @@ impl Document {
                         if let Err(error) = session.set_statement_timeout(this.statement_timeout) {
                             this.error = error.to_string();
                         }
+                        this.completion.set_session(Some(session.clone()));
                         this.session = Some(session);
                         this.observe_transaction(state, cx);
                         this.status = "Connected · ready".into();
@@ -467,6 +493,28 @@ impl Document {
             self.connect(window, cx);
             return;
         };
+        if matches!(self.kind, DocumentKind::Sql { .. }) {
+            if let Some(editor) = self.sql_editor() {
+                editor.update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
+            }
+            session.invalidate_completions();
+            let generation = self.session_generation;
+            task(
+                &self.services,
+                window,
+                cx,
+                async move { Ok(session.completion_catalog(vec![]).await) },
+                move |this, result, _, cx| {
+                    if this.session_generation == generation {
+                        if let Ok(catalog) = result {
+                            *this.completion.status.borrow_mut() = catalog.status;
+                        }
+                        cx.notify();
+                    }
+                },
+            );
+            return;
+        }
         let DocumentKind::Table {
             table,
             options,
@@ -823,6 +871,9 @@ impl Document {
         let profile = self.profile.clone();
         let generation = self.session_generation;
         let timeout = self.statement_timeout;
+        if let Some(editor) = self.sql_editor() {
+            editor.update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
+        }
         self.operation = Operation::Running;
         self.status = "Executing…".into();
         self.error.clear();
@@ -2049,6 +2100,18 @@ impl Document {
                     .on_click(cx.listener(|this, _, window, cx| this.format_sql(window, cx))),
             )
             .child(
+                icon_button(
+                    "refresh-completions",
+                    IconName::RefreshCw,
+                    format!(
+                        "Refresh completions · F5\n{}",
+                        self.completion.status.borrow()
+                    ),
+                )
+                .disabled(self.busy())
+                .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
+            )
+            .child(
                 Button::new("save-query")
                     .ghost()
                     .small()
@@ -2066,7 +2129,13 @@ impl Document {
                     let view = cx.entity();
                     move |menu, _, cx| {
                         view.update(cx, |_, cx| {
-                            menu.item(menu_item("Save as new query…", IconName::Plus).on_click(
+                            menu.item(
+                                menu_item("Refresh completions · F5", IconName::RefreshCw)
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.refresh(window, cx)),
+                                    ),
+                            )
+                            .item(menu_item("Save as new query…", IconName::Plus).on_click(
                                 cx.listener(|this, _, window, cx| {
                                     this.save_query(true, window, cx)
                                 }),

@@ -1,5 +1,6 @@
 mod admin;
 mod cell_inspector;
+mod completion;
 mod connection_form;
 mod connection_picker;
 mod controls;

@@ -5502,6 +5502,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "gpui-kit",
+ "lsp-types",
  "native-tls",
  "postgres-native-tls",
  "rusqlite",

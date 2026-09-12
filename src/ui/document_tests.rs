@@ -2333,3 +2333,244 @@ async fn missing_layout_column_requires_explicit_repair(cx: &mut TestAppContext)
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+async fn sql_completion_manual_typing_accept_undo_and_refresh(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(false, cx);
+    let editor = cx.update(|cx| doc.read(cx).sql_editor().unwrap());
+    cx.update_window(window, |_, window, cx| {
+        doc.read(cx)
+            .completion
+            .set_session(Some(fixture.session.clone()));
+        editor.update(cx, |e, cx| {
+            e.set_value("SELECT * FROM it", window, cx);
+            e.set_selected_range(e.value().len()..e.value().len(), cx);
+            e.focus(window, cx);
+        });
+        window.render_frame(cx);
+        window.press("ctrl-space", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        editor.read(cx).completion_menu_state().open
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        editor.read(cx).value() == "SELECT * FROM \"items\""
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        assert!(editor.read(cx).focus_handle(cx).is_focused(window));
+        window.press("ctrl-z", cx);
+        assert_eq!(editor.read(cx).value().to_string(), "SELECT * FROM it");
+        editor.update(cx, |e, cx| {
+            e.set_value("SELECT * FROM items u WHERE u", window, cx);
+            e.set_selected_range(e.value().len()..e.value().len(), cx)
+        });
+        window.input(".", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        editor.read(cx).completion_menu_state().open
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        assert!(
+            editor
+                .read(cx)
+                .completion_menu_state()
+                .items
+                .iter()
+                .any(|i| i.label == "name")
+        );
+        window.press("escape", cx);
+        editor.update(cx, |e, cx| {
+            e.set_value("SELECT * FROM items u WHERE u.na", window, cx);
+            e.set_selected_range(e.value().len()..e.value().len(), cx)
+        });
+        window.input("m", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        editor.read(cx).completion_menu_state().open
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        editor.read(cx).value().to_string().ends_with("u.\"name\"")
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.press("ctrl-z", cx);
+        assert!(editor.read(cx).value().to_string().ends_with("u.nam"));
+        window.press("f5", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        doc.read(cx).completion.status.borrow().contains("ready")
+    })
+    .await;
+}
+
+#[gpui_kit::test]
+async fn sql_completion_discards_stale_editor_focus_and_session(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(false, cx);
+    let editor = cx.update(|cx| doc.read(cx).sql_editor().unwrap());
+    cx.update_window(window, |_, window, cx| {
+        doc.read(cx)
+            .completion
+            .set_session(Some(fixture.session.clone()));
+        editor.update(cx, |e, cx| {
+            e.set_value("SELECT * FROM it", window, cx);
+            e.set_selected_range(e.value().len()..e.value().len(), cx);
+            e.focus(window, cx);
+        });
+        window.render_frame(cx);
+        window.press("ctrl-space", cx);
+        editor.update(cx, |e, cx| e.set_value("-- no suggestions", window, cx));
+    })
+    .unwrap();
+    cx.executor().timer(Duration::from_millis(250)).await;
+    cx.update_window(window, |_, window, cx| {
+        assert!(!editor.read(cx).completion_menu_state().open);
+        editor.update(cx, |e, cx| e.set_value("SELECT * FROM it", window, cx));
+        window.press("ctrl-space", cx);
+        doc.update(cx, |d, cx| d.disconnect(cx));
+    })
+    .unwrap();
+    cx.executor().timer(Duration::from_millis(250)).await;
+    cx.update_window(window, |_, window, cx| {
+        assert!(!editor.read(cx).completion_menu_state().open);
+        doc.read(cx)
+            .completion
+            .set_session(Some(fixture.session.clone()));
+        window.press("ctrl-space", cx);
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+    })
+    .unwrap();
+    cx.executor().timer(Duration::from_millis(250)).await;
+    cx.update(|cx| assert!(!editor.read(cx).completion_menu_state().open));
+}
+
+#[gpui_kit::test]
+async fn sql_completion_quoted_replacement_unicode_and_literals(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    fixture.services.runtime.block_on(fixture.session.query("ALTER TABLE items ADD COLUMN \"Mixed name\" TEXT; ALTER TABLE items ADD COLUMN \"日本語\" TEXT;".into())).unwrap();
+    let (window, doc) = fixture.open(false, cx);
+    let editor = cx.update(|cx| doc.read(cx).sql_editor().unwrap());
+    let original = "SELECT '😀', u.\"Mixed no\" FROM items u";
+    cx.update_window(window, |_, window, cx| {
+        doc.read(cx)
+            .completion
+            .set_session(Some(fixture.session.clone()));
+        editor.update(cx, |e, cx| {
+            e.set_value(original, window, cx);
+            let cursor = original.find("Mixed").unwrap() + 2;
+            e.set_selected_range(cursor..cursor, cx);
+            e.focus(window, cx);
+        });
+        window.render_frame(cx);
+        window.press("ctrl-space", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        editor.read(cx).completion_menu_state().open
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        editor.read(cx).value() == "SELECT '😀', u.\"Mixed name\" FROM items u"
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.press("ctrl-z", cx);
+        assert_eq!(editor.read(cx).value(), original);
+    })
+    .unwrap();
+    for sql in [
+        "SELECT 'unfinished",
+        "-- comment",
+        "SELECT /* comment",
+        "DO $body$ code",
+    ] {
+        cx.update_window(window, |_, window, cx| {
+            editor.update(cx, |e, cx| {
+                e.set_value(sql, window, cx);
+                e.set_selected_range(sql.len()..sql.len(), cx);
+            });
+            window.press("ctrl-space", cx);
+        })
+        .unwrap();
+        cx.executor().timer(Duration::from_millis(150)).await;
+        cx.update(|cx| assert!(!editor.read(cx).completion_menu_state().open));
+    }
+}
+
+#[gpui_kit::test]
+async fn sql_completion_open_popup_preserves_run_and_search_shortcuts(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(false, cx);
+    let editor = cx.update(|cx| doc.read(cx).sql_editor().unwrap());
+    cx.update_window(window, |_, window, cx| {
+        doc.read(cx)
+            .completion
+            .set_session(Some(fixture.session.clone()));
+        editor.update(cx, |e, cx| {
+            e.set_value("SELECT * FROM items", window, cx);
+            e.set_selected_range(19..19, cx);
+            e.focus(window, cx);
+        });
+        window.render_frame(cx);
+        window.press("ctrl-space", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        editor.read(cx).completion_menu_state().open
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| window.press("ctrl-enter", cx))
+        .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        !doc.read(cx).results.is_empty()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(editor.read(cx).value(), "SELECT * FROM items");
+        assert!(!editor.read(cx).completion_menu_state().open);
+        window.press("ctrl-space", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        editor.read(cx).completion_menu_state().open
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.press("ctrl-f", cx);
+        window.render_frame(cx);
+        assert!(editor.read(cx).search_session().open);
+        window.input("items", cx);
+        window.press("escape", cx);
+        assert!(editor.read(cx).focus_handle(cx).is_focused(window));
+    })
+    .unwrap();
+}

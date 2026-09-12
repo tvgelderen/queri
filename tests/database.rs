@@ -1564,3 +1564,134 @@ fn postgres_grouped_views() -> Result<()> {
         result
     })
 }
+
+#[test]
+fn sqlite_completion_catalog_session_scopes_and_transactions() -> Result<()> {
+    runtime()?.block_on(async {
+        let session=fixture().await?;
+        session.query("CREATE TABLE \"Mixed table\"(\"select\" TEXT, \"日本語\" INTEGER); CREATE TEMP TABLE items(temp_value TEXT); ATTACH ':memory:' AS other; CREATE TABLE other.attached(value BLOB);".into()).await?;
+        let names=session.completion_catalog(vec![]).await;
+        assert!(names.relations.iter().all(|r|r.columns.is_none()));
+        assert!(names.relations.iter().any(|r|r.schema=="temp" && r.name=="items" && r.visible));
+        assert!(names.relations.iter().any(|r|r.schema=="main" && r.name=="items" && !r.visible));
+        assert!(names.relations.iter().any(|r|r.schema=="other" && r.name=="attached"));
+        let catalog=session.completion_catalog(vec![("main".into(),"Mixed table".into())]).await;
+        let columns=catalog.relations.iter().find(|r|r.name=="Mixed table").unwrap().columns.as_ref().unwrap();
+        assert_eq!(columns[0].name,"select"); assert_eq!(columns[1].name,"日本語"); assert_eq!(columns[1].detail,"INTEGER");
+        session.query("BEGIN; CREATE TABLE uncommitted(value TEXT)".into()).await?;
+        session.invalidate_completions();
+        let during=session.completion_catalog(vec![("temp".into(),"items".into())]).await;
+        assert!(during.status.contains("transaction"));
+        assert!(!during.relations.iter().any(|r|r.name=="uncommitted"));
+        assert_eq!(session.transaction_status().await?,TransactionStatus::Open);
+        assert!(during.relations.iter().find(|r|r.name=="Mixed table").unwrap().columns.is_some());
+        session.query("ROLLBACK".into()).await?;
+        let other=fixture().await?;
+        assert!(!other.completion_catalog(vec![]).await.relations.iter().any(|r|r.schema=="temp"));
+        session.query("CREATE TEMP TABLE fresh(value TEXT)".into()).await?;
+        assert!(session.completion_catalog(vec![]).await.relations.iter().any(|r|r.name=="fresh"));
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires QUERI_TEST_POSTGRES pointing at a disposable PostgreSQL database"]
+fn postgres_completion_catalog_session_scopes_and_transactions() -> Result<()> {
+    runtime()?.block_on(async {
+        let (profile,password)=postgres_profile()?;
+        let session=Session::connect(profile.clone(),password.clone()).await?;
+        session.query("CREATE TEMP TABLE \"Mixed table\"(\"select\" text, \"日本語\" integer); COMMENT ON COLUMN \"Mixed table\".\"日本語\" IS 'column help'; SET search_path=pg_temp;".into()).await?;
+        let names=session.completion_catalog(vec![]).await;
+        let table=names.relations.iter().find(|r|r.name=="Mixed table").expect("session temp table");
+        assert!(table.visible); assert!(table.columns.is_none());
+        let key=(table.schema.clone(),table.name.clone());
+        let catalog=session.completion_catalog(vec![key.clone()]).await;
+        let columns=catalog.relations.iter().find(|r|r.name=="Mixed table").unwrap().columns.as_ref().unwrap();
+        assert_eq!(columns[0].name,"select");assert_eq!(columns[1].detail,"integer column help");
+        session.query("BEGIN; CREATE TEMP TABLE uncommitted(value text)".into()).await?;
+        session.invalidate_completions();
+        assert!(session.completion_catalog(vec![key.clone()]).await.status.contains("transaction"));
+        assert_eq!(session.transaction_status().await?,TransactionStatus::Open);
+        assert!(session.query("SELECT 1/0".into()).await.is_err());
+        session.invalidate_completions();
+        assert!(session.completion_catalog(vec![key]).await.status.contains("transaction"));
+        assert_eq!(session.transaction_status().await?,TransactionStatus::Failed);
+        session.query("ROLLBACK".into()).await?;
+        assert!(!session.completion_catalog(vec![]).await.relations.iter().any(|r|r.name=="uncommitted"));
+        let other=Session::connect(profile,password).await?;
+        assert!(!other.completion_catalog(vec![]).await.relations.iter().any(|r|r.name=="Mixed table"));
+        session.query("CREATE TEMP TABLE fresh(value text)".into()).await?;
+        assert!(session.completion_catalog(vec![]).await.relations.iter().any(|r|r.name=="fresh"));
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires QUERI_TEST_POSTGRES and role creation permission"]
+fn postgres_completion_permissions_search_path_and_disconnection() -> Result<()> {
+    runtime()?.block_on(async {
+        let (profile,password)=postgres_profile()?;
+        let session=Session::connect(profile.clone(),password.clone()).await?;
+        let admin=Session::connect(profile,password).await?;
+        let suffix=Uuid::new_v4().simple().to_string();
+        let schema=format!("completion_{suffix}");let role=format!("completion_role_{suffix}");
+        session.query(format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.items(secret text, allowed integer); CREATE VIEW {schema}.item_view AS SELECT allowed FROM {schema}.items; CREATE ROLE {role}; GRANT USAGE ON SCHEMA {schema} TO {role}; GRANT SELECT(allowed) ON {schema}.items TO {role}; CREATE TEMP TABLE items(temp_value text); SET search_path={schema},pg_temp")).await?;
+        let outcome: Result<()> = async {
+            let catalog=session.completion_catalog(vec![]).await;
+            anyhow::ensure!(catalog.relations.iter().any(|r|r.name=="items" && r.schema==schema && r.visible));
+            anyhow::ensure!(catalog.relations.iter().any(|r|r.name=="item_view"));
+            session.query("SET search_path=pg_temp".into()).await?;
+            let catalog=session.completion_catalog(vec![]).await;
+            anyhow::ensure!(!catalog.relations.iter().any(|r|r.name=="items" && r.schema==schema && r.visible));
+            session.query(format!("SET ROLE {role}")).await?;
+            let catalog=session.completion_catalog(vec![(schema.clone(),"items".into())]).await;
+            let columns=catalog.relations.iter().find(|r|r.schema==schema && r.name=="items").and_then(|r|r.columns.as_ref()).unwrap();
+            anyhow::ensure!(columns.len()==1 && columns[0].name=="allowed");
+            anyhow::ensure!(!catalog.relations.iter().any(|r|r.schema==schema && r.name=="item_view"));
+            session.query("RESET ROLE".into()).await?;
+            let pid=session.query("SELECT pg_backend_pid()".into()).await?.sets[0].rows[0][0].text();
+            admin.query(format!("SELECT pg_terminate_backend({pid})")).await?;
+            session.invalidate_completions();
+            let catalog=session.completion_catalog(vec![]).await;
+            anyhow::ensure!(catalog.status.contains("unavailable"));
+            anyhow::ensure!(session.query("SELECT 1".into()).await.is_err());
+            Ok(())
+        }.await;
+        let _=session.query("RESET ROLE".into()).await;
+        admin.query(format!("DROP SCHEMA {schema} CASCADE; DROP ROLE {role}")).await?;
+        outcome
+    })
+}
+
+#[test]
+#[ignore = "requires QUERI_TEST_POSTGRES pointing at a disposable PostgreSQL database"]
+fn postgres_completion_busy_execution_never_queues_catalog_sql() -> Result<()> {
+    runtime()?.block_on(async {
+        let (profile,password)=postgres_profile()?;
+        let session=Session::connect(profile.clone(),password.clone()).await?;
+        let observer=Session::connect(profile,password).await?;
+        session.query("CREATE TEMP TABLE cached(value text)".into()).await?;
+        let pid=session.query("SELECT pg_backend_pid()".into()).await?.sets[0].rows[0][0].text();
+        session.completion_catalog(vec![]).await;
+        let running=session.clone();
+        let job=tokio::spawn(async move {running.query("BEGIN; SELECT pg_sleep(30)".into()).await});
+        tokio::time::timeout(Duration::from_secs(5),async {
+            loop {
+                let state=observer.query(format!("SELECT count(*) FROM pg_stat_activity WHERE pid={pid} AND wait_event='PgSleep'")).await?;
+                if state.sets[0].rows[0][0].text()=="1" {break;}
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok::<_,anyhow::Error>(())
+        }).await??;
+        let snapshot=tokio::time::timeout(Duration::from_secs(1),session.completion_catalog(vec![])).await?;
+        anyhow::ensure!(snapshot.status.contains("busy"));
+        anyhow::ensure!(snapshot.relations.iter().any(|r|r.name=="cached"));
+        session.cancel().await?;
+        anyhow::ensure!(job.await?.is_err());
+        anyhow::ensure!(session.transaction_status().await?==TransactionStatus::Failed);
+        anyhow::ensure!(session.completion_catalog(vec![]).await.status.contains("transaction"));
+        session.query("ROLLBACK".into()).await?;
+        anyhow::ensure!(session.completion_catalog(vec![]).await.status.contains("ready"));
+        Ok(())
+    })
+}

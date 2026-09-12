@@ -17,6 +17,7 @@ futures = "0.3"
 fallible-iterator = "0.3"
 getrandom = "0.4"
 gpui-kit = { version = "=0.8.1", features = ["tree-sitter-sql"] }
+lsp-types = "0.97"
 native-tls = "0.2"
 postgres-native-tls = "0.5"
 rusqlite = { version = "0.41", features = ["bundled", "hooks"] }

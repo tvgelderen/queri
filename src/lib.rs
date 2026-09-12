@@ -1,5 +1,6 @@
 pub mod assets;
 pub mod cell_view;
+pub mod completion;
 pub mod database;
 pub mod export;
 pub mod model;

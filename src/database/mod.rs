@@ -1,3 +1,4 @@
+mod completion;
 mod postgres;
 mod sqlite;
 
@@ -15,6 +16,8 @@ use tokio::sync::Mutex as AsyncMutex;
 
 pub struct Session {
     backend: Backend,
+    completion_cache: AsyncMutex<completion::Cache>,
+    completion_epoch: std::sync::atomic::AtomicU64,
     pub profile: ConnectionProfile,
     timeout: Mutex<StatementTimeout>,
     read_write_observed: AtomicBool,
@@ -78,6 +81,8 @@ impl Session {
         };
         Ok(Arc::new(Self {
             backend,
+            completion_cache: AsyncMutex::new(completion::Cache::default()),
+            completion_epoch: std::sync::atomic::AtomicU64::new(1),
             profile,
             timeout: Mutex::new(StatementTimeout::Inherit),
             read_write_observed: AtomicBool::new(false),
@@ -112,6 +117,8 @@ impl Session {
     }
 
     pub async fn query(&self, sql: String) -> Result<QueryOutput> {
+        self.invalidate_completions();
+        let _completion_invalidation = CompletionInvalidation(self);
         let start = Instant::now();
         let timeout = *self.timeout.lock().unwrap();
         let sets = match &self.backend {
@@ -171,6 +178,8 @@ impl Session {
         let Backend::Postgres(pg) = &self.backend else {
             bail!("Text bind execution requires a PostgreSQL session");
         };
+        self.invalidate_completions();
+        let _completion_invalidation = CompletionInvalidation(self);
         let start = Instant::now();
         let client = pg.client.lock().await;
         let timeout = *self.timeout.lock().unwrap();
@@ -455,5 +464,12 @@ fn classify_postgres_error(error: anyhow::Error) -> anyhow::Error {
         error.context(StatementTimedOut)
     } else {
         error
+    }
+}
+
+struct CompletionInvalidation<'a>(&'a Session);
+impl Drop for CompletionInvalidation<'_> {
+    fn drop(&mut self) {
+        self.0.invalidate_completions();
     }
 }
