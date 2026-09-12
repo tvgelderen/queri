@@ -189,38 +189,49 @@ impl Document {
         let DocumentKind::Table { saved_view, .. } = &self.kind else {
             return Empty.into_any_element();
         };
-        h_flex()
-            .gap_2()
-            .child(
-                Button::new("saved-table-views")
-                    .small()
-                    .label("Saved views")
-                    .disabled(self.busy())
-                    .on_click(cx.listener(|this, _, window, cx| this.open_named_views(window, cx))),
+        let loaded = saved_view.is_some();
+        Button::new("table-views-menu")
+            .ghost()
+            .small()
+            .icon(IconName::Bookmark)
+            .label(
+                saved_view
+                    .as_ref()
+                    .map(|view| view.name.clone())
+                    .unwrap_or_else(|| "Views".into()),
             )
-            .child(
-                Button::new("save-table-view")
-                    .small()
-                    .label("Save")
-                    .disabled(self.busy() || saved_view.is_none())
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.save_named_view(false, window, cx)),
-                    ),
-            )
-            .child(
-                Button::new("save-table-view-as")
-                    .small()
-                    .label("Save as…")
-                    .disabled(self.busy())
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.save_named_view(true, window, cx)),
-                    ),
-            )
-            .children(saved_view.as_ref().map(|view| {
-                div()
-                    .text_sm()
-                    .child(format!("{} · revision {}", view.name, view.revision))
-            }))
+            .accessibility_label("Saved views")
+            .when_some(saved_view.as_ref(), |button, view| {
+                button.tooltip(format!("{} · revision {}", view.name, view.revision))
+            })
+            .dropdown_caret(true)
+            .disabled(self.busy())
+            .dropdown_menu({
+                let view = cx.entity();
+                move |menu, _, cx| {
+                    view.update(cx, |_, cx| {
+                        menu.min_w(px(200.))
+                            .item(menu_item("Load view…", IconName::FolderOpen).on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.open_named_views(window, cx)
+                                }),
+                            ))
+                            .separator()
+                            .item(
+                                menu_item("Save view", IconName::Save)
+                                    .disabled(!loaded)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_named_view(false, window, cx)
+                                    })),
+                            )
+                            .item(
+                                menu_item("Save view as…", IconName::Plus).on_click(cx.listener(
+                                    |this, _, window, cx| this.save_named_view(true, window, cx),
+                                )),
+                            )
+                    })
+                }
+            })
             .into_any_element()
     }
 }

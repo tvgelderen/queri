@@ -37,24 +37,46 @@ fn brand_color(cx: &App) -> Hsla {
     .into()
 }
 
-pub fn brand_mark(size: Pixels, cx: &App) -> Svg {
-    svg()
-        .path("brand/queri-mark.svg")
-        .text_color(brand_color(cx))
+/// The mark in ink with its tail cell in brand blue, as on queri.dev.
+fn branded(body: &'static str, width: Pixels, height: Pixels, cx: &App) -> Div {
+    div()
+        .relative()
         .flex_shrink_0()
-        .size(size)
+        .w(width)
+        .h(height)
+        .child(
+            svg()
+                .path(body)
+                .text_color(brand_color(cx))
+                .absolute()
+                .inset_0()
+                .size_full(),
+        )
+        .child(
+            svg()
+                .path("brand/queri-tail.svg")
+                .text_color(rgb(super::theme::BRAND_BLUE))
+                .absolute()
+                .top_0()
+                .left_0()
+                .size(height),
+        )
 }
 
-pub fn brand_logo(height: Pixels, cx: &App) -> Stateful<Svg> {
-    svg()
-        .path("brand/queri-logo.svg")
-        .text_color(brand_color(cx))
-        .id("brand-logo")
-        .role(Role::Image)
-        .aria_label("Queri")
-        .flex_shrink_0()
-        .w(height * (222. / 64.))
-        .h(height)
+pub fn brand_mark(size: Pixels, cx: &App) -> Div {
+    branded("brand/queri-mark-body.svg", size, size, cx)
+}
+
+pub fn brand_logo(height: Pixels, cx: &App) -> Stateful<Div> {
+    branded(
+        "brand/queri-logo-body.svg",
+        height * (222. / 64.),
+        height,
+        cx,
+    )
+    .id("brand-logo")
+    .role(Role::Image)
+    .aria_label("Queri")
 }
 
 pub fn empty_state(
@@ -88,6 +110,86 @@ pub fn icon_button(
         .icon(icon)
         .accessibility_label(label.clone())
         .tooltip(label)
+}
+
+/// A quiet, full-width navigation row for the sidebar; the shortcut appears in its tooltip.
+pub fn nav_button(
+    id: impl Into<ElementId>,
+    icon: IconName,
+    label: impl Into<SharedString>,
+    hint: Option<&'static str>,
+    cx: &App,
+) -> Button {
+    let label = label.into();
+    Button::new(id)
+        .ghost()
+        .w_full()
+        .accessibility_label(label.clone())
+        .when_some(hint, |button, hint| {
+            button.tooltip(format!("{label} · {hint}"))
+        })
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .gap_2p5()
+                .child(
+                    Icon::new(icon)
+                        .small()
+                        .text_color(cx.theme().muted_foreground),
+                )
+                .child(div().flex_1().min_w_0().text_ellipsis().child(label)),
+        )
+}
+
+/// Small uppercase section label, echoing the site's eyebrow style.
+pub fn section_label(label: impl Into<SharedString>, cx: &App) -> Div {
+    div()
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(cx.theme().muted_foreground)
+        .child(label.into())
+}
+
+/// A compact pill for applied state such as filters, sorts and scopes.
+pub fn chip(cx: &App) -> Div {
+    h_flex()
+        .h_7()
+        .min_w_0()
+        .pl_2p5()
+        .pr_0p5()
+        .gap_1p5()
+        .rounded_full()
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().background)
+        .text_xs()
+}
+
+/// A small numeric badge tinted with the brand accent.
+pub fn count_badge(count: usize, cx: &App) -> Div {
+    div()
+        .min_w(px(18.))
+        .h(px(18.))
+        .px_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(super::theme::accent_soft(cx))
+        .text_color(super::theme::accent_text(cx))
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(count.to_string())
+}
+
+pub fn toolbar_divider(cx: &App) -> Div {
+    div()
+        .flex_shrink_0()
+        .w_px()
+        .h_4()
+        .mx_1()
+        .bg(cx.theme().border)
 }
 
 pub fn menu_item(label: impl Into<SharedString>, icon: impl Into<Icon>) -> PopupMenuItem {

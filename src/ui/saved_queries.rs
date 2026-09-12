@@ -6,7 +6,7 @@ use super::{
 use crate::model::{ConnectionProfile, SavedQuery};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Sizable, WindowExt,
+    ActiveTheme, Disableable, Icon, Sizable, WindowExt,
     button::{Button, ButtonVariants},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -299,12 +299,34 @@ impl Render for SavedQueries {
                     .gap_2()
                     .when(self.entries.is_empty() && !self.busy, |view| {
                         view.child(
-                            div()
-                                .py_4()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
+                            v_flex()
+                                .items_center()
+                                .gap_2()
+                                .py_8()
                                 .child(
-                                    "No saved queries. Save SQL from an editor or query history.",
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .size_10()
+                                        .rounded(cx.theme().radius_lg)
+                                        .bg(super::theme::accent_soft(cx))
+                                        .child(
+                                            Icon::new(IconName::Bookmark)
+                                                .text_color(super::theme::accent_text(cx)),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child("No saved queries yet"),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("Save SQL from an editor or from query history."),
                                 ),
                         )
                     })

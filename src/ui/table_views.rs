@@ -128,16 +128,104 @@ impl Document {
         if let Some(root) = filter_draft {
             self.filter_tree_rows(root, vec![], &mut rows, cx);
         }
-        v_flex().gap_1().mt_2()
-            .child(div().text_xs().child("Draft conditions · select a group to add; select a condition to replace. Apply runs the draft."))
-            .children(rows)
-            .child(h_flex().gap_2()
-                .children([(false, "Add All group"), (true, "Add Any group")].into_iter().map(|(any, label)| Button::new(if any { "add-any-group" } else { "add-all-group" }).small().label(label).disabled(self.busy() || page.is_none()).on_click(cx.listener(move |this, _, _, cx| this.add_filter_node(if any { FilterExpression::Any(vec![]) } else { FilterExpression::All(vec![]) }, cx)))))
-                .child(Button::new("reset-filter-draft").small().label("Reset draft").disabled(self.busy()).on_click(cx.listener(|this, _, _, cx| {
-                    if let DocumentKind::Table { filter_draft, filter_target, options, .. } = &mut this.kind { *filter_draft = options.filter.clone().map(|filter| Box::new(FilterExpression::All(vec![filter]))); filter_target.clear(); }
-                    cx.notify();
-                }))))
-            .child(div().text_xs().child(format!("Adding to group {}", if filter_target.is_empty() { "root".into() } else { filter_target.iter().map(|i| (i+1).to_string()).collect::<Vec<_>>().join(".") })))
+        let target = if filter_target.is_empty() {
+            "the top-level group".to_string()
+        } else {
+            format!(
+                "group {}",
+                filter_target
+                    .iter()
+                    .map(|i| (i + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            )
+        };
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Conditions"),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .children(
+                                [(false, "Add All group"), (true, "Add Any group")]
+                                    .into_iter()
+                                    .map(|(any, label)| {
+                                        Button::new(if any {
+                                            "add-any-group"
+                                        } else {
+                                            "add-all-group"
+                                        })
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Plus)
+                                        .label(if any { "Any group" } else { "All group" })
+                                        .accessibility_label(label)
+                                        .tooltip(if any {
+                                            "Add a group where any condition matches (OR)"
+                                        } else {
+                                            "Add a group where all conditions match (AND)"
+                                        })
+                                        .disabled(self.busy() || page.is_none())
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.add_filter_node(
+                                                    if any {
+                                                        FilterExpression::Any(vec![])
+                                                    } else {
+                                                        FilterExpression::All(vec![])
+                                                    },
+                                                    cx,
+                                                )
+                                            }),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                Button::new("reset-filter-draft")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::RotateCcw)
+                                    .label("Reset")
+                                    .accessibility_label("Reset draft")
+                                    .tooltip("Discard unapplied changes")
+                                    .disabled(self.busy())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let DocumentKind::Table {
+                                            filter_draft,
+                                            filter_target,
+                                            options,
+                                            ..
+                                        } = &mut this.kind
+                                        {
+                                            *filter_draft = options.filter.clone().map(|filter| {
+                                                Box::new(FilterExpression::All(vec![filter]))
+                                            });
+                                            filter_target.clear();
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .child(v_flex().gap_0p5().children(rows))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "New conditions go into {target}. Select a condition to replace it."
+                    )),
+            )
             .into_any_element()
     }
 
@@ -179,13 +267,15 @@ impl Document {
         let toggle_path = path.clone();
         rows.push(
             h_flex()
-                .gap_2()
-                .pl(px(path.len() as f32 * 16.))
+                .gap_1()
+                .pl(px(path.len() as f32 * 20.))
                 .child(
                     Button::new(SharedString::from(id.clone()))
-                        .small()
+                        .xsmall()
+                        .when(group, |button| button.outline())
+                        .when(!group, |button| button.ghost())
                         .label(label)
-                        .selected(selected && group)
+                        .selected(selected)
                         .disabled(self.busy())
                         .on_click(cx.listener(move |this, _, window, cx| {
                             if let DocumentKind::Table {
@@ -227,57 +317,63 @@ impl Document {
                 )
                 .when(group, |row| {
                     row.child(
-                        Button::new(SharedString::from(format!("{id}-toggle")))
-                            .small()
-                            .label("Switch All/Any")
-                            .disabled(self.busy())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let DocumentKind::Table {
-                                    filter_draft: Some(root),
-                                    ..
-                                } = &mut this.kind
-                                    && let Some(node) = node_mut(root, &toggle_path)
-                                {
-                                    *node = match node {
-                                        FilterExpression::All(children) => {
-                                            FilterExpression::Any(std::mem::take(children))
-                                        }
-                                        FilterExpression::Any(children) => {
-                                            FilterExpression::All(std::mem::take(children))
-                                        }
-                                        _ => return,
-                                    };
-                                }
-                                cx.notify();
-                            })),
-                    )
-                })
-                .child(
-                    Button::new(SharedString::from(format!("{id}-remove")))
-                        .small()
-                        .label("Remove")
+                        icon_button(
+                            SharedString::from(format!("{id}-toggle")),
+                            IconName::ArrowLeftRight,
+                            "Switch All/Any",
+                        )
+                        .xsmall()
                         .disabled(self.busy())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let DocumentKind::Table {
-                                filter_draft,
-                                filter_target,
+                                filter_draft: Some(root),
                                 ..
                             } = &mut this.kind
+                                && let Some(node) = node_mut(root, &toggle_path)
                             {
-                                if remove_path.is_empty() {
-                                    *filter_draft = Some(Box::new(FilterExpression::All(vec![])));
-                                } else if let Some(root) = filter_draft
-                                    && let Some(
-                                        FilterExpression::All(children)
-                                        | FilterExpression::Any(children),
-                                    ) = node_mut(root, &remove_path[..remove_path.len() - 1])
-                                {
-                                    children.remove(*remove_path.last().unwrap());
-                                }
-                                filter_target.clear();
+                                *node = match node {
+                                    FilterExpression::All(children) => {
+                                        FilterExpression::Any(std::mem::take(children))
+                                    }
+                                    FilterExpression::Any(children) => {
+                                        FilterExpression::All(std::mem::take(children))
+                                    }
+                                    _ => return,
+                                };
                             }
                             cx.notify();
                         })),
+                    )
+                })
+                .child(
+                    icon_button(
+                        SharedString::from(format!("{id}-remove")),
+                        IconName::X,
+                        "Remove",
+                    )
+                    .xsmall()
+                    .disabled(self.busy())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let DocumentKind::Table {
+                            filter_draft,
+                            filter_target,
+                            ..
+                        } = &mut this.kind
+                        {
+                            if remove_path.is_empty() {
+                                *filter_draft = Some(Box::new(FilterExpression::All(vec![])));
+                            } else if let Some(root) = filter_draft
+                                && let Some(
+                                    FilterExpression::All(children)
+                                    | FilterExpression::Any(children),
+                                ) = node_mut(root, &remove_path[..remove_path.len() - 1])
+                            {
+                                children.remove(*remove_path.last().unwrap());
+                            }
+                            filter_target.clear();
+                        }
+                        cx.notify();
+                    })),
                 )
                 .into_any_element(),
         );
@@ -296,8 +392,9 @@ impl Document {
         let DocumentKind::Table { options, .. } = &self.kind else {
             return Empty.into_any_element();
         };
+        let many = options.sort.len() > 1;
         h_flex()
-            .gap_2()
+            .gap_1p5()
             .flex_wrap()
             .children(
                 options
@@ -305,17 +402,42 @@ impl Document {
                     .iter()
                     .enumerate()
                     .map(|(index, (column, descending))| {
-                        h_flex()
-                            .gap_1()
+                        chip(cx)
+                            .pl_0p5()
+                            .gap_0p5()
                             .child(
                                 Button::new(SharedString::from(format!("sort-direction-{index}")))
-                                    .small()
-                                    .label(format!(
+                                    .ghost()
+                                    .xsmall()
+                                    .rounded_full()
+                                    .accessibility_label(format!(
                                         "{} · {} {}",
                                         index + 1,
                                         column,
                                         if *descending { "DESC" } else { "ASC" }
                                     ))
+                                    .tooltip("Reverse direction")
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .when(many, |row| {
+                                                row.child(
+                                                    div()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child((index + 1).to_string()),
+                                                )
+                                            })
+                                            .child(column.clone())
+                                            .child(
+                                                Icon::new(if *descending {
+                                                    IconName::ArrowDown
+                                                } else {
+                                                    IconName::ArrowUp
+                                                })
+                                                .xsmall()
+                                                .text_color(super::super::theme::accent_text(cx)),
+                                            ),
+                                    )
                                     .disabled(self.busy())
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         if let DocumentKind::Table { options, .. } = &mut this.kind
@@ -326,33 +448,47 @@ impl Document {
                                         this.refresh(window, cx);
                                     })),
                             )
-                            .child(
-                                Button::new(SharedString::from(format!("sort-earlier-{index}")))
-                                    .small()
-                                    .label("Earlier")
-                                    .disabled(self.busy() || index == 0)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        if let DocumentKind::Table { options, .. } = &mut this.kind
-                                        {
-                                            options.sort.swap(index, index - 1);
-                                            options.offset = 0;
-                                        }
-                                        this.refresh(window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new(SharedString::from(format!("sort-remove-{index}")))
-                                    .small()
-                                    .label("Remove sort")
+                            .when(index > 0, |chip| {
+                                chip.child(
+                                    icon_button(
+                                        SharedString::from(format!("sort-earlier-{index}")),
+                                        IconName::ChevronLeft,
+                                        "Earlier",
+                                    )
+                                    .xsmall()
+                                    .tooltip("Sort by this first")
                                     .disabled(self.busy())
-                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            if let DocumentKind::Table { options, .. } =
+                                                &mut this.kind
+                                            {
+                                                options.sort.swap(index, index - 1);
+                                                options.offset = 0;
+                                            }
+                                            this.refresh(window, cx);
+                                        },
+                                    )),
+                                )
+                            })
+                            .child(
+                                icon_button(
+                                    SharedString::from(format!("sort-remove-{index}")),
+                                    IconName::X,
+                                    "Remove sort",
+                                )
+                                .xsmall()
+                                .disabled(self.busy())
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
                                         if let DocumentKind::Table { options, .. } = &mut this.kind
                                         {
                                             options.sort.remove(index);
                                             options.offset = 0;
                                         }
                                         this.refresh(window, cx);
-                                    })),
+                                    },
+                                )),
                             )
                     }),
             )
@@ -398,6 +534,37 @@ impl Document {
         }
     }
 
+    pub(super) fn column_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
+        let DocumentKind::Table {
+            columns_open,
+            columns,
+            ..
+        } = &self.kind
+        else {
+            return Empty.into_any_element();
+        };
+        let hidden = columns.iter().filter(|column| column.hidden).count();
+        Button::new("view-columns")
+            .ghost()
+            .small()
+            .icon(IconName::Columns3)
+            .accessibility_label("Columns")
+            .selected(*columns_open)
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child("Columns")
+                    .when(hidden > 0, |row| row.child(count_badge(hidden, cx))),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                if let DocumentKind::Table { columns_open, .. } = &mut this.kind {
+                    *columns_open = !*columns_open;
+                }
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
     pub(super) fn column_controls(&self, cx: &mut Context<Self>) -> AnyElement {
         let DocumentKind::Table {
             columns_open,
@@ -419,28 +586,56 @@ impl Document {
                 }
             }
         }
-        v_flex().gap_1().child(Button::new("view-columns").small().label("Columns").selected(*columns_open).on_click(cx.listener(|this, _, _, cx| {
-            if let DocumentKind::Table { columns_open, .. } = &mut this.kind { *columns_open = !*columns_open; } cx.notify();
-        })))
-        .when(*columns_open, |view| view
-            .child(div().text_xs().child("Presentation only · copy, export and search use visible column order. Row actions retain complete source rows."))
-            .children(all.iter().enumerate().map(|(index, column)| {
+        if !*columns_open {
+            return Empty.into_any_element();
+        }
+        let hidden = all.iter().filter(|column| column.hidden).count();
+        v_flex()
+            .p_3()
+            .gap_2()
+            .rounded(cx.theme().radius_lg)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().muted)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(cx.theme().muted_foreground).child("Columns"))
+                            .child(
+                                div()
+                                    .id("column-layout-note")
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground.opacity(0.8))
+                                    .child(if hidden == 0 { "All visible".to_string() } else { format!("{hidden} hidden") })
+                                    .tooltip(|window, cx| Tooltip::new("Presentation only · copy, export and search use visible column order. Row actions retain complete source rows.").build(window, cx)),
+                            ),
+                    )
+                    .child(Button::new("reset-columns").ghost().xsmall().icon(IconName::RotateCcw).label("Reset").accessibility_label("Reset column layout").disabled(self.busy()).on_click(cx.listener(|this, _, _, cx| {
+                        if let DocumentKind::Table { columns, .. } = &mut this.kind { columns.clear(); } this.error.clear(); this.update_grid(cx); cx.emit(DocumentChanged); cx.notify();
+                    }))),
+            )
+            .child(h_flex().flex_wrap().gap_x_4().gap_y_0p5().children(all.iter().enumerate().map(|(index, column)| {
                 let name = column.name.clone(); let current = all.clone(); let previous = all.clone(); let remove = all.clone();
                 let missing = page.as_ref().is_some_and(|page| !page.metadata.columns.iter().any(|col| col.name == name));
-                h_flex().gap_2()
-                    .child(Button::new(SharedString::from(format!("column-visible-{index}"))).small().label(format!("{} {}{}", if column.hidden { "Show" } else { "Hide" }, name, if missing { " (missing)" } else { "" })).disabled(self.busy() || missing).on_click(cx.listener(move |this, _, _, cx| {
+                h_flex().w(px(220.)).gap_1()
+                    .child(icon_button(SharedString::from(format!("column-visible-{index}")), if column.hidden { IconName::EyeOff } else { IconName::Eye }, format!("{} {}{}", if column.hidden { "Show" } else { "Hide" }, name, if missing { " (missing)" } else { "" })).xsmall().disabled(self.busy() || missing).on_click(cx.listener(move |this, _, _, cx| {
                         if let DocumentKind::Table { columns, .. } = &mut this.kind { *columns = current.clone(); columns[index].hidden = !columns[index].hidden; } this.update_grid(cx); cx.emit(DocumentChanged); cx.notify();
                     })))
-                    .child(Button::new(SharedString::from(format!("column-earlier-{index}"))).small().label("Earlier").disabled(self.busy() || index == 0).on_click(cx.listener(move |this, _, _, cx| {
-                        if let DocumentKind::Table { columns, .. } = &mut this.kind { *columns = previous.clone(); columns.swap(index, index-1); } this.update_grid(cx); cx.emit(DocumentChanged); cx.notify();
-                    })))
-                    .when(missing, |row| row.child(Button::new(SharedString::from(format!("column-remove-{index}"))).small().label("Remove missing column").on_click(cx.listener(move |this, _, _, cx| {
+                    .child(div().flex_1().min_w_0().text_sm().text_ellipsis()
+                        .when(column.hidden || missing, |label| label.text_color(cx.theme().muted_foreground))
+                        .when(missing, |label| label.text_color(cx.theme().danger))
+                        .child(if missing { format!("{name} (missing)") } else { name.clone() }))
+                    .when(missing, |row| row.child(icon_button(SharedString::from(format!("column-remove-{index}")), IconName::Trash, "Remove missing column").xsmall().on_click(cx.listener(move |this, _, _, cx| {
                         if let DocumentKind::Table { columns, .. } = &mut this.kind { *columns = remove.clone(); columns.remove(index); } this.error.clear(); this.update_grid(cx); cx.emit(DocumentChanged); cx.notify();
                     }))))
-            }))
-            .child(Button::new("reset-columns").small().label("Reset column layout").disabled(self.busy()).on_click(cx.listener(|this, _, _, cx| {
-                if let DocumentKind::Table { columns, .. } = &mut this.kind { columns.clear(); } this.error.clear(); this.update_grid(cx); cx.emit(DocumentChanged); cx.notify();
-            }))))
+                    .child(icon_button(SharedString::from(format!("column-earlier-{index}")), IconName::ChevronUp, "Earlier").xsmall().tooltip(format!("Move {name} earlier")).disabled(self.busy() || index == 0).on_click(cx.listener(move |this, _, _, cx| {
+                        if let DocumentKind::Table { columns, .. } = &mut this.kind { *columns = previous.clone(); columns.swap(index, index-1); } this.update_grid(cx); cx.emit(DocumentChanged); cx.notify();
+                    })))
+            })))
         .into_any_element()
     }
 }

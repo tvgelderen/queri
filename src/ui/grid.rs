@@ -142,7 +142,7 @@ impl TableDelegate for Grid {
     }
     fn column(&self, index: usize, _: &App) -> Column {
         if self.checkable && index == 0 {
-            return Column::new("selection", "Select")
+            return Column::new("selection", "#")
                 .width(px(70.))
                 .fixed_left()
                 .selectable(false)

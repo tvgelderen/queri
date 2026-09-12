@@ -2009,7 +2009,8 @@ async fn named_views_explicit_save_load_conflict_and_save_as(cx: &mut TestAppCon
     cx.update_window(window, |_, window, cx| {
         window.click("view-columns", cx);
         window.click("column-earlier-1", cx);
-        window.click("save-table-view-as", cx);
+        window.click("table-views-menu", cx);
+        crate::ui::test_support::click_label(window, "Save view as…", cx);
         window.click("saved-view-name", cx);
         window.input("By name", cx);
         window.click("confirm-save-view", cx);
@@ -2041,7 +2042,8 @@ async fn named_views_explicit_save_load_conflict_and_save_as(cx: &mut TestAppCon
     changed.name = "Changed elsewhere".into();
     fixture.services.store.save_table_view(&changed).unwrap();
     cx.update_window(window, |_, window, cx| {
-        window.click("save-table-view", cx);
+        window.click("table-views-menu", cx);
+        crate::ui::test_support::click_label(window, "Save view", cx);
         window.click("confirm-save-view", cx);
     })
     .unwrap();
@@ -2061,7 +2063,8 @@ async fn named_views_explicit_save_load_conflict_and_save_as(cx: &mut TestAppCon
     })
     .await;
     cx.update_window(window, |_, window, cx| {
-        window.click("save-table-view-as", cx);
+        window.click("table-views-menu", cx);
+        crate::ui::test_support::click_label(window, "Save view as…", cx);
         window.click("saved-view-name", cx);
         window.input("My changes", cx);
         window.click("confirm-save-view", cx);
@@ -2077,7 +2080,8 @@ async fn named_views_explicit_save_load_conflict_and_save_as(cx: &mut TestAppCon
     .await;
     assert_eq!(fixture.services.store.saved_table_views().unwrap().len(), 2);
     cx.update_window(window, |_, window, cx| {
-        window.click("saved-table-views", cx)
+        window.click("table-views-menu", cx);
+        crate::ui::test_support::click_label(window, "Load view…", cx);
     })
     .unwrap();
     let id = format!("load-view-{}", saved.id);
@@ -2127,7 +2131,8 @@ async fn named_relationship_view_requires_explicit_scope_choice(cx: &mut TestApp
         .await;
     cx.update_window(window, |_, window, cx| {
         doc.update(cx, |doc, _| doc.set_relationship(Some(scope.clone())));
-        window.click("save-table-view-as", cx);
+        window.click("table-views-menu", cx);
+        crate::ui::test_support::click_label(window, "Save view as…", cx);
         window.click("saved-view-name", cx);
         window.input("Reusable", cx);
         window.click("confirm-save-view", cx);
@@ -2173,7 +2178,8 @@ async fn named_relationship_view_requires_explicit_scope_choice(cx: &mut TestApp
             Some(&scope),
             "saving reusable settings does not change active scope"
         );
-        window.click("save-table-view-as", cx);
+        window.click("table-views-menu", cx);
+        crate::ui::test_support::click_label(window, "Save view as…", cx);
         window.click("saved-view-name", cx);
         window.input("Record", cx);
         window.click("saved-view-scope", cx);
@@ -2259,7 +2265,8 @@ async fn nested_filter_controls_and_null_cell_filter_are_drafts(cx: &mut TestApp
             .grid
             .clone()
             .update(cx, |grid, cx| grid.set_selected_cell(0, 3, cx));
-        window.click("filter-from-cell", cx);
+        window.click("row-actions", cx);
+        crate::ui::test_support::click_label(window, "Filter by this value", cx);
         let DocumentKind::Table { filter_draft, .. } = &doc.read(cx).kind else {
             panic!()
         };

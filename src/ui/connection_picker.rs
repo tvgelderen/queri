@@ -90,7 +90,7 @@ impl ConnectionItem {
                     .path(self.logo)
                     .size_8()
                     .flex_shrink_0()
-                    .text_color(cx.theme().primary),
+                    .text_color(cx.theme().foreground),
             )
             .child(
                 v_flex()
@@ -125,7 +125,7 @@ impl ConnectionItem {
                                             })
                                             .small()
                                             .text_color(match state {
-                                                ConnectionState::Ready => cx.theme().foreground,
+                                                ConnectionState::Ready => cx.theme().success,
                                                 ConnectionState::Failed => cx.theme().danger,
                                                 _ => cx.theme().muted_foreground,
                                             }),

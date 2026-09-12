@@ -1,6 +1,6 @@
 use super::{
     Services,
-    controls::{choice, empty_state, icon_button, menu_item, shortcut},
+    controls::{chip, choice, count_badge, empty_state, icon_button, menu_item, toolbar_divider},
     grid::{Grid, GridEvent},
     grid_search::{FindGrid, GridSearch},
     row_editor::{RowEditor, RowSaved},
@@ -14,7 +14,7 @@ use gpui_kit::component::{
     dialog::DialogButtonProps,
     h_flex,
     input::{Editor, EditorState, Input, InputEvent, InputState},
-    menu::DropdownMenu,
+    menu::{DropdownMenu, PopupMenu},
     resizable::{ResizableState, resizable_panel, v_resizable},
     tab::{Tab, TabBar},
     table::{ColumnSort, DataTable, TableEvent, TableState},
@@ -971,9 +971,13 @@ impl Document {
                     Ok((Ok(output), history_error, _)) => {
                         this.query_outcome = QueryOutcome::Succeeded;
                         this.status = format!(
-                            "Completed in {} ms · {} result sets",
+                            "Completed in {} ms{}",
                             output.elapsed_ms,
-                            output.sets.len()
+                            if output.sets.len() > 1 {
+                                format!(" · {} results", output.sets.len())
+                            } else {
+                                String::new()
+                            }
                         );
                         if let Some(error) = history_error {
                             this.status
@@ -1097,7 +1101,7 @@ impl Document {
         };
         h_flex().gap_2()
             .child(choice(
-                Button::new("statement-timeout").small().label(match self.statement_timeout {
+                Button::new("statement-timeout").ghost().small().icon(IconName::Timer).label(match self.statement_timeout {
                     StatementTimeout::Inherit => "Timeout: inherit".to_string(),
                     StatementTimeout::NoTimeout => "Timeout: none".to_string(),
                     StatementTimeout::Custom(ms) => format!("Timeout: {ms} ms"),
@@ -1144,84 +1148,116 @@ impl Document {
             )).into_any_element()
     }
 
-    fn transaction_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let label = match self.transaction {
-            TransactionStatus::Idle => {
-                if self.session.is_some() {
-                    "Autocommit"
-                } else {
-                    "Disconnected"
-                }
-            }
-            TransactionStatus::Open => "Transaction open",
-            TransactionStatus::Failed => "Transaction failed · roll back or recover a savepoint",
-            TransactionStatus::Unknown => "Transaction outcome unknown",
+    fn transaction_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (label, tone) = match self.transaction {
+            TransactionStatus::Idle if self.session.is_some() => ("Autocommit", cx.theme().success),
+            TransactionStatus::Idle => ("Disconnected", cx.theme().muted_foreground),
+            TransactionStatus::Open => ("Transaction open", cx.theme().warning),
+            TransactionStatus::Failed => ("Transaction failed", cx.theme().danger),
+            TransactionStatus::Unknown => ("Transaction outcome unknown", cx.theme().danger),
         };
         let elapsed = self
             .transaction_started
             .map(|start| format!(" · {}s", start.elapsed().as_secs()))
             .unwrap_or_default();
+        let detail = match self.transaction {
+            TransactionStatus::Idle => {
+                "Each statement commits on its own. Begin opens a transaction on this tab's session."
+            }
+            TransactionStatus::Open => {
+                "Changes stay on this tab's session until you commit or roll back."
+            }
+            TransactionStatus::Failed => "Roll back or recover a savepoint before continuing.",
+            TransactionStatus::Unknown => {
+                "The connection was lost. Verify the result before repeating the operation."
+            }
+        };
+        let unavailable = self.busy() || self.session.is_none();
         h_flex()
-            .px_4()
-            .pb_2()
-            .gap_2()
-            .child(self.timeout_controls(cx))
+            .gap_1()
+            .flex_wrap()
+            .child(
+                h_flex()
+                    .id("transaction-status")
+                    .h_7()
+                    .px_2p5()
+                    .gap_1p5()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .text_xs()
+                    .aria_label(format!("{label}{elapsed}"))
+                    .child(div().size_1p5().rounded_full().bg(tone))
+                    .child(format!("{label}{elapsed}"))
+                    .tooltip(move |window, cx| Tooltip::new(detail).build(window, cx)),
+            )
             .when(
                 self.profile.policy == ExecutionPolicy::ReadOnlyByDefault,
                 |view| {
+                    let observed = self.session.as_ref().is_some_and(|session| session.read_write_observed());
                     view.child(
-                div().id("read-only-policy").text_xs().child(
-                    if self.session.as_ref().is_some_and(|session| session.read_write_observed()) {
-                        "Read-write override observed · generated changes blocked"
-                    } else {
-                        "Read-only by default · SQL can override · generated changes blocked"
-                    }
-                )
-            )
+                        h_flex()
+                            .id("read-only-policy")
+                            .h_7()
+                            .px_2p5()
+                            .gap_1p5()
+                            .rounded_full()
+                            .bg(cx.theme().muted)
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .aria_label(if observed {
+                                "Read-write override observed · generated changes blocked"
+                            } else {
+                                "Read-only by default · SQL can override · generated changes blocked"
+                            })
+                            .child(Icon::new(IconName::Lock).xsmall())
+                            .child(if observed { "Read-write override" } else { "Read-only" })
+                            .tooltip(move |window, cx| Tooltip::new(if observed {
+                                "Read-write override observed · generated changes blocked"
+                            } else {
+                                "Read-only by default · SQL can override · generated changes blocked"
+                            }).build(window, cx)),
+                    )
                 },
             )
-            .flex_wrap()
-            .child(
-                div()
-                    .id("transaction-status")
-                    .text_xs()
-                    .child(format!("{label}{elapsed}")),
-            )
-            .children(
-                [
-                    (
-                        "begin-transaction",
-                        "Begin",
-                        "BEGIN",
-                        self.transaction == TransactionStatus::Idle,
-                    ),
-                    (
-                        "commit-transaction",
-                        "Commit",
-                        "COMMIT",
-                        self.transaction == TransactionStatus::Open,
-                    ),
-                    (
-                        "rollback-transaction",
-                        "Rollback",
-                        "ROLLBACK",
-                        matches!(
-                            self.transaction,
-                            TransactionStatus::Open | TransactionStatus::Failed
-                        ),
-                    ),
-                ]
-                .into_iter()
-                .map(|(id, label, command, allowed)| {
-                    Button::new(id)
+            .when(self.transaction == TransactionStatus::Idle, |row| {
+                row.child(
+                    Button::new("begin-transaction")
+                        .ghost()
                         .small()
-                        .label(label)
-                        .disabled(!allowed || self.busy() || self.session.is_none())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.transaction_command(command, window, cx)
-                        }))
-                }),
+                        .label("Begin")
+                        .tooltip("Begin a transaction")
+                        .disabled(unavailable)
+                        .on_click(cx.listener(|this, _, window, cx| this.transaction_command("BEGIN", window, cx))),
+                )
+            })
+            .when(self.transaction == TransactionStatus::Open, |row| {
+                row.child(
+                    Button::new("commit-transaction")
+                        .outline()
+                        .small()
+                        .icon(IconName::Check)
+                        .label("Commit")
+                        .disabled(unavailable)
+                        .on_click(cx.listener(|this, _, window, cx| this.transaction_command("COMMIT", window, cx))),
+                )
+            })
+            .when(
+                matches!(self.transaction, TransactionStatus::Open | TransactionStatus::Failed),
+                |row| {
+                    row.child(
+                        Button::new("rollback-transaction")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Undo2)
+                            .label("Roll back")
+                            .accessibility_label("Rollback")
+                            .disabled(unavailable)
+                            .on_click(cx.listener(|this, _, window, cx| this.transaction_command("ROLLBACK", window, cx))),
+                    )
+                },
             )
+            .child(self.timeout_controls(cx))
             .into_any_element()
     }
 
@@ -1425,28 +1461,20 @@ impl Document {
 
     fn data_actions(&self, cx: &mut Context<Self>) -> AnyElement {
         h_flex()
-            .when(self.table_ref().is_some(), |row| {
-                row.child(
-                    Button::new("filter-from-cell")
-                        .small()
-                        .label("Filter from cell")
-                        .disabled(self.busy())
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.filter_from_cell(window, cx)),
-                        ),
-                )
-            })
             .gap_1()
             .child(
                 Button::new("export-data")
                     .ghost()
                     .small()
-                    .label("Export…")
+                    .icon(IconName::Download)
+                    .label("Export")
+                    .accessibility_label("Export…")
                     .disabled(self.grid.read(cx).delegate().data.columns.is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.export(window, cx))),
             )
             .child(
                 icon_button("copy-selection", IconName::Copy, "Copy selected cells")
+                    .small()
                     .disabled(self.cell_selection(cx).is_none())
                     .dropdown_menu({
                         let view = cx.entity();
@@ -2107,9 +2135,101 @@ impl Document {
 
     fn query_actions(&self, cx: &mut Context<Self>) -> AnyElement {
         let selection = matches!(&self.kind, DocumentKind::Sql { editor } if !editor.read(cx).selected_value().trim().is_empty());
+        let running = matches!(self.operation, Operation::Running | Operation::Cancelling);
         h_flex()
             .flex_wrap()
-            .gap_2()
+            .gap_1()
+            .child(
+                Button::new("format-sql")
+                    .ghost()
+                    .small()
+                    .icon(IconName::WandSparkles)
+                    .label(if self.formatting {
+                        "Formatting…"
+                    } else if selection {
+                        "Format selection"
+                    } else {
+                        "Format"
+                    })
+                    .disabled(self.formatting)
+                    .tooltip("Format SQL · Ctrl+Shift+F")
+                    .on_click(cx.listener(|this, _, window, cx| this.format_sql(window, cx))),
+            )
+            .child(
+                Button::new("save-query")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Bookmark)
+                    .label(if self.saved_query.is_some() {
+                        "Save changes"
+                    } else {
+                        "Save"
+                    })
+                    .tooltip(if self.saved_query.is_some() {
+                        "Update the saved query"
+                    } else {
+                        "Save to your query library"
+                    })
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.save_query(false, window, cx)),
+                    ),
+            )
+            .child(
+                icon_button("query-files", IconName::Ellipsis, "Query actions")
+                    .small()
+                    .dropdown_menu({
+                        let view = cx.entity();
+                        move |menu, _, cx| {
+                            view.update(cx, |this, cx| {
+                                let status = this.completion.status.borrow().clone();
+                                let menu = menu
+                                    .min_w(px(224.))
+                                    .label(status)
+                                    .item(
+                                        menu_item("Refresh completions", IconName::RefreshCw)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.refresh(window, cx)
+                                            })),
+                                    )
+                                    .item(menu_item("Save as new query…", IconName::Plus).on_click(
+                                        cx.listener(|this, _, window, cx| {
+                                            this.save_query(true, window, cx)
+                                        }),
+                                    ))
+                                    .separator()
+                                    .item(menu_item("Open SQL file…", IconName::Folder).on_click(
+                                        cx.listener(|this, _, window, cx| {
+                                            this.sql_file(true, window, cx)
+                                        }),
+                                    ))
+                                    .item(menu_item("Save SQL file…", IconName::File).on_click(
+                                        cx.listener(|this, _, window, cx| {
+                                            this.sql_file(false, window, cx)
+                                        }),
+                                    ))
+                                    .separator();
+                                this.session_menu(menu, cx)
+                            })
+                        }
+                    }),
+            )
+            .child(toolbar_divider(cx))
+            .when(running, |bar| {
+                bar.child(
+                    Button::new("cancel-query")
+                        .outline()
+                        .small()
+                        .icon(IconName::Square)
+                        .label(if self.operation == Operation::Cancelling {
+                            "Cancelling…"
+                        } else {
+                            "Cancel"
+                        })
+                        .tooltip("Cancel query · Ctrl+Shift+C")
+                        .disabled(self.operation != Operation::Running)
+                        .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx))),
+                )
+            })
             .child(
                 Button::new("run-query")
                     .primary()
@@ -2125,95 +2245,47 @@ impl Document {
                     } else {
                         "Run entire script · Ctrl+Enter"
                     })
+                    .loading(self.operation == Operation::Running)
                     .disabled(self.busy() || self.session.is_none())
                     .on_click(cx.listener(|this, _, window, cx| this.run(window, cx))),
             )
-            .child(shortcut("Ctrl ↵", cx))
-            .child(
-                Button::new("format-sql")
-                    .ghost()
-                    .small()
-                    .label(if self.formatting {
-                        "Formatting…"
-                    } else if selection {
-                        "Format selection"
-                    } else {
-                        "Format SQL"
-                    })
-                    .disabled(self.formatting)
-                    .tooltip("Format SQL · Ctrl+Shift+F")
-                    .on_click(cx.listener(|this, _, window, cx| this.format_sql(window, cx))),
+            .into_any_element()
+    }
+
+    /// Session and context actions shared by table and SQL documents.
+    fn session_menu(&self, menu: PopupMenu, cx: &mut Context<Self>) -> PopupMenu {
+        let context = format!(
+            "{} / {}",
+            self.profile.display_name(),
+            self.profile.database()
+        );
+        let menu = menu
+            .item(
+                menu_item("New query on this database", IconName::Code)
+                    .disabled(!self.database_available)
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(NewDocumentQuery))),
             )
-            .child(
-                icon_button(
-                    "refresh-completions",
-                    IconName::RefreshCw,
-                    format!(
-                        "Refresh completions · F5\n{}",
-                        self.completion.status.borrow()
-                    ),
-                )
-                .disabled(self.busy())
-                .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
-            )
-            .child(
-                Button::new("save-query")
-                    .ghost()
-                    .small()
-                    .label(if self.saved_query.is_some() {
-                        "Save changes…"
-                    } else {
-                        "Save query…"
-                    })
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.save_query(false, window, cx)),
-                    ),
-            )
-            .child(
-                icon_button("query-files", IconName::Ellipsis, "Query actions").dropdown_menu({
-                    let view = cx.entity();
-                    move |menu, _, cx| {
-                        view.update(cx, |_, cx| {
-                            menu.item(
-                                menu_item("Refresh completions · F5", IconName::RefreshCw)
-                                    .on_click(
-                                        cx.listener(|this, _, window, cx| this.refresh(window, cx)),
-                                    ),
-                            )
-                            .item(menu_item("Save as new query…", IconName::Plus).on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.save_query(true, window, cx)
-                                }),
-                            ))
-                            .item(menu_item("Open SQL file…", IconName::Folder).on_click(
-                                cx.listener(|this, _, window, cx| this.sql_file(true, window, cx)),
-                            ))
-                            .item(
-                                menu_item("Save SQL file…", IconName::File).on_click(cx.listener(
-                                    |this, _, window, cx| this.sql_file(false, window, cx),
-                                )),
-                            )
-                        })
-                    }
+            .item(
+                menu_item("Copy connection context", IconName::Copy).on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(context.clone()))
                 }),
             )
-            .when(
-                matches!(self.operation, Operation::Running | Operation::Cancelling),
-                |bar| {
-                    bar.child(
-                        Button::new("cancel-query")
-                            .small()
-                            .label(if self.operation == Operation::Cancelling {
-                                "Cancelling…"
-                            } else {
-                                "Cancel"
-                            })
-                            .disabled(self.operation != Operation::Running)
-                            .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx))),
-                    )
-                },
-            )
-            .into_any_element()
+            .item(
+                menu_item("Reconnect session", IconName::RefreshCw)
+                    .disabled(self.busy() || !self.database_available)
+                    .on_click(cx.listener(|this, _, window, cx| this.reconnect(window, cx))),
+            );
+        if let DocumentKind::Sql { editor } = &self.kind {
+            let sql = editor.read(cx).value().to_string();
+            menu.separator()
+                .item(
+                    menu_item("Copy SQL", IconName::Copy).on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(sql.clone()))
+                    }),
+                )
+        } else {
+            menu
+        }
     }
 
     fn results_header(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2235,14 +2307,23 @@ impl Document {
                 }
             )
         };
+        let outcome_color = if self.busy() {
+            cx.theme().muted_foreground
+        } else {
+            match self.query_outcome {
+                QueryOutcome::Succeeded => cx.theme().success,
+                QueryOutcome::Failed | QueryOutcome::TimedOut => cx.theme().danger,
+                QueryOutcome::Cancelled | QueryOutcome::NotRun => cx.theme().muted_foreground,
+            }
+        };
         h_flex()
             .id("result-tabs")
             .flex_shrink_0()
             .flex_wrap()
             .min_h_10()
             .px_4()
-            .gap_3()
-            .border_b_1()
+            .gap_2()
+            .border_y_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().muted)
             .when(self.results.len() <= 1, |bar| {
@@ -2255,8 +2336,12 @@ impl Document {
                 .when_some(self.results.first(), |bar, result| {
                     bar.child(
                         div()
+                            .px_1p5()
+                            .rounded(cx.theme().radius_tokens().sm)
+                            .bg(cx.theme().secondary_hover)
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
+                            .font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
                             .child(count(result)),
                     )
                 })
@@ -2300,18 +2385,19 @@ impl Document {
                     .text_color(cx.theme().muted_foreground)
                     .child(
                         Icon::new(if self.busy() {
-                            IconName::RefreshCw
+                            IconName::LoaderCircle
                         } else {
                             match self.query_outcome {
-                                QueryOutcome::Succeeded => IconName::Check,
+                                QueryOutcome::Succeeded => IconName::CircleCheck,
                                 QueryOutcome::Failed | QueryOutcome::TimedOut => {
                                     IconName::CircleAlert
                                 }
-                                QueryOutcome::Cancelled => IconName::Square,
-                                QueryOutcome::NotRun => IconName::Code,
+                                QueryOutcome::Cancelled => IconName::CircleStop,
+                                QueryOutcome::NotRun => IconName::CircleDashed,
                             }
                         })
-                        .small(),
+                        .small()
+                        .text_color(outcome_color),
                     )
                     .child(self.status.clone()),
             )
@@ -2477,8 +2563,411 @@ impl Document {
         } else {
             selected
         };
-        let sections = TabBar::new("table-sections")
+        let filter_count = options.filter.as_ref().map(filter_conditions).unwrap_or(0);
+        let busy = self.busy();
+        let data = *section == Section::Data;
+        if !data {
+            return div().into_any_element();
+        }
+        let toolbar = h_flex()
+            .gap_1()
+            .flex_wrap()
+            .justify_between()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .child(
+                        Button::new("toggle-filter")
+                            .ghost()
+                            .small()
+                            .icon(IconName::ListFilter)
+                            .accessibility_label(if options.filter.is_some() {
+                                "Filter applied"
+                            } else {
+                                "Filter"
+                            })
+                            .selected(*filter_open)
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .child("Filter")
+                                    .when(filter_count > 0, |row| {
+                                        row.child(count_badge(filter_count, cx))
+                                    }),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let DocumentKind::Table {
+                                    filter_open,
+                                    filter,
+                                    filter_operator,
+                                    filter_apply_focus,
+                                    ..
+                                } = &mut this.kind
+                                {
+                                    *filter_open = !*filter_open;
+                                    if *filter_open {
+                                        if filter_operator.needs_value() {
+                                            filter.read(cx).focus_handle(cx).focus(window, cx);
+                                        } else {
+                                            filter_apply_focus.focus(window, cx);
+                                        }
+                                    }
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(self.column_toggle(cx))
+                    .child(self.named_view_controls(cx)),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .child(
+                        icon_button("refresh-table", IconName::RefreshCw, "Refresh table · F5")
+                            .small()
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
+                    )
+                    .child(
+                        icon_button(
+                            "open-table-sql",
+                            IconName::SquareCode,
+                            "Open as SQL · the loaded page, including its limit and offset",
+                        )
+                        .small()
+                        .disabled(busy || self.applied_browse.is_none())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_table_sql(window, cx)),
+                        ),
+                    )
+                    .child(self.data_actions(cx))
+                    .child(toolbar_divider(cx))
+                    .child(
+                        Button::new("row-actions")
+                            .ghost()
+                            .small()
+                            .label(if selected > 1 {
+                                format!("{selected} rows")
+                            } else {
+                                "Row actions".into()
+                            })
+                            .accessibility_label("Row actions")
+                            .dropdown_caret(true)
+                            .tooltip(format!(
+                                "{selected} selected · Edit: Ctrl+E · Inspect: Alt+Enter"
+                            ))
+                            .disabled(busy || selected == 0)
+                            .dropdown_menu({
+                                let view = cx.entity();
+                                move |menu, _, cx| {
+                                    view.update(cx, |_, cx| {
+                                        menu.item(
+                                            menu_item("Inspect", IconName::ScanText)
+                                                .disabled(selected != 1)
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.inspect(window, cx)
+                                                })),
+                                        )
+                                        .item(
+                                            menu_item("Edit row…", IconName::Pencil)
+                                                .disabled(!editable || selected != 1)
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.edit_row(false, window, cx)
+                                                })),
+                                        )
+                                        .item(
+                                            menu_item("Filter by this value", IconName::ListFilter)
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.filter_from_cell(window, cx)
+                                                })),
+                                        )
+                                        .separator()
+                                        .item(
+                                            menu_item("Open referenced row…", IconName::ArrowRight)
+                                                .disabled(selected != 1)
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.related_rows(false, window, cx)
+                                                })),
+                                        )
+                                        .item(
+                                            menu_item("Find referencing rows…", IconName::Search)
+                                                .disabled(selected != 1)
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.related_rows(true, window, cx)
+                                                })),
+                                        )
+                                        .separator()
+                                        .item(
+                                            super::controls::destructive_menu_item(
+                                                if selected == 1 {
+                                                    "Delete row…".to_owned()
+                                                } else {
+                                                    format!("Delete {selected} rows…")
+                                                },
+                                                !editable,
+                                            )
+                                            .on_click(
+                                                cx.listener(|this, _, window, cx| {
+                                                    this.delete_rows(window, cx)
+                                                }),
+                                            ),
+                                        )
+                                    })
+                                }
+                            }),
+                    )
+                    .child(
+                        Button::new("insert")
+                            .small()
+                            .outline()
+                            .icon(IconName::Plus)
+                            .label("Insert row")
+                            .disabled(!writable)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.edit_row(true, window, cx)),
+                            ),
+                    ),
+            );
+        let applied = options
+            .filter
+            .as_ref()
+            .filter(|_| !*filter_open)
+            .map(|filter| {
+                filter.summary(
+                    &page
+                        .as_ref()
+                        .map(|page| page.metadata.clone())
+                        .unwrap_or_default(),
+                    sqlite,
+                )
+            });
+        let has_chips =
+            options.relationship.is_some() || applied.is_some() || !options.sort.is_empty();
+        let chips =
+            h_flex()
+                .gap_1p5()
+                .flex_wrap()
+                .when_some(options.relationship.as_ref(), |row, scope| {
+                    row.child(
+                        chip(cx)
+                            .child(
+                                Icon::new(IconName::Link)
+                                    .xsmall()
+                                    .text_color(super::theme::accent_text(cx)),
+                            )
+                            .child(div().text_ellipsis().child(scope.label()))
+                            .child(
+                                icon_button(
+                                    "clear-relationship",
+                                    IconName::X,
+                                    "Clear relationship filter",
+                                )
+                                .xsmall()
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.set_relationship(None);
+                                        cx.emit(DocumentChanged);
+                                        this.refresh(window, cx);
+                                    },
+                                )),
+                            ),
+                    )
+                })
+                .when_some(applied, |row, summary| {
+                    let tooltip = summary.clone();
+                    row.child(
+                        chip(cx)
+                            .max_w(px(560.))
+                            .child(
+                                Icon::new(IconName::ListFilter)
+                                    .xsmall()
+                                    .text_color(super::theme::accent_text(cx)),
+                            )
+                            .child(
+                                div()
+                                    .id("applied-filter")
+                                    .min_w_0()
+                                    .text_ellipsis()
+                                    .child(summary)
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(tooltip.clone()).build(window, cx)
+                                    }),
+                            )
+                            .child(
+                                icon_button("clear-applied-filter", IconName::X, "Clear filter")
+                                    .xsmall()
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.clear_filter(window, cx)
+                                    })),
+                            ),
+                    )
+                })
+                .child(self.sort_controls(cx));
+        let mut panel = v_flex()
+            .flex_shrink_0()
+            .px_4()
+            .pb_2()
+            .gap_2()
+            .child(toolbar)
+            .when(has_chips, |view| view.child(chips))
+            .child(self.column_controls(cx));
+        if *filter_open {
+            let column_picker = choice(
+                Button::new("filter-column")
+                    .small()
+                    .outline()
+                    .w_full()
+                    .disabled(busy || page.is_none())
+                    .accessibility_label(format!("Filter column: {column}"))
+                    .label(column.clone())
+                    .tooltip(column),
+                *filter_column,
+                page.as_ref()
+                    .map(|page| {
+                        page.metadata
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .map(|(i, col)| (i, SharedString::from(col.name.clone())))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                cx.listener(|this, index, _, cx| {
+                    if let DocumentKind::Table {
+                        filter_column,
+                        filter_operator,
+                        page,
+                        ..
+                    } = &mut this.kind
+                    {
+                        *filter_column = *index;
+                        let kind = page
+                            .as_ref()
+                            .and_then(|page| page.metadata.columns.get(*index))
+                            .map(|column| {
+                                column.filter_kind(matches!(
+                                    this.profile.config,
+                                    ConnectionConfig::Sqlite { .. }
+                                ))
+                            })
+                            .unwrap_or(FilterKind::Text);
+                        if !kind.operators().contains(filter_operator) {
+                            *filter_operator = kind.default_operator();
+                        }
+                    }
+                    cx.notify();
+                }),
+            );
+            let operator_picker = choice(
+                Button::new("filter-operator")
+                    .small()
+                    .outline()
+                    .disabled(busy || page.is_none())
+                    .accessibility_label(format!(
+                        "Filter operator: {}",
+                        filter_operator.label(filter_kind)
+                    ))
+                    .label(filter_operator.label(filter_kind)),
+                *filter_operator,
+                filter_kind
+                    .operators()
+                    .iter()
+                    .map(|operator| (*operator, SharedString::from(operator.label(filter_kind)))),
+                cx.listener(|this, operator, window, cx| {
+                    if let DocumentKind::Table {
+                        filter_operator,
+                        filter,
+                        filter_apply_focus,
+                        ..
+                    } = &mut this.kind
+                    {
+                        *filter_operator = *operator;
+                        if operator.needs_value() {
+                            filter.read(cx).focus_handle(cx).focus(window, cx);
+                        } else {
+                            filter_apply_focus.focus(window, cx);
+                        }
+                    }
+                    cx.notify();
+                }),
+            );
+            panel = panel.child(
+                v_flex()
+                    .p_3()
+                    .gap_3()
+                    .rounded(cx.theme().radius_lg)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().muted)
+                    .child(self.filter_tree(cx))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(div().w(px(160.)).max_w_full().child(column_picker))
+                            .child(operator_picker)
+                            .when(filter_operator.needs_value(), |row| {
+                                row.child(
+                                    div().flex_1().min_w(px(140.)).child(
+                                        Input::new(filter)
+                                            .id("filter-value")
+                                            .small()
+                                            .aria_label("Filter value"),
+                                    ),
+                                )
+                            })
+                            .child(
+                                Button::new("add-filter-condition")
+                                    .small()
+                                    .outline()
+                                    .icon(IconName::Plus)
+                                    .label("Add condition")
+                                    .accessibility_label("Add / replace condition")
+                                    .tooltip("Adds to the selected group, or replaces the selected condition")
+                                    .disabled(busy || page.is_none())
+                                    .on_click(cx.listener(|this, _, _, cx| this.add_filter_condition(cx))),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .when(options.filter.is_some(), |row| {
+                                row.child(
+                                    Button::new("clear-filter")
+                                        .ghost()
+                                        .small()
+                                        .label("Clear filter")
+                                        .disabled(busy)
+                                        .on_click(cx.listener(|this, _, window, cx| this.clear_filter(window, cx))),
+                                )
+                            })
+                            .child(
+                                Button::new("apply-filter")
+                                    .track_focus(filter_apply_focus)
+                                    .small()
+                                    .primary()
+                                    .label("Apply")
+                                    .tooltip("Apply filter · Enter")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|this, _, window, cx| this.apply_filter(window, cx))),
+                            ),
+                    ),
+            );
+        }
+        panel.into_any_element()
+    }
+
+    fn table_sections(&self, cx: &mut Context<Self>) -> AnyElement {
+        let DocumentKind::Table { section, .. } = &self.kind else {
+            return div().into_any_element();
+        };
+        TabBar::new("table-sections")
             .segmented()
+            .small()
             .selected_index(match section {
                 Section::Data => 0,
                 Section::Structure => 1,
@@ -2500,312 +2989,33 @@ impl Document {
                 }
                 this.update_grid(cx);
                 cx.notify();
-            }));
-        v_flex()
-            .flex_shrink_0()
-            .px_4()
-            .pb_2()
-            .when_some(options.relationship.as_ref(), |view, scope| {
-                view.child(
-                    h_flex()
-                        .gap_2()
-                        .flex_wrap()
-                        .child(div().text_sm().child(scope.label()))
-                        .child(
-                            Button::new("clear-relationship")
-                                .ghost()
-                                .small()
-                                .label("Clear relationship filter")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.set_relationship(None);
-                                    cx.emit(DocumentChanged);
-                                    this.refresh(window, cx);
-                                })),
-                        ),
-                )
-            })
-            .child(
-                h_flex()
-                    .gap_3()
-                    .flex_wrap()
-                    .justify_between()
-                    .child(div().min_w(px(270.)).child(sections))
-                    .when(*section == Section::Data, |view| {
-                        view.child(
-                            h_flex()
-                                .gap_2()
-                                .flex_wrap()
-                                .child(
-                                    Button::new("open-table-sql").label("Open SQL").small()
-                                        .disabled(self.busy() || self.applied_browse.is_none())
-                                        .tooltip("Open editable SQL for the loaded page, including its limit and offset")
-                                        .on_click(cx.listener(|this,_,window,cx| this.open_table_sql(window,cx))))
-                                .child(
-                                    Button::new("toggle-filter")
-                                        .ghost()
-                                        .icon(IconName::ListFilter)
-                                        .label(if options.filter.is_some() {
-                                            "Filter applied"
-                                        } else {
-                                            "Filter"
-                                        })
-                                        .selected(*filter_open || options.filter.is_some())
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            if let DocumentKind::Table {
-                                                filter_open,
-                                                filter,
-                                                filter_operator,
-                                                filter_apply_focus,
-                                                ..
-                                            } = &mut this.kind
-                                            {
-                                                *filter_open = !*filter_open;
-                                                if *filter_open {
-                                                    if filter_operator.needs_value() {
-                                                        filter
-                                                            .read(cx)
-                                                            .focus_handle(cx)
-                                                            .focus(window, cx);
-                                                    } else {
-                                                        filter_apply_focus.focus(window, cx);
-                                                    }
-                                                }
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    icon_button(
-                                        "refresh-table",
-                                        IconName::RefreshCw,
-                                        "Refresh table · F5",
-                                    )
-                                    .disabled(self.busy())
-                                    .on_click(
-                                        cx.listener(|this, _, window, cx| this.refresh(window, cx)),
-                                    ),
-                                )
-                                .child(self.data_actions(cx))
-                                .child(Button::new("row-actions").ghost().label("Row actions")
-                                    .tooltip(format!("{selected} selected · Edit: Ctrl+E · Inspect: Alt+Enter"))
-                                    .disabled(self.busy() || selected==0)
-                                    .dropdown_menu({
-                                        let view=cx.entity();
-                                        move |menu,_,cx| view.update(cx,|_,cx| menu
-                                            .item(menu_item("Inspect",IconName::ScanText).disabled(selected!=1)
-                                                .on_click(cx.listener(|this,_,window,cx|this.inspect(window,cx))))
-                                            .item(menu_item("Edit row…",IconName::Pencil).disabled(!editable || selected!=1)
-                                                .on_click(cx.listener(|this,_,window,cx|this.edit_row(false,window,cx))))
-                                            .separator()
-                                            .item(menu_item("Open referenced row…",IconName::ArrowRight).disabled(selected!=1)
-                                                .on_click(cx.listener(|this,_,window,cx|this.related_rows(false,window,cx))))
-                                            .item(menu_item("Find referencing rows…",IconName::Search).disabled(selected!=1)
-                                                .on_click(cx.listener(|this,_,window,cx|this.related_rows(true,window,cx))))
-                                            .separator()
-                                            .item(super::controls::destructive_menu_item(if selected==1 {"Delete row…".to_owned()} else {format!("Delete {selected} rows…")},!editable)
-                                                .on_click(cx.listener(|this,_,window,cx|this.delete_rows(window,cx)))))
-                                    }))
-                                .child(
-                                    Button::new("insert")
-                                        .icon(IconName::Plus)
-                                        .label("Insert row")
-                                        .disabled(!writable)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.edit_row(true, window, cx)
-                                        })),
-                                ),
-                        )
-                    }),
-            )
-            .when(*section == Section::Data, |view| view.child(self.named_view_controls(cx)).child(self.sort_controls(cx)).child(self.column_controls(cx)))
-            .when(*section == Section::Data && *filter_open, |view| {
-                let view = view.child(self.filter_tree(cx));
-                let column_picker = choice(
-                    Button::new("filter-column")
-                        .small()
-                        .w_full()
-                        .disabled(self.busy() || page.is_none())
-                        .accessibility_label(format!("Filter column: {column}"))
-                        .label(column.clone())
-                        .tooltip(column),
-                    *filter_column,
-                    page.as_ref()
-                        .map(|page| {
-                            page.metadata
-                                .columns
-                                .iter()
-                                .enumerate()
-                                .map(|(i, col)| (i, SharedString::from(col.name.clone())))
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default(),
-                    cx.listener(|this, index, _, cx| {
-                        if let DocumentKind::Table {
-                            filter_column,
-                            filter_operator,
-                            page,
-                            ..
-                        } = &mut this.kind
-                        {
-                            *filter_column = *index;
-                            let kind = page
-                                .as_ref()
-                                .and_then(|page| page.metadata.columns.get(*index))
-                                .map(|column| {
-                                    column.filter_kind(matches!(
-                                        this.profile.config,
-                                        ConnectionConfig::Sqlite { .. }
-                                    ))
-                                })
-                                .unwrap_or(FilterKind::Text);
-                            if !kind.operators().contains(filter_operator) {
-                                *filter_operator = kind.default_operator();
-                            }
-                        }
-                        cx.notify();
-                    }),
-                );
-                let operator_picker = choice(
-                    Button::new("filter-operator")
-                        .small()
-                        .disabled(self.busy() || page.is_none())
-                        .accessibility_label(format!(
-                            "Filter operator: {}",
-                            filter_operator.label(filter_kind)
-                        ))
-                        .label(filter_operator.label(filter_kind)),
-                    *filter_operator,
-                    filter_kind.operators().iter().map(|operator| {
-                        (*operator, SharedString::from(operator.label(filter_kind)))
-                    }),
-                    cx.listener(|this, operator, window, cx| {
-                        if let DocumentKind::Table {
-                            filter_operator,
-                            filter,
-                            filter_apply_focus,
-                            ..
-                        } = &mut this.kind
-                        {
-                            *filter_operator = *operator;
-                            if operator.needs_value() {
-                                filter.read(cx).focus_handle(cx).focus(window, cx);
-                            } else {
-                                filter_apply_focus.focus(window, cx);
-                            }
-                        }
-                        cx.notify();
-                    }),
-                );
-                view.child(
-                    h_flex()
-                        .mt_2()
-                        .p_2()
-                        .gap_2()
-                        .flex_wrap()
-                        .rounded(cx.theme().radius)
-                        .bg(cx.theme().muted)
-                        .child(div().w(px(140.)).max_w_full().child(column_picker))
-                        .child(operator_picker)
-                        .when(filter_operator.needs_value(), |row| {
-                            row.child(
-                                div().flex_1().min_w(px(120.)).child(
-                                    Input::new(filter)
-                                        .id("filter-value")
-                                        .small()
-                                        .aria_label("Filter value"),
-                                ),
-                            )
-                        })
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .flex_shrink_0()
-                                .child(
-                                    Button::new("add-filter-condition").small().label("Add / replace condition").disabled(self.busy() || page.is_none()).on_click(cx.listener(|this, _, _, cx| this.add_filter_condition(cx)))
-                                )
-                                .child(
-                                    Button::new("apply-filter")
-                                        .track_focus(filter_apply_focus)
-                                        .small()
-                                        .primary()
-                                        .label("Apply")
-                                        .tooltip("Apply filter · Enter")
-                                        .disabled(self.busy())
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.apply_filter(window, cx)
-                                        })),
-                                )
-                                .when(options.filter.is_some(), |row| {
-                                    row.child(
-                                        icon_button("clear-filter", IconName::X, "Clear filter")
-                                            .small()
-                                            .disabled(self.busy())
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.clear_filter(window, cx)
-                                            })),
-                                    )
-                                }),
-                        ),
-                )
-            })
-            .when(*section == Section::Data && !*filter_open, |view| {
-                view.when_some(options.filter.as_ref(), |view, filter| {
-                    let summary = filter.summary(&page.as_ref().map(|page| page.metadata.clone()).unwrap_or_default(), sqlite);
-                    view.child(
-                        h_flex()
-                            .pt_2()
-                            .gap_2()
-                            .child(Icon::new(IconName::ListFilter).small())
-                            .child(
-                                div()
-                                    .id("applied-filter")
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_sm()
-                                    .text_ellipsis()
-                                    .child(summary.clone())
-                                    .tooltip(move |window, cx| {
-                                        Tooltip::new(summary.clone()).build(window, cx)
-                                    }),
-                            )
-                            .child(
-                                Button::new("clear-applied-filter")
-                                    .ghost()
-                                    .small()
-                                    .label("Clear filter")
-                                    .disabled(self.busy())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.clear_filter(window, cx)
-                                    })),
-                            ),
-                    )
-                })
-            })
-            .when(
-                *section == Section::Data && !editable && page.is_some(),
-                |view| {
-                    view.child(
-                        div()
-                            .pt_2()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(
-                                if self
-                                    .session
-                                    .as_ref()
-                                    .is_some_and(|session| session.read_only())
-                                {
-                                    "Generated changes blocked by connection policy"
-                                } else if !table.is_table() {
-                                    "Views are read-only"
-                                } else {
-                                    "Editing and deleting rows requires a primary key"
-                                },
-                            ),
-                    )
-                },
-            )
+            }))
             .into_any_element()
+    }
+
+    fn read_only_reason(&self) -> Option<&'static str> {
+        let DocumentKind::Table {
+            table,
+            page: Some(page),
+            section: Section::Data,
+            ..
+        } = &self.kind
+        else {
+            return None;
+        };
+        if self.can_insert() && page.metadata.editable(table) {
+            None
+        } else if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.read_only())
+        {
+            Some("Generated changes blocked by connection policy")
+        } else if !table.is_table() {
+            Some("Views are read-only")
+        } else {
+            Some("Editing and deleting rows requires a primary key")
+        }
     }
 
     fn table_footer(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2843,27 +3053,44 @@ impl Document {
         } else {
             self.status.clone()
         };
+        let read_only = self.read_only_reason();
         h_flex()
             .gap_2()
             .px_4()
-            .py_2()
+            .py_1p5()
             .flex_wrap()
             .border_t_1()
             .border_color(cx.theme().border)
             .child(
-                div()
+                h_flex()
                     .flex_1()
+                    .min_w_0()
+                    .gap_3()
                     .text_xs()
-                    .font_family(cx.theme().mono_font_family.clone())
                     .text_color(cx.theme().muted_foreground)
-                    .child(summary),
+                    .child(
+                        div()
+                            .font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
+                            .child(summary),
+                    )
+                    .when_some(read_only, |row, reason| {
+                        row.child(
+                            h_flex()
+                                .id("read-only-reason")
+                                .min_w_0()
+                                .gap_1()
+                                .child(Icon::new(IconName::Lock).xsmall())
+                                .child(div().text_ellipsis().child(reason)),
+                        )
+                    }),
             )
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap_1()
                     .flex_wrap()
                     .child(
                         icon_button("previous", IconName::ChevronLeft, "Previous page")
+                            .small()
                             .disabled(self.busy() || options.offset == 0)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if let DocumentKind::Table { options, .. } = &mut this.kind {
@@ -2873,12 +3100,13 @@ impl Document {
                                 this.refresh(window, cx);
                             })),
                     )
-                    .child(div().text_sm().child(format!(
+                    .child(div().text_xs().px_1().child(format!(
                         "Page {}",
                         options.offset / u64::from(options.limit) + 1,
                     )))
                     .child(
                         icon_button("next", IconName::ChevronRight, "Next page")
+                            .small()
                             .disabled(
                                 self.busy()
                                     || page.as_ref().is_none_or(|page| {
@@ -2915,6 +3143,15 @@ impl Document {
                     )),
             )
             .into_any_element()
+    }
+}
+
+fn filter_conditions(filter: &FilterExpression) -> usize {
+    match filter {
+        FilterExpression::Predicate(_) => 1,
+        FilterExpression::All(children) | FilterExpression::Any(children) => {
+            children.iter().map(filter_conditions).sum()
+        }
     }
 }
 
@@ -3007,23 +3244,40 @@ impl Render for Document {
             )
             .child(
                 h_flex()
-                    .gap_3()
+                    .gap_x_4()
+                    .gap_y_2()
                     .flex_shrink_0()
                     .flex_wrap()
                     .min_h(px(56.))
                     .px_4()
-                    .py_2()
+                    .pt_3()
+                    .pb_2()
                     .child(
                         v_flex()
                             .flex_1()
-                            .min_w(px(140.))
+                            .min_w(px(160.))
                             .gap_0p5()
                             .child(
-                                div()
-                                    .text_base()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_ellipsis()
-                                    .child(self.table_ref().map(|table| table.name.clone()).unwrap_or_else(|| self.title())),
+                                h_flex()
+                                    .min_w_0()
+                                    .gap_2()
+                                    .child(
+                                        Icon::new(match self.table_ref() {
+                                            Some(table) if table.is_table() => IconName::Table2,
+                                            Some(_) => IconName::Eye,
+                                            None => IconName::SquareCode,
+                                        })
+                                        .small()
+                                        .text_color(super::theme::accent_text(cx)),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .text_base()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_ellipsis()
+                                            .child(self.table_ref().map(|table| table.name.clone()).unwrap_or_else(|| self.title())),
+                                    ),
                             )
                             .child(
                                 div()
@@ -3038,105 +3292,66 @@ impl Render for Document {
                                     }),
                             ),
                     )
-                    .when(matches!(self.kind, DocumentKind::Sql { .. }), |bar| {
-                        bar.child(self.query_actions(cx))
-                    })
-                    .when(matches!(self.kind, DocumentKind::Table { section, .. } if section != Section::Data), |bar| {
-                        bar.child(
-                            icon_button("refresh-metadata", IconName::RefreshCw, "Refresh table · F5")
-                                .disabled(self.busy())
-                                .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
-                        )
-                    })
-                    .when(
-                        self.session.is_none() && self.database_available && !self.busy(),
-                        |bar| {
-                            bar.child(
-                                Button::new("reconnect")
-                                    .small()
-                                    .label("Reconnect")
-                                    .on_click(
-                                        cx.listener(|this, _, window, cx| this.connect(window, cx)),
-                                    ),
-                            )
-                        },
-                    )
-                    .when(
-                        matches!(self.kind, DocumentKind::Sql { .. })
-                            && self.selected_row(cx).is_some(),
-                        |bar| {
-                            bar.child(
-                                icon_button(
-                                    "inspect-cell",
-                                    IconName::ScanText,
-                                    "Inspect cell · Alt+Enter",
-                                )
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.inspect(window, cx)),
-                                ),
-                            )
-                        },
-                    )
                     .child(
-                        icon_button("document-menu", IconName::Ellipsis, "Document actions")
-                            .dropdown_menu({
-                                let view = cx.entity();
-                                move |menu, _, cx| {
-                                    view.update(cx, |this, cx| {
-                                        let context = format!(
-                                            "{} / {}",
-                                            this.profile.display_name(),
-                                            this.profile.database()
-                                        );
-                                        let menu = menu
-                                            .item(
-                                                menu_item("New query on this database", IconName::Code)
-                                                    .disabled(!this.database_available)
-                                                    .on_click(cx.listener(|_, _, _, cx| {
-                                                        cx.emit(NewDocumentQuery)
-                                                    })),
+                        h_flex()
+                            .gap_1()
+                            .flex_wrap()
+                            .when(
+                                self.session.is_none() && self.database_available && !self.busy(),
+                                |bar| {
+                                    bar.child(
+                                        Button::new("reconnect")
+                                            .outline()
+                                            .small()
+                                            .icon(IconName::RefreshCw)
+                                            .label("Reconnect")
+                                            .on_click(
+                                                cx.listener(|this, _, window, cx| this.connect(window, cx)),
+                                            ),
+                                    )
+                                },
+                            )
+                            .when(matches!(self.kind, DocumentKind::Sql { .. }), |bar| {
+                                bar.child(self.transaction_controls(cx))
+                                    .child(toolbar_divider(cx))
+                                    .when(self.selected_row(cx).is_some(), |bar| {
+                                        bar.child(
+                                            icon_button(
+                                                "inspect-cell",
+                                                IconName::ScanText,
+                                                "Inspect cell · Alt+Enter",
                                             )
-                                            .item(
-                                                menu_item("Copy connection context", IconName::Copy)
-                                                    .on_click(move |_, _, cx| {
-                                                        cx.write_to_clipboard(
-                                                            ClipboardItem::new_string(
-                                                                context.clone(),
-                                                            ),
-                                                        )
-                                                    }),
-                                            )
-                                            .separator()
-                                            .item(
-                                                menu_item("Reconnect session", Icon::empty())
-                                                    .disabled(
-                                                        this.busy() || !this.database_available,
-                                                    )
-                                                    .on_click(cx.listener(
-                                                        |this, _, window, cx| {
-                                                            this.reconnect(window, cx);
-                                                        },
-                                                    )),
-                                            );
-                                        if let DocumentKind::Sql { editor } = &this.kind {
-                                            let sql = editor.read(cx).value().to_string();
-                                            menu.separator().item(
-                                                menu_item("Copy SQL", IconName::Copy)
-                                                    .on_click(move |_, _, cx| {
-                                                        cx.write_to_clipboard(
-                                                            ClipboardItem::new_string(sql.clone()),
-                                                        )
-                                                    }),
-                                            )
-                                        } else {
-                                            menu
-                                        }
+                                            .small()
+                                            .on_click(
+                                                cx.listener(|this, _, window, cx| this.inspect(window, cx)),
+                                            ),
+                                        )
                                     })
-                                }
+                                    .child(self.query_actions(cx))
+                            })
+                            .when(matches!(self.kind, DocumentKind::Table { .. }), |bar| {
+                                bar.child(self.table_sections(cx))
+                                    .when(matches!(self.kind, DocumentKind::Table { section, .. } if section != Section::Data), |bar| {
+                                        bar.child(
+                                            icon_button("refresh-metadata", IconName::RefreshCw, "Refresh table · F5")
+                                                .small()
+                                                .disabled(self.busy())
+                                                .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
+                                        )
+                                    })
+                                    .child(
+                                        icon_button("document-menu", IconName::Ellipsis, "Document actions")
+                                            .small()
+                                            .dropdown_menu({
+                                                let view = cx.entity();
+                                                move |menu, _, cx| {
+                                                    view.update(cx, |this, cx| this.session_menu(menu.min_w(px(224.)), cx))
+                                                }
+                                            }),
+                                    )
                             }),
                     ),
             )
-            .when(matches!(self.kind, DocumentKind::Sql { .. }), |view| view.child(self.transaction_toolbar(cx)))
             .child(self.grid_search.clone())
             .child(div().flex_1().min_h_0().overflow_hidden().child(content))
             .when(!self.error.is_empty(), |view| {

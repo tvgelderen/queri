@@ -11,6 +11,18 @@ const BRAND_ASSETS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/brand/queri-logo.svg"),
     ),
     (
+        "brand/queri-mark-body.svg",
+        include_bytes!("../assets/brand/queri-mark-body.svg"),
+    ),
+    (
+        "brand/queri-logo-body.svg",
+        include_bytes!("../assets/brand/queri-logo-body.svg"),
+    ),
+    (
+        "brand/queri-tail.svg",
+        include_bytes!("../assets/brand/queri-tail.svg"),
+    ),
+    (
         "brand/postgresql.svg",
         include_bytes!("../assets/brand/postgresql.svg"),
     ),

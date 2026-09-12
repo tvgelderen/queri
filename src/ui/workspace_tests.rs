@@ -1541,6 +1541,8 @@ async fn saved_library_sql_files_and_related_tabs_keep_work_separate(cx: &mut Te
             .unwrap(),
         0
     );
+    // Let the library dialog finish its exit transition before using the toolbar under it.
+    cx.executor().timer(Duration::from_millis(500)).await;
     let file = directory.path().join("import.sql");
     std::fs::write(&file, "SELECT 'imported';").unwrap();
     cx.update_window(window, |_, window, cx| {

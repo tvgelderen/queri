@@ -13,6 +13,18 @@ fn radius(cx: &App) -> Pixels {
     cx.theme().radius_lg.min(px(TAB_HEIGHT) / 3.)
 }
 
+/// The bar's bottom hairline. Render it before the tabs so the active tab can
+/// paint over it and open into the document below.
+pub fn tab_bar_baseline(cx: &App) -> Div {
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .h_px()
+        .bg(cx.theme().border)
+}
+
 pub fn document_tab_bar(
     scroll: &ScrollHandle,
     tabs: impl IntoIterator<Item = Tab>,
@@ -23,7 +35,6 @@ pub fn document_tab_bar(
         .flex()
         .items_center()
         .min_w_0()
-        .bg(cx.theme().tab_bar)
         .child(
             h_flex()
                 .relative()
@@ -88,19 +99,38 @@ pub fn document_tab(
                 .left(-radius(cx))
                 .right(-radius(cx))
                 .when(!selected, |view| {
-                    view.invisible()
+                    // Hover drops the flares so it never overlaps a neighbour, and stops
+                    // above the baseline, which stays visible.
+                    view.left_0()
+                        .right_0()
+                        .bottom(px(1.))
+                        .invisible()
                         .group_hover("document-tab", |style| style.visible())
+                        .child(div().size_full().rounded_t(radius(cx)).bg(
+                            if cx.theme().is_dark() {
+                                // Move toward the active tab without outshining it.
+                                cx.theme().tab_active.opacity(0.75)
+                            } else {
+                                cx.theme().secondary_hover
+                            },
+                        ))
                 })
-                .child(folder_tab_fill(
-                    radius(cx),
-                    if selected {
-                        cx.theme().tab_active
-                    } else {
-                        cx.theme().secondary_hover
-                    },
-                )),
+                .when(selected, |view| {
+                    view.child(folder_tab_fill(
+                        radius(cx),
+                        cx.theme().tab_active,
+                        cx.theme().border,
+                    ))
+                }),
         )
-        .child(Icon::new(icon).small().flex_shrink_0())
+        .child(
+            Icon::new(icon)
+                .small()
+                .flex_shrink_0()
+                .when(selected, |icon| {
+                    icon.text_color(super::theme::accent_text(cx))
+                }),
+        )
         .child(
             div()
                 .id("document-tab-title")
@@ -111,34 +141,51 @@ pub fn document_tab(
         )
 }
 
-// One outline for selection and hover, including the flared bottom corners.
-fn folder_tab_fill(radius: Pixels, background: Hsla) -> impl IntoElement {
+// The selected tab's surface, with flared bottom corners that open into the
+// document. Its hairline edge joins the bar's baseline on both sides.
+fn folder_tab_fill(radius: Pixels, background: Hsla, outline: Hsla) -> impl IntoElement {
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
             let (left, right) = (bounds.left(), bounds.right());
-            let (top, bottom) = (bounds.top(), bounds.bottom());
             let (tab_left, tab_right) = (left + radius, right - radius);
             let radii = point(radius, radius);
-            let mut path =
-                PathBuilder::fill().with_style(PathStyle::Fill(FillOptions::tolerance(0.02)));
-            path.move_to(point(left, bottom));
-            path.arc_to(
-                radii,
-                px(0.),
-                false,
-                false,
-                point(tab_left, bottom - radius),
+            let edge = |mut path: PathBuilder, top: Pixels, bottom: Pixels| {
+                path.move_to(point(left, bottom));
+                path.arc_to(
+                    radii,
+                    px(0.),
+                    false,
+                    false,
+                    point(tab_left, bottom - radius),
+                );
+                path.line_to(point(tab_left, top + radius));
+                path.arc_to(radii, px(0.), false, true, point(tab_left + radius, top));
+                path.line_to(point(tab_right - radius, top));
+                path.arc_to(radii, px(0.), false, true, point(tab_right, top + radius));
+                path.line_to(point(tab_right, bottom - radius));
+                path.arc_to(radii, px(0.), false, false, point(right, bottom));
+                path
+            };
+            let mut fill = edge(
+                PathBuilder::fill().with_style(PathStyle::Fill(FillOptions::tolerance(0.02))),
+                bounds.top(),
+                bounds.bottom(),
             );
-            path.line_to(point(tab_left, top + radius));
-            path.arc_to(radii, px(0.), false, true, point(tab_left + radius, top));
-            path.line_to(point(tab_right - radius, top));
-            path.arc_to(radii, px(0.), false, true, point(tab_right, top + radius));
-            path.line_to(point(tab_right, bottom - radius));
-            path.arc_to(radii, px(0.), false, false, point(right, bottom));
-            path.close();
-            if let Ok(path) = path.build() {
+            fill.close();
+            if let Ok(path) = fill.build() {
                 window.paint_path(path, background);
+            }
+            // Centre the hairline half a pixel inside the edge so its top is not
+            // clipped and its feet sit exactly on the 1px baseline.
+            if let Ok(path) = edge(
+                PathBuilder::stroke(px(1.)),
+                bounds.top() + px(0.5),
+                bounds.bottom() - px(0.5),
+            )
+            .build()
+            {
+                window.paint_path(path, outline);
             }
         },
     )

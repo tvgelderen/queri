@@ -738,10 +738,8 @@ impl Render for ConnectionForm {
         v_flex()
             .gap_4()
             .child(
-                v_flex().gap_1()
-                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Connect your database"))
-                    .child(div().text_sm().line_height(relative(1.5)).text_color(cx.theme().muted_foreground)
-                        .child("Choose a database type, then enter its connection details. Connection details are saved locally.")),
+                div().text_sm().line_height(relative(1.5)).text_color(cx.theme().muted_foreground)
+                    .child("Choose a database type, then enter its details. Everything is saved locally."),
             )
             .child(
                 TabBar::new("connection-provider")

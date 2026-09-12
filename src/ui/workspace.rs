@@ -4,13 +4,13 @@ use super::{
     connection_form::{ConnectionForm, SavedConnection},
     connection_picker::{ConnectionPicker, ConnectionPickerEvent},
     controls::{
-        brand_logo, brand_mark, destructive_menu_item, icon_button, menu_item, setting_switch,
-        shortcut,
+        brand_logo, brand_mark, destructive_menu_item, icon_button, menu_item, nav_button,
+        section_label, setting_switch, shortcut,
     },
     document::{
         ConnectionPasswordRequired, Document, DocumentChanged, NewDocumentQuery, ReconnectRequested,
     },
-    document_tabs::{document_tab, document_tab_bar},
+    document_tabs::{document_tab, document_tab_bar, tab_bar_baseline},
     draft_search::{DraftSearch, OpenDraftMatch},
     history::{History, NewHistoryQuery, ReplayQuery},
     table_finder::{OpenTable, TableFinder},
@@ -1858,19 +1858,71 @@ impl Workspace {
                                     .w_full()
                                     .gap_2()
                                     .pt_3()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("Saved connections"),
-                                    )
+                                    .child(section_label("Saved connections", cx))
                                     .children(self.profiles.iter().take(3).map(|profile| {
                                         let id = profile.id;
+                                        let logo = match profile.config {
+                                            ConnectionConfig::Postgres { .. } => {
+                                                "brand/postgresql.svg"
+                                            }
+                                            ConnectionConfig::Sqlite { .. } => "brand/sqlite.svg",
+                                        };
                                         Button::new(SharedString::from(format!(
                                             "welcome-connect-{id}"
                                         )))
-                                        .icon(IconName::Database)
-                                        .label(profile.name.clone())
+                                        .outline()
+                                        .w_full()
+                                        .h(px(56.))
+                                        .px_3()
+                                        .accessibility_label(format!(
+                                            "Connect to {}",
+                                            profile.display_name()
+                                        ))
+                                        .child(
+                                            h_flex()
+                                                .w_full()
+                                                .min_w_0()
+                                                .gap_3()
+                                                .child(
+                                                    svg()
+                                                        .path(logo)
+                                                        .size_6()
+                                                        .flex_shrink_0()
+                                                        .text_color(cx.theme().foreground),
+                                                )
+                                                .child(
+                                                    v_flex()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .items_start()
+                                                        .gap_0p5()
+                                                        .child(
+                                                            div()
+                                                                .text_sm()
+                                                                .font_weight(FontWeight::MEDIUM)
+                                                                .text_ellipsis()
+                                                                .child(profile.display_name()),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(
+                                                                    cx.theme().muted_foreground,
+                                                                )
+                                                                .text_ellipsis()
+                                                                .child(format!(
+                                                                    "{} · {}",
+                                                                    profile.provider(),
+                                                                    profile.database()
+                                                                )),
+                                                        ),
+                                                )
+                                                .child(
+                                                    Icon::new(IconName::ChevronRight)
+                                                        .small()
+                                                        .text_color(cx.theme().muted_foreground),
+                                                ),
+                                        )
                                         .tooltip(format!(
                                             "Connect to {} · {}",
                                             profile.name,
@@ -2082,7 +2134,7 @@ impl Render for Workspace {
                         }))
                         .when_some(object_icon, |row, icon| {
                             row.child(Icon::new(icon).small().text_color(if selected {
-                                cx.theme().foreground
+                                super::theme::accent_text(cx)
                             } else {
                                 cx.theme().muted_foreground
                             }))
@@ -2135,8 +2187,9 @@ impl Render for Workspace {
                     .gap_2p5()
                     .h_12()
                     .flex_shrink_0()
-                    .px_4()
-                    .child(div().flex_1().child(brand_logo(px(32.), cx)))
+                    .pl_4()
+                    .pr_2()
+                    .child(div().flex_1().child(brand_logo(px(26.), cx)))
                     .child(
                         icon_button("app-menu", IconName::Ellipsis, "Application menu")
                             .dropdown_menu({
@@ -2198,26 +2251,26 @@ impl Render for Workspace {
             )
             .child(
                 h_flex()
-                    .px_3()
-                    .pt_4()
-                    .pb_2()
+                    .h_8()
+                    .pl_4()
+                    .pr_2()
+                    .mt_4()
                     .gap_2()
                     .justify_between()
                     .child(
                         h_flex()
                             .gap_1p5()
-                            .text_sm()
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Databases"),
-                            )
+                            .child(section_label("Databases", cx))
                             .when(self.connection_state == ConnectionState::Ready, |heading| {
                                 heading.child(
                                     div()
+                                        .px_1p5()
+                                        .rounded(cx.theme().radius_tokens().sm)
+                                        .bg(cx.theme().secondary_hover)
+                                        .text_xs()
                                         .text_color(cx.theme().muted_foreground)
                                         .font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
-                                        .child(format!("({})", self.databases.len())),
+                                        .child(self.databases.len().to_string()),
                                 )
                             }),
                     )
@@ -2310,42 +2363,50 @@ impl Render for Workspace {
                         )
                     }),
             )
-            .child(div().px_3().child(Button::new("search-drafts").outline().icon(IconName::Search).label("Search SQL drafts")
-                .on_click(cx.listener(|this, _, window, cx| this.find_draft(window, cx)))))
-            .child(div().px_3().child(Button::new("saved-queries").outline().icon(IconName::Code).label("Saved queries")
-                .on_click(cx.listener(|this,_,window,cx|this.saved_queries(window,cx)))))
             .child(
-                h_flex()
-                    .px_3()
+                v_flex()
+                    .flex_shrink_0()
+                    .px_2()
                     .py_2()
-                    .gap_2()
+                    .gap_0p5()
+                    .border_t_1()
+                    .border_color(cx.theme().sidebar_border)
                     .child(
-                        div().flex_1().child(
-                            Button::new("history")
-                                .outline()
-                                .icon(IconName::Clock)
-                                .label("Query history")
-                                .selected(self.history.is_some())
-                                .disabled(self.selected.is_none())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.toggle_history(window, cx)
-                                })),
-                        ),
+                        nav_button("search-drafts", IconName::Search, "Search SQL drafts", Some("Ctrl+Shift+S"), cx)
+                            .on_click(cx.listener(|this, _, window, cx| this.find_draft(window, cx))),
                     )
                     .child(
-                        icon_button("preferences", IconName::Settings, "Preferences")
-                            .on_click(cx.listener(|this, _, window, cx| this.settings(window, cx))),
+                        nav_button("saved-queries", IconName::BookOpen, "Saved queries", None, cx)
+                            .on_click(cx.listener(|this, _, window, cx| this.saved_queries(window, cx))),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                div().flex_1().min_w_0().child(
+                                    nav_button("history", IconName::Clock, "Query history", Some("Ctrl+H"), cx)
+                                        .selected(self.history.is_some())
+                                        .disabled(self.selected.is_none())
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.toggle_history(window, cx)
+                                        })),
+                                ),
+                            )
+                            .child(
+                                icon_button("preferences", IconName::Settings, "Preferences")
+                                    .on_click(cx.listener(|this, _, window, cx| this.settings(window, cx))),
+                            ),
                     ),
             );
         let mut body = v_flex().size_full().min_w_0().child(
             h_flex()
+                .relative()
                 .min_w_0()
                 .h_10()
                 .items_end()
                 .flex_shrink_0()
                 .bg(cx.theme().tab_bar)
-                .border_b_1()
-                .border_color(cx.theme().border)
+                .child(tab_bar_baseline(cx))
                 .when(!self.documents.is_empty(), |bar| {
                     bar.child(
                         div().flex_1().min_w_0().child(
@@ -2384,14 +2445,19 @@ impl Render for Workspace {
                                         },
                                     ))
                                     .child(
-                                        Button::new(("close-tab", index))
-                                            .text()
-                                            .small()
-                                            .icon(IconName::X)
-                                            .accessibility_label(format!("Close {title}"))
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.close_document(index, window, cx)
-                                            })),
+                                        div().flex_shrink_0().child(
+                                            Button::new(("close-tab", index))
+                                                .text()
+                                                .xsmall()
+                                                .icon(IconName::X)
+                                                .accessibility_label(format!("Close {title}"))
+                                                .tooltip("Close · Ctrl+W")
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.close_document(index, window, cx)
+                                                    },
+                                                )),
+                                        ),
                                     )
                                 }),
                                 cx,
