@@ -200,6 +200,39 @@ impl Session {
         })
     }
 
+    pub async fn query_params(&self, query: crate::parameters::BoundQuery) -> Result<QueryOutput> {
+        let dialect = match self.backend {
+            Backend::Postgres(_) => crate::sql::SqlDialect::Postgres,
+            _ => crate::sql::SqlDialect::Sqlite,
+        };
+        let parameters = crate::parameters::discover(&query.sql, dialect)?;
+        let query = parameters.bind(query.values)?;
+        match &self.backend {
+            Backend::Postgres(_) => {
+                let values = query.values.into_iter().map(|v| match v {
+                    Cell::Null => Ok(None), Cell::Text(v) => Ok(Some(v)),
+                    _ => anyhow::bail!("PostgreSQL parameters require server text or NULL; use SQL casts for types."),
+                }).collect::<Result<Vec<_>>>()?;
+                self.query_postgres_params(query.sql, values).await
+            }
+            Backend::Sqlite { .. } => {
+                self.invalidate_completions();
+                let _invalidation = CompletionInvalidation(self);
+                let start = Instant::now();
+                let timeout = *self.timeout.lock().unwrap();
+                let sets = self
+                    .with_sqlite(move |conn| {
+                        sqlite::query_bound(conn, &query.sql, timeout, &query.values)
+                    })
+                    .await?;
+                Ok(QueryOutput {
+                    sets,
+                    elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                })
+            }
+        }
+    }
+
     pub async fn cancel(&self) -> Result<()> {
         match &self.backend {
             Backend::Postgres(pg) => pg

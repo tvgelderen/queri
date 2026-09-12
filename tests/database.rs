@@ -1695,3 +1695,111 @@ fn postgres_completion_busy_execution_never_queues_catalog_sql() -> Result<()> {
         Ok(())
     })
 }
+
+async fn parameter_execution(session: Arc<Session>, pg: bool) -> Result<()> {
+    use queri::{parameters::BoundQuery, sql::SqlDialect};
+    let dialect = if pg {
+        SqlDialect::Postgres
+    } else {
+        SqlDialect::Sqlite
+    };
+    let text = "雪'; DROP TABLE parameter_fixture; --";
+    session
+        .query("CREATE TEMP TABLE parameter_fixture(value text)".into())
+        .await?;
+    let sql = if pg {
+        "SELECT :value::text, :value::text, :empty::text, :null::text"
+    } else {
+        "SELECT :value, :value, :empty, :null"
+    };
+    let p = queri::parameters::discover(sql, dialect)?;
+    let out = session
+        .query_params(p.bind(vec![
+            Cell::Text(text.into()),
+            Cell::Text("".into()),
+            Cell::Null,
+        ])?)
+        .await?;
+    assert_eq!(
+        out.sets[0].rows[0],
+        vec![
+            Cell::Text(text.into()),
+            Cell::Text(text.into()),
+            Cell::Text("".into()),
+            Cell::Null
+        ]
+    );
+    assert!(
+        session
+            .query_params(BoundQuery {
+                sql: "INSERT INTO parameter_fixture VALUES(:x); DELETE FROM parameter_fixture"
+                    .into(),
+                values: vec![Cell::Text(text.into())]
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        session
+            .query_params(BoundQuery {
+                sql: "INSERT INTO parameter_fixture VALUES(:x)".into(),
+                values: vec![]
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        session
+            .query("SELECT * FROM parameter_fixture".into())
+            .await?
+            .sets[0]
+            .rows
+            .is_empty()
+    );
+    session.query("BEGIN".into()).await?;
+    session
+        .query_params(BoundQuery {
+            sql: "INSERT INTO parameter_fixture VALUES(:x)".into(),
+            values: vec![Cell::Text(text.into())],
+        })
+        .await?;
+    assert_eq!(session.transaction_status().await?, TransactionStatus::Open);
+    session.query("ROLLBACK".into()).await?;
+    if !pg {
+        let out = session
+            .query_params(BoundQuery {
+                sql: "SELECT ?1, ?2, ?3, ?1".into(),
+                values: vec![
+                    Cell::Integer(i64::MAX),
+                    Cell::Real(1.25),
+                    Cell::Blob(vec![0, 255]),
+                ],
+            })
+            .await?;
+        assert_eq!(
+            out.sets[0].rows[0],
+            vec![
+                Cell::Integer(i64::MAX),
+                Cell::Real(1.25),
+                Cell::Blob(vec![0, 255]),
+                Cell::Integer(i64::MAX)
+            ]
+        );
+        session.set_statement_timeout(StatementTimeout::custom(20)?)?;
+        let error = session.query_params(BoundQuery { sql: "WITH RECURSIVE n(x) AS (SELECT ?1 UNION ALL SELECT x+1 FROM n) SELECT sum(x) FROM n".into(), values: vec![Cell::Integer(1)] }).await.unwrap_err();
+        assert!(queri::database::is_statement_timeout(&error));
+    }
+    Ok(())
+}
+#[test]
+fn sqlite_parameter_execution() -> Result<()> {
+    runtime()?.block_on(async { parameter_execution(fixture().await?, false).await })
+}
+#[test]
+#[ignore = "requires QUERI_TEST_POSTGRES"]
+fn postgres_parameter_execution() -> Result<()> {
+    runtime()?.block_on(async {
+        let (p, password) = postgres_profile()?;
+        parameter_execution(Session::connect(p, password).await?, true).await
+    })
+}

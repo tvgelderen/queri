@@ -95,6 +95,16 @@ pub fn query(
     sql: &str,
     timeout: StatementTimeout,
 ) -> Result<Vec<ResultSet>> {
+    query_bound(conn, sql, timeout, &[])
+}
+
+pub fn query_bound(
+    conn: &mut Connection,
+    sql: &str,
+    timeout: StatementTimeout,
+    values: &[Cell],
+) -> Result<Vec<ResultSet>> {
+    let values: Vec<_> = values.iter().map(value).collect();
     let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let busy_ms = if timeout.duration().is_some() {
         Some(conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?)
@@ -133,7 +143,7 @@ pub fn query(
             let Some(mut stmt) = batch.next()? else {
                 return Ok(None);
             };
-            Ok(Some(result(&mut stmt, &[], &mut bytes, &mut count)?))
+            Ok(Some(result(&mut stmt, &values, &mut bytes, &mut count)?))
         })();
         match next {
             Ok(Some(set)) => sets.push(set),

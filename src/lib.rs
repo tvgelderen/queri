@@ -4,6 +4,7 @@ pub mod completion;
 pub mod database;
 pub mod export;
 pub mod model;
+pub mod parameters;
 pub mod sql;
 pub mod storage;
 pub mod ui;
