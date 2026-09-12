@@ -803,6 +803,17 @@ impl Workspace {
                 this.schedule_save(window, cx);
             },
         ));
+        self.subscriptions.push(cx.subscribe_in(
+            &doc,
+            window,
+            |this, doc, event: &super::document::OpenGeneratedSql, window, cx| {
+                let profile = doc.read(cx).profile.clone();
+                this.add_document(profile, None, event.0.sql.clone(), true, window, cx);
+                if let Some(target) = this.documents.last() {
+                    target.update(cx, |doc, _| doc.seed_generated_parameters(event.0.clone()));
+                }
+            },
+        ));
         self.documents.push(doc.clone());
         self.refresh_draft_search(window, cx);
         self.active = self.documents.len() - 1;

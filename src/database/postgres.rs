@@ -234,12 +234,16 @@ pub(super) async fn metadata(
     })
 }
 
-pub async fn browse(
+pub(super) async fn compile_browse(
     client: &Client,
     table: &TableRef,
     options: &BrowseOptions,
-) -> Result<TablePage> {
+) -> Result<super::BrowsePlan> {
     let metadata = metadata(client, table).await?;
+    ensure!(
+        !metadata.columns.is_empty(),
+        "The table is missing or has no accessible columns. Refresh the schema and reopen the table."
+    );
     let table_name = qualified(&table.schema, &table.name)?;
     let mut values = Vec::<String>::new();
     let mut filter = match &options.filter {
@@ -302,16 +306,12 @@ pub async fn browse(
         ),
         None => String::new(),
     };
-    let mut params: Vec<&(dyn ToSql + Sync)> = values
-        .iter()
-        .map(|value| value as &(dyn ToSql + Sync))
-        .collect();
     let relation = match &options.relationship {
-        Some(scope) => Some(relationship_predicate(client, table, scope, params.len() + 1).await?),
+        Some(scope) => Some(relationship_predicate(client, table, scope, values.len() + 1).await?),
         None => None,
     };
     if let Some((predicate, value)) = &relation {
-        params.push(value);
+        values.push(value.clone());
         filter.push_str(if filter.is_empty() {
             " WHERE "
         } else {
@@ -320,29 +320,46 @@ pub async fn browse(
         filter.push_str(predicate);
     }
     let sort = browse_ordering(&metadata, &options.sort)?;
-    let count: i64 = client
-        .query_one(
-            &format!("SELECT count(*) FROM {table_name}{filter}"),
-            &params,
-        )
-        .await
-        .context("Could not load rows. Check the filter operator and value.")?
-        .get(0);
     let columns = metadata
         .columns
         .iter()
         .map(|col| Ok(format!("{}::text", quote_identifier(&col.name)?)))
         .collect::<Result<Vec<_>>>()?
         .join(",");
-    let rows = client
-        .query(
-            &format!(
+    Ok(super::BrowsePlan {
+        metadata,
+        count_sql: format!("SELECT count(*) FROM {table_name}{filter}"),
+        query: crate::parameters::BoundQuery {
+            sql: format!(
                 "SELECT {columns} FROM {table_name}{filter}{sort} LIMIT {} OFFSET {}",
                 options.limit, options.offset
             ),
-            &params,
-        )
-        .await?;
+            values: values.into_iter().map(Cell::Text).collect(),
+        },
+    })
+}
+
+pub async fn browse(
+    client: &Client,
+    table: &TableRef,
+    options: &BrowseOptions,
+) -> Result<TablePage> {
+    let plan = compile_browse(client, table, options).await?;
+    let values = plan
+        .query
+        .values
+        .iter()
+        .map(|v| v.text())
+        .collect::<Vec<_>>();
+    let params: Vec<&(dyn ToSql + Sync)> =
+        values.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
+    let count: i64 = client
+        .query_one(&plan.count_sql, &params)
+        .await
+        .context("Could not load rows. Check the filter operator and value.")?
+        .get(0);
+    let rows = client.query(&plan.query.sql, &params).await?;
+    let metadata = plan.metadata;
     let mut data = ResultSet {
         columns: metadata
             .columns

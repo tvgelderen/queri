@@ -32,6 +32,15 @@ pub struct Parameters {
 }
 
 impl ParameterType {
+    pub fn for_cell(value: &Cell) -> Self {
+        match value {
+            Cell::Integer(_) => Self::Integer,
+            Cell::Real(_) => Self::Real,
+            Cell::Blob(_) => Self::Blob,
+            Cell::Text(_) | Cell::Null => Self::Text,
+        }
+    }
+
     pub fn parse(self, input: &str, null: bool) -> Result<Cell> {
         if null {
             return Ok(Cell::Null);
@@ -103,10 +112,11 @@ pub fn discover(sql: &str, dialect: SqlDialect) -> Result<Parameters> {
     } else {
         &SQLiteDialect {}
     };
-    let tokens = Tokenizer::new(dialect, sql)
+    let mut tokens = Vec::new();
+    let lexical_error = Tokenizer::new(dialect, sql)
         .with_unescape(false)
-        .tokenize_with_location()
-        .context("Finish the SQL literal or comment before entering parameters.")?;
+        .tokenize_with_location_into_buf(&mut tokens)
+        .err();
     // Tokenizer columns count Unicode scalars, including tabs as one column.
     let mut locations = std::collections::HashMap::new();
     let (mut line, mut column) = (1, 1);
@@ -132,6 +142,9 @@ pub fn discover(sql: &str, dialect: SqlDialect) -> Result<Parameters> {
     let mut statements = 0;
     let mut content = false;
     let mut i = 0;
+    let mut parentheses = 0usize;
+    let mut brackets: Vec<(bool, usize)> = Vec::new();
+    let mut previous: Option<&Token> = None;
     while i < tokens.len() {
         let token = &tokens[i];
         if token.token == Token::SemiColon {
@@ -147,10 +160,27 @@ pub fn discover(sql: &str, dialect: SqlDialect) -> Result<Parameters> {
             continue;
         }
         content = true;
+        match &token.token {
+            Token::LParen => parentheses += 1,
+            Token::RParen => parentheses = parentheses.saturating_sub(1),
+            Token::LBracket if pg => {
+                let constructor = matches!(previous, Some(Token::Word(word)) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("ARRAY"))
+                    || (matches!(previous, Some(Token::LBracket | Token::Comma))
+                        && brackets.last().is_some_and(|(subscript, _)| !subscript));
+                brackets.push((!constructor, parentheses));
+            }
+            Token::RBracket if pg => {
+                brackets.pop();
+            }
+            _ => {}
+        }
+        let slice_colon = brackets
+            .last()
+            .is_some_and(|(subscript, depth)| *subscript && *depth == parentheses);
         let start = offset(token.span.start)?;
         let mut end = offset(token.span.end)?;
         let found = match &token.token {
-            Token::Colon => {
+            Token::Colon if !slice_colon => {
                 if let Some(next) = tokens.get(i + 1) {
                     if let Token::Word(word) = &next.token {
                         if word.quote_style.is_none() && token.span.end == next.span.start {
@@ -212,10 +242,19 @@ pub fn discover(sql: &str, dialect: SqlDialect) -> Result<Parameters> {
             };
             replacements.push((start, end, format!("{}{index}", if pg { "$" } else { "?" })));
         }
+        previous = Some(&token.token);
         i += 1;
     }
     if content {
         statements += 1;
+    }
+    if let Some(error) = lexical_error {
+        // An unterminated literal/comment consumes the remaining source. With no
+        // binds before it, preserve the raw-script API's backend error/effect behavior.
+        ensure!(
+            names.is_empty() && error.message.starts_with("Unterminated"),
+            "Finish the SQL literal or comment before entering parameters: {error}"
+        );
     }
     if !names.is_empty() {
         ensure!(
@@ -289,6 +328,64 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.names, ["x"]);
+        assert!(
+            discover(
+                "select a[lower:upper], a[:upper] from t",
+                SqlDialect::Postgres
+            )
+            .unwrap()
+            .names
+            .is_empty()
+        );
+        assert_eq!(
+            discover("select ARRAY[:element], a[(:index)]", SqlDialect::Postgres)
+                .unwrap()
+                .names,
+            ["element", "index"]
+        );
+        assert!(
+            discover("select \"ARRAY\"[lower:upper] from t", SqlDialect::Postgres)
+                .unwrap()
+                .names
+                .is_empty()
+        );
+        assert_eq!(
+            discover("select ARRAY[[:x],[:y]]", SqlDialect::Postgres)
+                .unwrap()
+                .names,
+            ["x", "y"]
+        );
+        assert_eq!(
+            discover("select\t:é,\r\n:é, :next", SqlDialect::Postgres)
+                .unwrap()
+                .sql,
+            "select\t$1,\r\n$1, $2"
+        );
+        assert!(
+            discover(
+                "CREATE TABLE t(x); SELECT ':inside unfinished",
+                SqlDialect::Sqlite
+            )
+            .unwrap()
+            .names
+            .is_empty()
+        );
+        assert!(discover("select ?2, ?", SqlDialect::Sqlite).is_err());
+        assert_eq!(
+            discover("select ?1, ?, ?1, ?", SqlDialect::Sqlite)
+                .unwrap()
+                .names,
+            ["1", "2", "3"]
+        );
+        assert_eq!(
+            discover(
+                "select ':ignored' /* outer /* nested */ :no */ , :yes",
+                SqlDialect::Postgres
+            )
+            .unwrap()
+            .names,
+            ["yes"]
+        );
         assert_eq!(
             ParameterType::Text.parse("", false).unwrap(),
             Cell::Text("".into())

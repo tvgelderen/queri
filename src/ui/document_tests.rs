@@ -2620,7 +2620,6 @@ async fn parameter_form_keyboard_validation_cancel_and_privacy(cx: &mut TestAppC
         window.press("ctrl-enter", cx);
         window.click("cancel", cx);
         assert!(doc.read(cx).results.is_empty());
-        doc.update(cx, |doc, cx| doc.focus(window, cx));
         window.press("ctrl-enter", cx);
         window.click("parameter-value-0", cx);
         window.input("private 雪'; DELETE FROM items; --", cx);
@@ -2690,4 +2689,221 @@ async fn parameter_form_keyboard_validation_cancel_and_privacy(cx: &mut TestAppC
         assert_eq!(doc.read(cx).results[0].rows[0][3], Cell::Null);
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+async fn generated_sql_uses_successful_options_and_reports_schema_drift(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(true, cx);
+    let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let output = captured.clone();
+    let _subscription = cx.update(|cx| {
+        cx.subscribe(&doc, move |_, event: &super::OpenGeneratedSql, _| {
+            *output.borrow_mut() = Some(event.0.clone())
+        })
+    });
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| {
+            if let DocumentKind::Table { options, .. } = &mut doc.kind {
+                options.filter = Some(
+                    TableFilter {
+                        column: "name".into(),
+                        predicate: FilterPredicate::Equals("Alpha".into()),
+                    }
+                    .into(),
+                );
+                options.limit = 1;
+            }
+            doc.refresh(window, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, _| {
+            if let DocumentKind::Table {
+                filter_draft,
+                options,
+                ..
+            } = &mut doc.kind
+            {
+                *filter_draft = Some(Box::new(
+                    TableFilter {
+                        column: "name".into(),
+                        predicate: FilterPredicate::Equals("unapplied".into()),
+                    }
+                    .into(),
+                ));
+                options.sort = vec![("missing".into(), false)];
+            }
+        });
+        window.click("refresh-table", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| window.click("open-table-sql", cx))
+        .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, _| {
+        captured.borrow().is_some()
+    })
+    .await;
+    let query = captured.borrow_mut().take().unwrap();
+    assert_eq!(query.values, vec![Cell::Text("Alpha".into())]);
+    assert!(query.sql.ends_with("LIMIT 1 OFFSET 0"));
+    assert!(!query.sql.contains("missing"));
+    assert!(
+        fixture
+            .services
+            .store
+            .history(fixture.profile.id, "", 0)
+            .unwrap()
+            .is_empty()
+    );
+    fixture
+        .services
+        .runtime
+        .block_on(
+            fixture
+                .session
+                .query("ALTER TABLE items RENAME COLUMN name TO renamed".into()),
+        )
+        .unwrap();
+    cx.update_window(window, |_, window, cx| window.click("open-table-sql", cx))
+        .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    assert!(captured.borrow().is_none());
+    cx.update(|cx| assert!(doc.read(cx).error.contains("Repair the table view")));
+}
+
+#[gpui_kit::test]
+async fn parameter_definitions_reopen_edit_save_and_stale_session(cx: &mut TestAppContext) {
+    use crate::parameters::{Definition, ParameterType};
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let saved = fixture
+        .services
+        .store
+        .save_query(&SavedQuery {
+            parameters: vec![Definition {
+                name: "count".into(),
+                kind: ParameterType::Integer,
+            }],
+            id: Uuid::new_v4(),
+            name: "Typed query".into(),
+            sql: "SELECT :count".into(),
+            favorite: false,
+            connection_id: Some(fixture.profile.id),
+            database: fixture.profile.database(),
+            revision: 0,
+        })
+        .unwrap();
+    let (window, doc) = fixture.open(false, cx);
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| {
+            doc.sql_editor().unwrap().update(cx, |editor, cx| {
+                editor.set_value(saved.sql.clone(), window, cx)
+            });
+            doc.saved_query = Some(saved.clone());
+            doc.focus(window, cx);
+        });
+        window.press("ctrl-enter", cx);
+        assert_eq!(
+            window.find(("parameter-type", 0usize)).label(),
+            Some("Type: Integer")
+        );
+        window.click("parameter-value-0", cx);
+        window.input("42", cx);
+        window.click("ok", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(doc.read(cx).results[0].rows[0][0], Cell::Integer(42));
+        doc.update(cx, |doc, cx| {
+            doc.sql_editor().unwrap().update(cx, |editor, cx| {
+                editor.set_value("SELECT :count, :new", window, cx)
+            });
+        });
+        window.click("save-query", cx);
+        window.click("confirm-save-query", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        doc.read(cx).saved_query.as_ref().unwrap().revision == 2
+    })
+    .await;
+    let reopened = fixture
+        .services
+        .store
+        .saved_queries("", None)
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        reopened.parameters,
+        vec![
+            Definition {
+                name: "count".into(),
+                kind: ParameterType::Integer
+            },
+            Definition {
+                name: "new".into(),
+                kind: ParameterType::Text
+            }
+        ]
+    );
+    assert_eq!(reopened.sql, "SELECT :count, :new");
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| doc.focus(window, cx));
+        window.press("ctrl-enter", cx);
+        window.click("parameter-value-0", cx);
+        window.input("99", cx);
+        doc.update(cx, |doc, _| doc.session_generation += 1);
+        window.click("ok", cx);
+        assert!(!doc.read(cx).busy());
+        assert_eq!(doc.read(cx).results[0].rows[0][0], Cell::Integer(42));
+        doc.update(cx, |doc, cx| {
+            doc.sql_editor()
+                .unwrap()
+                .update(cx, |editor, cx| editor.set_value("SELECT :new", window, cx))
+        });
+        assert_eq!(
+            doc.read(cx).draft(cx).parameters,
+            vec![Definition {
+                name: "new".into(),
+                kind: ParameterType::Text
+            }]
+        );
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| {
+            doc.execute(
+                "CREATE TABLE raw_partial_effect(x); SELECT 'unfinished".into(),
+                window,
+                cx,
+            )
+        });
+        window.click("ok", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    assert!(
+        fixture
+            .services
+            .runtime
+            .block_on(
+                fixture
+                    .session
+                    .query("SELECT * FROM raw_partial_effect".into())
+            )
+            .is_ok()
+    );
 }

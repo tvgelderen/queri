@@ -250,8 +250,16 @@ pub(super) fn metadata(conn: &Connection, table: &TableRef) -> Result<TableMetad
     })
 }
 
-pub fn browse(conn: &Connection, table: &TableRef, options: &BrowseOptions) -> Result<TablePage> {
+pub(super) fn compile_browse(
+    conn: &Connection,
+    table: &TableRef,
+    options: &BrowseOptions,
+) -> Result<super::BrowsePlan> {
     let metadata = metadata(conn, table)?;
+    ensure!(
+        !metadata.columns.is_empty(),
+        "The table is missing or has no accessible columns. Refresh the schema and reopen the table."
+    );
     let qualified = qualified(&table.schema, &table.name)?;
     let mut values = vec![];
     let mut filter = match &options.filter {
@@ -315,29 +323,44 @@ pub fn browse(conn: &Connection, table: &TableRef, options: &BrowseOptions) -> R
         filter.push_str(&predicate);
     }
     let sort = browse_ordering(&metadata, &options.sort)?;
-    let total: i64 = conn.query_row(
-        &format!("SELECT count(*) FROM {qualified}{filter}"),
-        params_from_iter(&values),
-        |row| row.get(0),
-    )?;
     let names = metadata
         .columns
         .iter()
         .map(|col| quote_identifier(&col.name))
         .collect::<Result<Vec<_>>>()?
         .join(",");
-    let data = select(
-        conn,
-        &format!(
-            "SELECT {names} FROM {qualified}{filter}{sort} LIMIT {} OFFSET {}",
-            options.limit, options.offset
-        ),
-        &values,
-    )?;
+    Ok(super::BrowsePlan {
+        metadata,
+        count_sql: format!("SELECT count(*) FROM {qualified}{filter}"),
+        query: crate::parameters::BoundQuery {
+            sql: format!(
+                "SELECT {names} FROM {qualified}{filter}{sort} LIMIT {} OFFSET {}",
+                options.limit, options.offset
+            ),
+            values: values
+                .into_iter()
+                .map(|v| match v {
+                    Value::Null => Cell::Null,
+                    Value::Integer(v) => Cell::Integer(v),
+                    Value::Real(v) => Cell::Real(v),
+                    Value::Text(v) => Cell::Text(v),
+                    Value::Blob(v) => Cell::Blob(v),
+                })
+                .collect(),
+        },
+    })
+}
+
+pub fn browse(conn: &Connection, table: &TableRef, options: &BrowseOptions) -> Result<TablePage> {
+    let plan = compile_browse(conn, table, options)?;
+    let values: Vec<_> = plan.query.values.iter().map(value).collect();
+    let total: i64 =
+        conn.query_row(&plan.count_sql, params_from_iter(&values), |row| row.get(0))?;
+    let data = select(conn, &plan.query.sql, &values)?;
     Ok(TablePage {
         data,
         total: u64::try_from(total)?,
-        metadata,
+        metadata: plan.metadata,
     })
 }
 

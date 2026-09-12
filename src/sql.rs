@@ -137,6 +137,11 @@ mod format_tests {
         let fixtures = [
             (
                 SqlDialect::Postgres,
+                "select :name::text, :name::text, :number::integer",
+            ),
+            (SqlDialect::Sqlite, "select ?2, ?1, ?2, :name"),
+            (
+                SqlDialect::Postgres,
                 "-- keep this\nselect 'é;--x' as \"Odd Name\", $1::numeric;",
             ),
             (

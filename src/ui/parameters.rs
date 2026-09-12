@@ -28,21 +28,83 @@ impl ParameterForm {
 }
 impl Render for ParameterForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().gap_3().child(if self.postgres { "PostgreSQL infers types. Use SQL casts where needed. Values stay in memory." } else { "Choose a SQLite value type. Empty text and NULL are different. Values stay in memory." })
-            .child(v_flex().id("parameter-fields").max_h(px(360.)).overflow_y_scroll().gap_2().children(self.fields.iter().enumerate().map(|(index, field)| {
-                h_flex().gap_2().child(div().w(px(100.)).child(field.definition.name.clone()))
-                    .when(!self.postgres, |row| row.child(choice(Button::new(("parameter-type",index)).label(format!("Type: {:?}",field.definition.kind)),field.definition.kind,
-                        vec![(ParameterType::Text,"Text".into()),(ParameterType::Integer,"Integer".into()),(ParameterType::Real,"Real".into()),(ParameterType::Blob,"Blob (hex)".into())],
-                        cx.listener(move |this,kind,_,cx| { this.fields[index].definition.kind=*kind; cx.notify(); }))))
-                    .child(Button::new(("parameter-null",index)).label("NULL").selected(field.null).on_click(cx.listener(move |this,_,_,cx| { this.fields[index].null=!this.fields[index].null; cx.notify(); })))
-                    .child(Input::new(&field.input).id(SharedString::from(format!("parameter-value-{index}"))).disabled(field.null).aria_label(format!("Value for {}",field.definition.name)))
-            })))
-            .child(div().id("parameter-error").test_support().role(Role::Alert).aria_label(self.error.clone()).text_color(cx.theme().danger).child(self.error.clone()))
+        let help = if self.postgres {
+            "PostgreSQL infers types. Use SQL casts where needed. Values stay in memory."
+        } else {
+            "Choose a SQLite value type. Empty text and NULL are different. Values stay in memory."
+        };
+        let fields = self.fields.iter().enumerate().map(|(index, field)| {
+            h_flex()
+                .gap_2()
+                .child(div().w(px(100.)).child(field.definition.name.clone()))
+                .when(!self.postgres, |row| {
+                    row.child(choice(
+                        Button::new(("parameter-type", index))
+                            .label(format!("Type: {:?}", field.definition.kind)),
+                        field.definition.kind,
+                        vec![
+                            (ParameterType::Text, "Text".into()),
+                            (ParameterType::Integer, "Integer".into()),
+                            (ParameterType::Real, "Real".into()),
+                            (ParameterType::Blob, "Blob (hex)".into()),
+                        ],
+                        cx.listener(move |this, kind, _, cx| {
+                            this.fields[index].definition.kind = *kind;
+                            cx.notify();
+                        }),
+                    ))
+                })
+                .child(
+                    Button::new(("parameter-null", index))
+                        .label("NULL")
+                        .selected(field.null)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.fields[index].null = !this.fields[index].null;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Input::new(&field.input)
+                        .id(SharedString::from(format!("parameter-value-{index}")))
+                        .disabled(field.null)
+                        .aria_label(format!("Value for {}", field.definition.name)),
+                )
+        });
+        v_flex()
+            .gap_3()
+            .child(help)
+            .child(
+                v_flex()
+                    .id("parameter-fields")
+                    .max_h(px(360.))
+                    .overflow_y_scroll()
+                    .gap_2()
+                    .children(fields),
+            )
+            .child(
+                div()
+                    .id("parameter-error")
+                    .test_support()
+                    .role(Role::Alert)
+                    .aria_label(self.error.clone())
+                    .text_color(cx.theme().danger)
+                    .child(self.error.clone()),
+            )
     }
 }
+
 impl Document {
     pub(in crate::ui) fn set_parameter_definitions(&mut self, definitions: Vec<Definition>) {
         self.parameter_definitions = definitions;
+    }
+    pub(super) fn submission_snapshot(&self, cx: &App) -> Option<(String, String)> {
+        self.sql_editor().map(|editor| {
+            let editor = editor.read(cx);
+            (
+                editor.value().to_string(),
+                editor.selected_value().to_string(),
+            )
+        })
     }
     pub(super) fn parameter_dialect(&self) -> sql::SqlDialect {
         if matches!(self.profile.config, ConnectionConfig::Sqlite { .. }) {
@@ -86,12 +148,7 @@ impl Document {
                     if postgres {
                         definition.kind = ParameterType::Text;
                     } else if let Some(value) = value {
-                        definition.kind = match value {
-                            Cell::Integer(_) => ParameterType::Integer,
-                            Cell::Real(_) => ParameterType::Real,
-                            Cell::Blob(_) => ParameterType::Blob,
-                            _ => ParameterType::Text,
-                        };
+                        definition.kind = ParameterType::for_cell(value);
                     }
                     let text = match value {
                         Some(Cell::Blob(bytes)) => {
@@ -112,7 +169,7 @@ impl Document {
         });
         let view = cx.entity();
         let generation = self.session_generation;
-        let editor_sql = self.sql_editor().map(|e| e.read(cx).value().to_string());
+        let editor_sql = self.submission_snapshot(cx);
         window.open_alert_dialog(cx, move |dialog, _, _| {
             let (view, form, sql, editor_sql) =
                 (view.clone(), form.clone(), sql.clone(), editor_sql.clone());
@@ -140,7 +197,7 @@ impl Document {
                             false
                         }
                         Ok(values) => {
-                            let definitions = form
+                            let definitions: Vec<Definition> = form
                                 .read(cx)
                                 .fields
                                 .iter()
@@ -150,10 +207,18 @@ impl Document {
                             window.close_dialog(cx);
                             view.update(cx, |this, cx| {
                                 if this.session_generation == generation
-                                    && this.sql_editor().map(|e| e.read(cx).value().to_string())
-                                        == editor_sql
+                                    && this.submission_snapshot(cx) == editor_sql
                                 {
-                                    this.parameter_definitions = definitions;
+                                    let mut all_definitions = this.parameter_definitions(cx);
+                                    for definition in definitions {
+                                        if let Some(existing) = all_definitions
+                                            .iter_mut()
+                                            .find(|d| d.name == definition.name)
+                                        {
+                                            *existing = definition;
+                                        }
+                                    }
+                                    this.parameter_definitions = all_definitions;
                                     cx.emit(DocumentChanged);
                                     this.focus(window, cx);
                                     this.submit_sql(sql.clone(), Some(values), window, cx);

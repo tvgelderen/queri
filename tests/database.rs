@@ -724,12 +724,12 @@ fn sqlite_relationship_navigation_preserves_composite_keys_and_affinity() -> Res
         assert_eq!(keys.len(),1);
         assert_eq!(keys[0].columns[0].target,"tenant");
         let outgoing=RelationshipScope { key:keys[0].clone(),incoming:false,values:vec![Cell::Text("01".into()),Cell::Text("alpha".into())] };
-        let result=session.browse(outgoing.destination().clone(),BrowseOptions{relationship:Some(outgoing),..page()}).await?;
+        let result=compare_generated_page(&session,outgoing.destination().clone(),BrowseOptions{relationship:Some(outgoing),..page()}).await?;
         assert_eq!(result.total,1);assert_eq!(result.data.rows[0][0],Cell::Text("Alpha".into()));
         let incoming=RelationshipScope {key:keys[0].clone(),incoming:true,values:vec![Cell::Integer(1),Cell::Text("Alpha".into())]};
-        let result=session.browse(child.clone(),BrowseOptions{relationship:Some(incoming.clone()),..page()}).await?;
+        let result=compare_generated_page(&session,child.clone(),BrowseOptions{relationship:Some(incoming.clone()),..page()}).await?;
         assert_eq!(result.total,1);assert_eq!(result.data.rows[0][0],Cell::Integer(1));
-        let filtered=session.browse(child.clone(),BrowseOptions{relationship:Some(incoming),filter:Some(TableFilter{column:"id".into(),predicate:FilterPredicate::Equals("2".into())}.into()),..page()}).await?;
+        let filtered=compare_generated_page(&session,child.clone(),BrowseOptions{relationship:Some(incoming),filter:Some(TableFilter{column:"id".into(),predicate:FilterPredicate::Equals("2".into())}.into()),..page()}).await?;
         assert_eq!(filtered.total,0);
         Ok(())
     })
@@ -751,10 +751,10 @@ fn postgres_relationship_navigation_uses_native_key_types() -> Result<()> {
         let keys=session.foreign_keys(child.clone(),false).await?;
         assert_eq!(keys.len(),1);
         let scope=RelationshipScope{key:keys[0].clone(),incoming:false,values:vec![Cell::Text("1".into()),Cell::Text("12345678-1234-1234-1234-123456789abc".into())]};
-        let result=session.browse(scope.destination().clone(),BrowseOptions{relationship:Some(scope.clone()),..page()}).await?;
+        let result=compare_generated_page(&session,scope.destination().clone(),BrowseOptions{relationship:Some(scope.clone()),..page()}).await?;
         assert_eq!(result.total,1);
         let incoming=RelationshipScope{incoming:true,..scope};
-        assert_eq!(session.browse(child,BrowseOptions{relationship:Some(incoming),..page()}).await?.total,1);
+        assert_eq!(compare_generated_page(&session,child,BrowseOptions{relationship:Some(incoming),..page()}).await?.total,1);
         session.query(format!("DROP SCHEMA {schema} CASCADE")).await?;
         Ok(())
     })
@@ -1412,6 +1412,20 @@ fn postgres_safeguards_defaults_overrides_boundaries_and_reconnect() -> Result<(
     })
 }
 
+async fn compare_generated_page(
+    session: &Session,
+    table: TableRef,
+    options: BrowseOptions,
+) -> Result<TablePage> {
+    let query = session.browse_sql(table.clone(), options.clone()).await?;
+    let page = session.browse(table, options).await?;
+    let generated = session.query_params(query).await?;
+    assert_eq!(generated.sets.len(), 1);
+    assert_eq!(generated.sets[0].columns, page.data.columns);
+    assert_eq!(generated.sets[0].rows, page.data.rows);
+    Ok(page)
+}
+
 async fn grouped_views(session: &Session, schema: &str) -> Result<()> {
     let table = TableRef {
         schema: schema.into(),
@@ -1439,75 +1453,75 @@ async fn grouped_views(session: &Session, schema: &str) -> Result<()> {
         ..Default::default()
     };
     for (offset, expected) in [(0, ("1", "1")), (1, ("1", "2")), (2, ("2", "1"))] {
-        let result = session
-            .browse(
-                table.clone(),
-                BrowseOptions {
-                    offset,
-                    ..options.clone()
-                },
-            )
-            .await?;
+        let result = compare_generated_page(
+            session,
+            table.clone(),
+            BrowseOptions {
+                offset,
+                ..options.clone()
+            },
+        )
+        .await?;
         assert_eq!(result.total, 3);
         assert_eq!(
             (result.data.rows[0][0].text(), result.data.rows[0][1].text()),
             (expected.0.into(), expected.1.into())
         );
     }
-    let result = session
-        .browse(
-            table.clone(),
-            BrowseOptions {
-                filter: Some(leaf(
-                    "label",
-                    FilterPredicate::Equals("x' OR 1=1 --".into()),
-                )),
-                ..page()
-            },
-        )
-        .await?;
+    let result = compare_generated_page(
+        session,
+        table.clone(),
+        BrowseOptions {
+            filter: Some(leaf(
+                "label",
+                FilterPredicate::Equals("x' OR 1=1 --".into()),
+            )),
+            ..page()
+        },
+    )
+    .await?;
     assert_eq!(result.total, 1);
-    let result = session
-        .browse(
-            table.clone(),
-            BrowseOptions {
-                filter: Some(FilterExpression::All(vec![
-                    leaf("label", FilterPredicate::NotEquals("beta".into())),
-                    leaf("amount", FilterPredicate::LessThan("20".into())),
-                ])),
-                ..page()
-            },
-        )
-        .await?;
+    let result = compare_generated_page(
+        session,
+        table.clone(),
+        BrowseOptions {
+            filter: Some(FilterExpression::All(vec![
+                leaf("label", FilterPredicate::NotEquals("beta".into())),
+                leaf("amount", FilterPredicate::LessThan("20".into())),
+            ])),
+            ..page()
+        },
+    )
+    .await?;
     assert_eq!(result.total, 2, "negative comparisons exclude NULL");
     for filter in [
         FilterExpression::Any(vec![]),
         leaf("missing", FilterPredicate::IsNull),
     ] {
         assert!(
-            session
-                .browse(
-                    table.clone(),
-                    BrowseOptions {
-                        filter: Some(filter),
-                        ..page()
-                    }
-                )
-                .await
-                .is_err()
-        );
-    }
-    assert!(
-        session
-            .browse(
-                table,
+            compare_generated_page(
+                session,
+                table.clone(),
                 BrowseOptions {
-                    sort: vec![("missing".into(), false)],
+                    filter: Some(filter),
                     ..page()
                 }
             )
             .await
             .is_err()
+        );
+    }
+    assert!(
+        compare_generated_page(
+            session,
+            table,
+            BrowseOptions {
+                sort: vec![("missing".into(), false)],
+                ..page()
+            }
+        )
+        .await
+        .is_err()
     );
     session.query(format!("CREATE TABLE {schema}.view_parent(tenant INTEGER, id INTEGER, PRIMARY KEY(tenant,id)); CREATE TABLE {schema}.view_child(id INTEGER PRIMARY KEY, tenant INTEGER, parent INTEGER, FOREIGN KEY(tenant,parent) REFERENCES {schema}.view_parent(tenant,id)); INSERT INTO {schema}.view_parent VALUES(1,1),(2,1); INSERT INTO {schema}.view_child VALUES(1,1,1),(2,2,1),(3,NULL,NULL);").replace("REFERENCES main.", "REFERENCES ")).await?;
     let child = TableRef {
@@ -1516,23 +1530,23 @@ async fn grouped_views(session: &Session, schema: &str) -> Result<()> {
         kind: RelationKind::Table,
     };
     let key = session.foreign_keys(child.clone(), false).await?.remove(0);
-    let scoped = session
-        .browse(
-            child,
-            BrowseOptions {
-                relationship: Some(RelationshipScope {
-                    key,
-                    incoming: true,
-                    values: vec![Cell::Integer(1), Cell::Integer(1)],
-                }),
-                filter: Some(FilterExpression::Any(vec![
-                    leaf("id", FilterPredicate::Equals("1".into())),
-                    leaf("id", FilterPredicate::Equals("2".into())),
-                ])),
-                ..page()
-            },
-        )
-        .await?;
+    let scoped = compare_generated_page(
+        session,
+        child,
+        BrowseOptions {
+            relationship: Some(RelationshipScope {
+                key,
+                incoming: true,
+                values: vec![Cell::Integer(1), Cell::Integer(1)],
+            }),
+            filter: Some(FilterExpression::Any(vec![
+                leaf("id", FilterPredicate::Equals("1".into())),
+                leaf("id", FilterPredicate::Equals("2".into())),
+            ])),
+            ..page()
+        },
+    )
+    .await?;
     assert_eq!(
         scoped.total, 1,
         "relationship scope must AND the entire OR group"
@@ -1801,5 +1815,92 @@ fn postgres_parameter_execution() -> Result<()> {
     runtime()?.block_on(async {
         let (p, password) = postgres_profile()?;
         parameter_execution(Session::connect(p, password).await?, true).await
+    })
+}
+
+async fn quoted_generated_sql(session: &Session, schema: &str) -> Result<()> {
+    let name = "odd\" 雪 table";
+    let qualified = queri::sql::qualified(schema, name)?;
+    session.query(format!("CREATE TABLE {qualified}(\"key\" INTEGER PRIMARY KEY, \"a'b 雪\" TEXT, \"order\" INTEGER); INSERT INTO {qualified} VALUES(1,'雪''; --',2),(2,'雪''; --',2),(3,NULL,1),(4,'',3)")).await?;
+    let table = TableRef {
+        schema: schema.into(),
+        name: name.into(),
+        kind: RelationKind::Table,
+    };
+    let options = BrowseOptions {
+        filter: Some(FilterExpression::Any(vec![
+            TableFilter {
+                column: "a'b 雪".into(),
+                predicate: FilterPredicate::Equals("雪'; --".into()),
+            }
+            .into(),
+            TableFilter {
+                column: "a'b 雪".into(),
+                predicate: FilterPredicate::IsNull,
+            }
+            .into(),
+        ])),
+        sort: vec![("order".into(), false)],
+        limit: 1,
+        offset: 1,
+        relationship: None,
+    };
+    let query = session.browse_sql(table.clone(), options.clone()).await?;
+    assert!(!query.sql.contains("雪'; --"));
+    let result = compare_generated_page(session, table.clone(), options).await?;
+    assert_eq!(result.data.rows.len(), 1);
+    compare_generated_page(session, table, page()).await?;
+    session.query(format!("DROP TABLE {qualified}")).await?;
+    Ok(())
+}
+#[test]
+fn sqlite_generated_quoted_sql() -> Result<()> {
+    runtime()?.block_on(async {
+        let session = fixture().await?;
+        quoted_generated_sql(&session,"main").await?;
+        session.query("CREATE TABLE blob_parent(k BLOB PRIMARY KEY); CREATE TABLE blob_child(id INTEGER PRIMARY KEY, k BLOB REFERENCES blob_parent(k)); INSERT INTO blob_parent VALUES(X'00ff'); INSERT INTO blob_child VALUES(1,X'00ff')".into()).await?;
+        let table = TableRef {schema:"main".into(),name:"blob_child".into(),kind:RelationKind::Table};
+        let key = session.foreign_keys(table.clone(),false).await?.remove(0);
+        compare_generated_page(&session,table,BrowseOptions {relationship:Some(RelationshipScope {key,incoming:true,values:vec![Cell::Blob(vec![0,255])]}),..page()}).await?;
+        Ok(())
+    })
+}
+#[test]
+#[ignore = "requires QUERI_TEST_POSTGRES"]
+fn postgres_generated_quoted_sql() -> Result<()> {
+    runtime()?.block_on(async {
+        let (profile, password) = postgres_profile()?;
+        let session = Session::connect(profile, password).await?;
+        session
+            .query("CREATE TEMP TABLE initialize_temp(n integer)".into())
+            .await?;
+        let schema = session
+            .query("SELECT nspname FROM pg_namespace WHERE oid=pg_my_temp_schema()".into())
+            .await?
+            .sets[0]
+            .rows[0][0]
+            .text();
+        quoted_generated_sql(&session, &schema).await
+    })
+}
+
+#[test]
+fn sqlite_parameter_limits_and_cancel() -> Result<()> {
+    use queri::parameters::BoundQuery;
+    runtime()?.block_on(async {
+        let session = fixture().await?;
+        let query = BoundQuery {sql:"WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x < :limit) SELECT x FROM n".into(),values:vec![Cell::Integer(11000)]};
+        let result = session.query_params(query).await?;
+        assert!(result.sets[0].truncated);
+        assert_eq!(result.sets[0].rows.len(),MAX_RESULT_ROWS);
+        assert_eq!(result.sets[0].affected,11000);
+        let running = session.clone();
+        let query = tokio::spawn(async move { running.query_params(BoundQuery {sql:"WITH RECURSIVE n(x) AS (SELECT :start UNION ALL SELECT x+1 FROM n) SELECT sum(x) FROM n".into(),values:vec![Cell::Integer(1)]}).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        session.cancel().await?;
+        assert!(tokio::time::timeout(Duration::from_secs(5),query).await??.is_err());
+        assert_eq!(session.transaction_status().await?,TransactionStatus::Idle);
+        assert_eq!(session.query_params(BoundQuery {sql:"SELECT :x".into(),values:vec![Cell::Integer(42)]}).await?.sets[0].rows[0][0],Cell::Integer(42));
+        Ok(())
     })
 }

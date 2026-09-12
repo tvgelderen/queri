@@ -25,8 +25,11 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::{sync::Arc, time::Instant};
 
+#[path = "generated_sql.rs"]
+mod generated_sql;
 #[path = "named_table_views.rs"]
 mod named_table_views;
+pub use generated_sql::OpenGeneratedSql;
 #[path = "parameters.rs"]
 mod parameters;
 #[path = "table_views.rs"]
@@ -150,6 +153,7 @@ pub struct Document {
     pub saved_query: Option<SavedQuery>,
     pub statement_timeout: StatementTimeout,
     timeout_input: Entity<InputState>,
+    applied_browse: Option<BrowseOptions>,
     parameter_definitions: Vec<crate::parameters::Definition>,
     pub(super) parameter_seed: Option<crate::parameters::BoundQuery>,
     formatting: bool,
@@ -311,6 +315,7 @@ impl Document {
             saved_query: None,
             statement_timeout: StatementTimeout::Inherit,
             timeout_input: cx.new(|cx| InputState::new(window, cx).placeholder("Milliseconds")),
+            applied_browse: None,
             parameter_definitions: vec![],
             parameter_seed: None,
             formatting: false,
@@ -390,6 +395,7 @@ impl Document {
     ) {
         self.profile = profile.for_database(&self.profile.database());
         self.password = Some(password);
+        self.applied_browse = None;
         self.parameter_seed = None;
         self.session_generation += 1;
         self.operation = Operation::Idle;
@@ -404,6 +410,7 @@ impl Document {
         self.database_available = true;
     }
     pub fn disconnect(&mut self, cx: &mut Context<Self>) {
+        self.applied_browse = None;
         self.parameter_seed = None;
         self.session_generation += 1;
         self.operation = Operation::Idle;
@@ -451,6 +458,7 @@ impl Document {
         self.error.clear();
         self.status = "Connecting…".into();
         let profile = self.profile.clone();
+        self.applied_browse = None;
         self.parameter_seed = None;
         self.session_generation += 1;
         let generation = self.session_generation;
@@ -543,6 +551,7 @@ impl Document {
             options.offset = 0;
         }
         let filtered = options.filter.is_some();
+        let applied_options = options.clone();
         self.operation = Operation::Running;
         self.error.clear();
         self.status = "Loading table…".into();
@@ -576,6 +585,7 @@ impl Document {
                 this.operation = Operation::Idle;
                 match result {
                     Ok(page) => {
+                        this.applied_browse = Some(applied_options);
                         this.status = format!(
                             "{} matching rows{}",
                             page.total,
@@ -825,7 +835,7 @@ impl Document {
         if self.profile.policy == ExecutionPolicy::ConfirmExecutions || destructive {
             let view = cx.entity();
             let generation = self.session_generation;
-            let editor_sql = self.sql_editor().map(|e| e.read(cx).value().to_string());
+            let editor_sql = self.submission_snapshot(cx);
             let context = self.profile.context();
             let preview: String = sql.chars().take(2000).collect();
             let preview = if preview.len() < sql.len() {
@@ -864,8 +874,7 @@ impl Document {
                     .on_ok(move |_, window, cx| {
                         view.update(cx, |this, cx| {
                             if this.session_generation == generation
-                                && this.sql_editor().map(|e| e.read(cx).value().to_string())
-                                    == editor_sql
+                                && this.submission_snapshot(cx) == editor_sql
                             {
                                 this.execute_confirmed(sql.clone(), params.clone(), window, cx);
                             }
@@ -2526,6 +2535,11 @@ impl Document {
                             h_flex()
                                 .gap_2()
                                 .flex_wrap()
+                                .child(
+                                    Button::new("open-table-sql").label("Open SQL").small()
+                                        .disabled(self.busy() || self.applied_browse.is_none())
+                                        .tooltip("Open editable SQL for the loaded page, including its limit and offset")
+                                        .on_click(cx.listener(|this,_,window,cx| this.open_table_sql(window,cx))))
                                 .child(
                                     Button::new("toggle-filter")
                                         .ghost()

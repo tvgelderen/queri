@@ -1608,6 +1608,48 @@ async fn saved_library_sql_files_and_related_tabs_keep_work_separate(cx: &mut Te
             serde_json::from_str(&serde_json::to_string(&draft).unwrap()).unwrap();
         assert_eq!(restored.relationship, target.relationship().cloned());
         window.render_frame(cx);
+        window.click("open-table-sql", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace
+            .read(cx)
+            .documents
+            .last()
+            .is_some_and(|doc| doc.read(cx).table_ref().is_none() && !doc.read(cx).busy())
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        let doc = workspace.read(cx).documents.last().unwrap().clone();
+        assert_eq!(doc.read(cx).profile.id, profile.id);
+        assert_eq!(doc.read(cx).profile.database(), profile.database());
+        assert!(doc.read(cx).draft(cx).sql.contains("LIMIT 100 OFFSET 0"));
+        assert!(doc.read(cx).parameter_seed.is_some());
+        assert!(store.history(profile.id, "", 0).unwrap().is_empty());
+        doc.update(cx, |doc, cx| doc.focus(window, cx));
+        window.press("ctrl-enter", cx);
+        window.click("ok", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        !workspace.read(cx).documents.last().unwrap().read(cx).busy()
+    })
+    .await;
+    assert_eq!(store.history(profile.id, "", 0).unwrap().len(), 1);
+    cx.update_window(window, |_, window, cx| {
+        assert!(
+            window
+                .find("table-cell-0:1")
+                .label()
+                .unwrap()
+                .contains("Alice")
+        );
+        workspace.update(cx, |this, cx| {
+            this.active = this.documents.len() - 2;
+            this.documents[this.active].update(cx, |doc, cx| doc.focus(window, cx));
+            cx.notify();
+        });
+        window.render_frame(cx);
         window.click("clear-relationship", cx);
     })
     .unwrap();
@@ -1616,7 +1658,7 @@ async fn saved_library_sql_files_and_related_tabs_keep_work_separate(cx: &mut Te
             workspace
                 .read(cx)
                 .documents
-                .last()
+                .get(workspace.read(cx).active)
                 .unwrap()
                 .read(cx)
                 .relationship()

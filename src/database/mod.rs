@@ -31,6 +31,12 @@ enum Backend {
     },
 }
 
+struct BrowsePlan {
+    metadata: TableMetadata,
+    count_sql: String,
+    query: crate::parameters::BoundQuery,
+}
+
 impl Session {
     pub async fn connect(profile: ConnectionProfile, password: String) -> Result<Arc<Self>> {
         profile.validate()?;
@@ -308,6 +314,33 @@ impl Session {
             Backend::Sqlite { .. } => {
                 self.with_sqlite(move |conn| sqlite::browse(conn, &table, &options))
                     .await
+            }
+        }
+    }
+
+    /// SQL and in-memory binds for precisely the requested page; column layout is presentation-only.
+    pub async fn browse_sql(
+        &self,
+        table: TableRef,
+        options: BrowseOptions,
+    ) -> Result<crate::parameters::BoundQuery> {
+        anyhow::ensure!(
+            (1..=1000).contains(&options.limit),
+            "Page size must be 1–1000 rows."
+        );
+        match &self.backend {
+            Backend::Postgres(pg) => {
+                Ok(
+                    postgres::compile_browse(&*pg.client.lock().await, &table, &options)
+                        .await?
+                        .query,
+                )
+            }
+            Backend::Sqlite { .. } => {
+                self.with_sqlite(move |conn| {
+                    Ok(sqlite::compile_browse(conn, &table, &options)?.query)
+                })
+                .await
             }
         }
     }
