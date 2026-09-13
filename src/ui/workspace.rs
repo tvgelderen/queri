@@ -994,7 +994,9 @@ impl Workspace {
         // Preserve immediate tab and form interactions when no transaction can be lost.
         if documents.iter().all(|doc| {
             let doc = doc.read(cx);
-            !doc.busy() && (doc.session.is_none() || doc.transaction == TransactionStatus::Idle)
+            !doc.busy()
+                && !doc.has_edits(cx)
+                && (doc.session.is_none() || doc.transaction == TransactionStatus::Idle)
         }) {
             complete(self, window, cx);
         } else {

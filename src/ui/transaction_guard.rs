@@ -15,6 +15,24 @@ pub(super) fn release<V: 'static>(
     cx: &mut Context<V>,
     complete: impl FnOnce(&mut V, &mut Window, &mut Context<V>) + 'static,
 ) {
+    if let Some(doc) = documents
+        .iter()
+        .find(|doc| doc.read(cx).has_edits(cx) && !doc.read(cx).busy())
+        .cloned()
+    {
+        let services = services.clone();
+        let owner = cx.entity();
+        doc.update(cx, |doc, cx| {
+            doc.resolve_edits(window, cx, move |_, window, cx| {
+                window.defer(cx, move |window, cx| {
+                    owner.update(cx, |_, cx| {
+                        release(&services, documents, window, cx, complete)
+                    });
+                });
+            })
+        });
+        return;
+    }
     if documents.iter().any(|doc| doc.read(cx).releasing) {
         return;
     }

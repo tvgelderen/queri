@@ -7,5 +7,6 @@ cargo test --locked --features test-support
 if [[ -n ${QUERI_TEST_POSTGRES:-} ]]; then
   cargo test --locked --features test-support --lib postgres_ -- --include-ignored
   cargo test --locked --test database postgres_ -- --include-ignored
+  cargo test --locked --test table_tools postgres_ -- --include-ignored
 fi
 desktop-file-validate packaging/dev.queri.Queri.desktop

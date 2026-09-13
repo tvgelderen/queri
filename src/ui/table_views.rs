@@ -556,11 +556,13 @@ impl Document {
                     .child("Columns")
                     .when(hidden > 0, |row| row.child(count_badge(hidden, cx))),
             )
-            .on_click(cx.listener(|this, _, _, cx| {
-                if let DocumentKind::Table { columns_open, .. } = &mut this.kind {
-                    *columns_open = !*columns_open;
-                }
-                cx.notify();
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.resolve_edits(window, cx, |this, _, cx| {
+                    if let DocumentKind::Table { columns_open, .. } = &mut this.kind {
+                        *columns_open = !*columns_open;
+                    }
+                    cx.notify();
+                });
             }))
             .into_any_element()
     }

@@ -839,7 +839,7 @@ async fn format_selection_keeps_surrounding_sql(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-async fn selecting_a_cell_keeps_the_grid_stable_and_double_click_inspects_it(
+async fn selecting_a_cell_stays_stable_double_click_edits_and_shortcut_inspects(
     cx: &mut TestAppContext,
 ) {
     cx.executor().allow_parking();
@@ -854,6 +854,15 @@ async fn selecting_a_cell_keeps_the_grid_stable_and_double_click_inspects_it(
         window.render_frame(cx);
         assert_eq!(window.find("table-cell-0:2").bounds(), before);
         window.double_click("table-cell-0:2", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.try_find("inline-cell-input").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.press("escape", cx);
+        window.press("alt-enter", cx);
     })
     .unwrap();
     cx.wait_for(window, Duration::from_secs(5), |window, _| {
@@ -2913,4 +2922,126 @@ async fn parameter_definitions_reopen_edit_save_and_stale_session(cx: &mut TestA
             )
             .is_ok()
     );
+}
+
+#[gpui_kit::test]
+async fn inline_edits_stage_guard_refresh_and_save(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(true, cx);
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        matches!(
+            &doc.read(cx).kind,
+            DocumentKind::Table { page: Some(_), .. }
+        )
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| {
+            doc.grid.update(cx, |grid, cx| {
+                grid.set_selected_cell(0, 2, cx);
+                grid.focus_handle(cx).focus(window, cx);
+            })
+        });
+        window.render_frame(cx);
+        window.press("f2", cx);
+        window.render_frame(cx);
+        assert!(doc.read(cx).grid.read(cx).delegate().editor.is_some());
+        window.press("ctrl-a", cx);
+        window.input("Staged", cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        !doc.read(cx).edits.rows.is_empty()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        assert!(doc.read(cx).grid.read(cx).delegate().editor.is_none());
+        window.press("f5", cx);
+        window.render_frame(cx);
+        window.click("guard-cancel-edits", cx);
+        assert_eq!(doc.read(cx).edits.rows.len(), 1);
+    })
+    .unwrap();
+    assert_eq!(
+        fixture
+            .services
+            .runtime
+            .block_on(fixture.session.query("SELECT name FROM items".into()))
+            .unwrap()
+            .sets[0]
+            .rows[0][0]
+            .text(),
+        "Alpha"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("save-edits", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        doc.read(cx).edits.rows.is_empty() && !doc.read(cx).busy()
+    })
+    .await;
+    assert_eq!(
+        fixture
+            .services
+            .runtime
+            .block_on(fixture.session.query("SELECT name FROM items".into()))
+            .unwrap()
+            .sets[0]
+            .rows[0][0]
+            .text(),
+        "Staged"
+    );
+    cx.update_window(window, |_, window, cx| {
+        doc.update(cx, |doc, cx| doc.show_statistics(1, false, window, cx));
+        window.render_frame(cx);
+        assert!(window.try_find("statistics-results").is_some());
+        window.click("exact-statistics", cx);
+        window.render_frame(cx);
+        crate::ui::test_support::click_label(window, "Calculate", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
+        .await;
+    assert!(cx.update(|cx| doc.read(cx).error.is_empty()));
+}
+
+#[gpui_kit::test]
+async fn explain_action_keeps_editor_and_builds_plan(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let fixture = Fixture::new();
+    let (window, doc) = fixture.open(false, cx);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.input("SELECT * FROM items WHERE id=1", cx);
+        window.click("explain-query", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        doc.read(cx).plan_view.is_some() || !doc.read(cx).error.is_empty()
+    })
+    .await;
+    cx.update(|cx| {
+        assert!(doc.read(cx).error.is_empty(), "{}", doc.read(cx).error);
+        assert!(doc.read(cx).plan_view.is_some());
+        assert_eq!(doc.read(cx).draft(cx).sql, "SELECT * FROM items WHERE id=1");
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("plan-raw", cx);
+        window.render_frame(cx);
+        window.click("copy-plan", cx);
+        assert!(
+            cx.read_from_clipboard()
+                .unwrap()
+                .text()
+                .unwrap()
+                .contains("items")
+        );
+    })
+    .unwrap();
 }

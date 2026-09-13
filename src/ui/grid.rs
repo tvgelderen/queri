@@ -11,6 +11,7 @@ use std::{collections::BTreeSet, sync::Arc};
 #[derive(Clone)]
 pub enum GridEvent {
     Sort(String, ColumnSort),
+    Statistics(usize),
 }
 impl EventEmitter<GridEvent> for TableState<Grid> {}
 
@@ -23,6 +24,8 @@ pub struct Grid {
     pub sortable: bool,
     pub sort: Vec<(String, ColumnSort)>,
     numeric_columns: BTreeSet<usize>,
+    pub edits: std::collections::BTreeMap<(usize, usize), crate::model::FieldValue>,
+    pub editor: Option<(usize, usize, Entity<gpui_kit::component::input::InputState>)>,
 }
 
 impl Grid {
@@ -36,6 +39,8 @@ impl Grid {
             sortable: false,
             sort: vec![],
             numeric_columns: BTreeSet::new(),
+            edits: Default::default(),
+            editor: None,
         };
         grid.replace(data);
         grid
@@ -124,6 +129,13 @@ impl Grid {
         else {
             return String::new();
         };
+        if let Some(value) = self.edits.get(&(row, col)) {
+            return match value {
+                crate::model::FieldValue::Default => "DEFAULT".into(),
+                crate::model::FieldValue::Null => "NULL".into(),
+                crate::model::FieldValue::Value(cell) => cell.text(),
+            };
+        }
         self.data
             .rows
             .get(row)
@@ -209,6 +221,27 @@ impl TableDelegate for Grid {
             cx.emit(GridEvent::Sort(name.clone(), sort));
         }
     }
+    fn render_th(
+        &mut self,
+        col: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let name = self.column(col, cx).name.clone();
+        let index = col
+            .checked_sub(usize::from(self.checkable))
+            .and_then(|i| self.display_columns.get(i).copied());
+        div().size_full().child(name).on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |_, _, _, cx| {
+                if let Some(index) = index {
+                    cx.stop_propagation();
+                    cx.emit(GridEvent::Statistics(index));
+                }
+            }),
+        )
+    }
+
     fn render_td(
         &mut self,
         row: usize,
@@ -237,11 +270,25 @@ impl TableDelegate for Grid {
                 .into_any_element();
         }
         let index = self.display_columns[col.saturating_sub(usize::from(self.checkable))];
+        if let Some((edit_row, edit_col, input)) = &self.editor
+            && *edit_row == row
+            && *edit_col == index
+        {
+            return gpui_kit::component::input::Input::new(input)
+                .id("inline-cell-input")
+                .aria_label("Cell value · Enter to accept, Escape to cancel")
+                .into_any_element();
+        }
         let cell = self.data.rows.get(row).and_then(|row| row.get(index));
         div()
             .when(self.search_cell == Some((row, index)), |view| {
                 view.bg(cx.theme().accent)
                     .border_1()
+                    .border_color(cx.theme().primary)
+            })
+            .when(self.edits.contains_key(&(row, index)), |view| {
+                view.bg(cx.theme().accent)
+                    .border_b_2()
                     .border_color(cx.theme().primary)
             })
             .text_ellipsis()

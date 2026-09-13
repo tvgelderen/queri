@@ -25,6 +25,11 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::{sync::Arc, time::Instant};
 
+#[path = "column_statistics.rs"]
+mod column_statistics;
+#[path = "inline_edits.rs"]
+mod inline_edits;
+
 #[path = "generated_sql.rs"]
 mod generated_sql;
 #[path = "named_table_views.rs"]
@@ -46,6 +51,8 @@ actions!(
         Refresh,
         InspectCell,
         EditRow,
+        EditCell,
+        CancelCellEdit,
         CopyCells,
         FormatSql,
         BeginTransaction,
@@ -136,6 +143,9 @@ pub struct Document {
     grid: Entity<TableState<Grid>>,
     grid_search: Entity<GridSearch>,
     results: Vec<Arc<ResultSet>>,
+    plan_view: Option<Entity<super::query_plan::PlanView>>,
+    edits: crate::row_updates::PendingEdits,
+    edit_input: Entity<InputState>,
     result_index: usize,
     operation: Operation,
     query_outcome: QueryOutcome,
@@ -164,6 +174,13 @@ pub struct Document {
 impl Document {
     pub fn init(cx: &mut App) {
         cx.bind_keys([
+            KeyBinding::new("f2", EditCell, Some("QueriDocument")),
+            KeyBinding::new("escape", CancelCellEdit, Some("QueriDocument")),
+            KeyBinding::new(
+                "escape",
+                CancelCellEdit,
+                Some("QueriDocument > DataTable > Input"),
+            ),
             KeyBinding::new(
                 "ctrl-space",
                 gpui_kit::component::input::ShowCompletions,
@@ -234,35 +251,70 @@ impl Document {
                 .range_selectable(true)
                 .loop_selection(false)
         });
+        let edit_input = cx.new(|cx| InputState::new(window, cx));
         let grid_search = cx.new(|cx| GridSearch::new(grid.clone(), window, cx));
         let mut subscriptions = vec![
+            cx.subscribe_in(
+                &edit_input,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        this.accept_cell_edit(window, cx);
+                    }
+                },
+            ),
             cx.subscribe_in(&grid, window, |this, _, event: &GridEvent, window, cx| {
                 if this.busy() {
                     return;
                 }
-                let GridEvent::Sort(column, sort) = event;
-                if let DocumentKind::Table { options, .. } = &mut this.kind {
-                    if let Some(index) = options.sort.iter().position(|(name, _)| name == column) {
-                        if *sort == ColumnSort::Default {
-                            options.sort.remove(index);
-                        } else {
-                            options.sort[index].1 = *sort == ColumnSort::Descending;
+                let GridEvent::Sort(column, sort) = event else {
+                    let GridEvent::Statistics(column) = event else {
+                        return;
+                    };
+                    this.show_statistics(*column, false, window, cx);
+                    return;
+                };
+                let column = column.clone();
+                let sort = *sort;
+                this.resolve_edits(window, cx, move |this, window, cx| {
+                    if let DocumentKind::Table { options, .. } = &mut this.kind {
+                        if let Some(index) =
+                            options.sort.iter().position(|(name, _)| name == &column)
+                        {
+                            if sort == ColumnSort::Default {
+                                options.sort.remove(index);
+                            } else {
+                                options.sort[index].1 = sort == ColumnSort::Descending;
+                            }
+                        } else if sort != ColumnSort::Default {
+                            options
+                                .sort
+                                .push((column.clone(), sort == ColumnSort::Descending));
                         }
-                    } else if *sort != ColumnSort::Default {
-                        options
-                            .sort
-                            .push((column.clone(), *sort == ColumnSort::Descending));
+                        options.offset = 0;
+                        this.refresh(window, cx);
                     }
-                    options.offset = 0;
-                    this.refresh(window, cx);
-                }
+                });
             }),
             cx.subscribe_in(&grid, window, |this, _, event: &TableEvent, window, cx| {
                 if matches!(
                     event,
                     TableEvent::DoubleClickedCell(..) | TableEvent::DoubleClickedRow(..)
                 ) {
-                    this.inspect(window, cx);
+                    if matches!(
+                        this.kind,
+                        DocumentKind::Table {
+                            section: Section::Data,
+                            ..
+                        }
+                    ) {
+                        this.begin_cell_edit(window, cx);
+                        if this.grid.read(cx).delegate().editor.is_none() {
+                            this.inspect(window, cx);
+                        }
+                    } else {
+                        this.inspect(window, cx);
+                    }
                 }
                 cx.notify();
             }),
@@ -298,6 +350,9 @@ impl Document {
             grid,
             grid_search,
             results: vec![],
+            plan_view: None,
+            edits: Default::default(),
+            edit_input,
             result_index: 0,
             operation: Operation::Idle,
             query_outcome: QueryOutcome::NotRun,
@@ -506,6 +561,27 @@ impl Document {
     }
 
     pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_edits(cx) && !self.busy() {
+            let desired = match &mut self.kind {
+                DocumentKind::Table { options, .. } => {
+                    let desired = options.clone();
+                    if let Some(applied) = &self.applied_browse {
+                        **options = applied.clone();
+                    }
+                    Some(desired)
+                }
+                _ => None,
+            };
+            self.resolve_edits(window, cx, move |this, w, cx| {
+                if let (Some(desired), DocumentKind::Table { options, .. }) =
+                    (desired, &mut this.kind)
+                {
+                    *options = desired;
+                }
+                this.refresh(w, cx);
+            });
+            return;
+        }
         if self.busy() {
             return;
         }
@@ -786,6 +862,28 @@ impl Document {
         });
     }
 
+    fn explain(&mut self, analyze: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
+        let Some(editor) = self.sql_editor() else {
+            return;
+        };
+        let selected = editor.read(cx).selected_value();
+        let source = if selected.trim().is_empty() {
+            editor.read(cx).value()
+        } else {
+            selected
+        };
+        match crate::query_plan::explain_sql(&source, self.parameter_dialect(), analyze) {
+            Ok(sql) => self.execute(sql, window, cx),
+            Err(error) => {
+                self.error = format!("{error:#}");
+                cx.notify();
+            }
+        }
+    }
+
     fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy() {
             return;
@@ -831,8 +929,9 @@ impl Document {
         if self.busy() || self.session.is_none() {
             return;
         }
+        let analyze = sql.starts_with("EXPLAIN (ANALYZE,");
         let destructive = self.warn_destructive && sql::destructive(&sql);
-        if self.profile.policy == ExecutionPolicy::ConfirmExecutions || destructive {
+        if self.profile.policy == ExecutionPolicy::ConfirmExecutions || destructive || analyze {
             let view = cx.entity();
             let generation = self.session_generation;
             let editor_sql = self.submission_snapshot(cx);
@@ -844,7 +943,12 @@ impl Document {
                 preview
             };
             let message = format!(
-                "Submit SQL to {context}. Cancel sends nothing to the database.\n\n{preview}"
+                "Submit SQL to {context}. Cancel sends nothing to the database.\n{}\n{preview}",
+                if analyze {
+                    "Explain and run executes the statement, including its writes and other side effects."
+                } else {
+                    ""
+                }
             );
             window.open_alert_dialog(cx, move |dialog, _, _| {
                 let sql = sql.clone();
@@ -902,6 +1006,8 @@ impl Document {
             cx.notify();
             return;
         };
+        let plan_source = sql.clone();
+        let plan_parameters = params.clone();
         let store = self.services.store.clone();
         let profile = self.profile.clone();
         let generation = self.session_generation;
@@ -956,7 +1062,7 @@ impl Document {
                     .map(|error| format!("{error:#}"));
                 Ok((result, history_error, transaction))
             },
-            move |this, result, _, cx| {
+            move |this, result, window, cx| {
                 if this.session_generation != generation {
                     return;
                 }
@@ -982,6 +1088,33 @@ impl Document {
                         if let Some(error) = history_error {
                             this.status
                                 .push_str(&format!(" · History could not be saved: {error}"));
+                        }
+                        this.plan_view = None;
+                        if (plan_source.starts_with("EXPLAIN (FORMAT JSON)")
+                            || plan_source.starts_with("EXPLAIN (ANALYZE,")
+                            || plan_source.starts_with("EXPLAIN QUERY PLAN"))
+                            && let Some(set) = output.sets.first()
+                        {
+                            match crate::query_plan::QueryPlan::parse(
+                                set,
+                                matches!(this.parameter_dialect(), sql::SqlDialect::Postgres),
+                            ) {
+                                Ok(plan) => {
+                                    let context = format!(
+                                        "{} · {} ms\n{}\nParameters (live tab only): {:?}",
+                                        this.profile.context(),
+                                        output.elapsed_ms,
+                                        plan_source,
+                                        plan_parameters
+                                    );
+                                    this.plan_view = Some(cx.new(|cx| {
+                                        super::query_plan::PlanView::new(plan, context, window, cx)
+                                    }));
+                                }
+                                Err(error) => {
+                                    this.error = format!("{error:#}. Raw results are shown below.")
+                                }
+                            }
                         }
                         this.results = output.sets.into_iter().map(Arc::new).collect();
                         this.result_index = 0;
@@ -1059,6 +1192,13 @@ impl Document {
     }
 
     fn transaction_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_edits(cx) {
+            let command = command.to_owned();
+            self.resolve_edits(window, cx, move |this, w, cx| {
+                this.transaction_command(&command, w, cx)
+            });
+            return;
+        }
         let allowed = match command {
             "BEGIN" => self.transaction == TransactionStatus::Idle,
             "COMMIT" => self.transaction == TransactionStatus::Open,
@@ -1593,6 +1733,10 @@ impl Document {
     }
 
     fn edit_row(&mut self, insert: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_edits(cx) {
+            self.resolve_edits(window, cx, move |this, w, cx| this.edit_row(insert, w, cx));
+            return;
+        }
         if self.busy() {
             return;
         }
@@ -1649,6 +1793,10 @@ impl Document {
     }
 
     fn delete_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_edits(cx) {
+            self.resolve_edits(window, cx, |this, w, cx| this.delete_rows(w, cx));
+            return;
+        }
         if self.busy() {
             return;
         }
@@ -2140,6 +2288,27 @@ impl Document {
             .flex_wrap()
             .gap_1()
             .child(
+                Button::new("explain-query")
+                    .small()
+                    .label("Explain")
+                    .disabled(self.busy())
+                    .on_click(cx.listener(|this, _, window, cx| this.explain(false, window, cx))),
+            )
+            .when(
+                matches!(self.profile.config, ConnectionConfig::Postgres { .. }),
+                |view| {
+                    view.child(
+                        Button::new("analyze-query")
+                            .small()
+                            .label("Explain and run")
+                            .disabled(self.busy())
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.explain(true, window, cx)),
+                            ),
+                    )
+                },
+            )
+            .child(
                 Button::new("format-sql")
                     .ghost()
                     .small()
@@ -2421,6 +2590,9 @@ impl Document {
     }
 
     fn query_results(&self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(plan) = &self.plan_view {
+            return plan.clone().into_any_element();
+        }
         if let Some(result) = self.results.get(self.result_index) {
             if result.columns.is_empty() {
                 return empty_state(
@@ -2978,17 +3150,20 @@ impl Document {
                 ["Data", "Structure", "Indexes", "Constraints"]
                     .map(|label| Tab::new().label(label)),
             )
-            .on_click(cx.listener(|this, index, _, cx| {
-                if let DocumentKind::Table { section, .. } = &mut this.kind {
-                    *section = match index {
-                        1 => Section::Structure,
-                        2 => Section::Indexes,
-                        3 => Section::Constraints,
-                        _ => Section::Data,
-                    };
-                }
-                this.update_grid(cx);
-                cx.notify();
+            .on_click(cx.listener(|this, index, window, cx| {
+                let index = *index;
+                this.resolve_edits(window, cx, move |this, _, cx| {
+                    if let DocumentKind::Table { section, .. } = &mut this.kind {
+                        *section = match index {
+                            1 => Section::Structure,
+                            2 => Section::Indexes,
+                            3 => Section::Constraints,
+                            _ => Section::Data,
+                        };
+                    }
+                    this.update_grid(cx);
+                    cx.notify();
+                });
             }))
             .into_any_element()
     }
@@ -3208,6 +3383,16 @@ impl Render for Document {
                 .size_full()
                 .min_h_0()
                 .child(self.table_toolbar(cx))
+                .when(
+                    matches!(
+                        self.kind,
+                        DocumentKind::Table {
+                            section: Section::Data,
+                            ..
+                        }
+                    ),
+                    |view| view.child(self.edit_toolbar(cx)),
+                )
                 .child(
                     v_flex()
                         .flex_1()
@@ -3230,6 +3415,8 @@ impl Render for Document {
                 |view| view.track_focus(&self.grid.read(cx).focus_handle(cx)),
             )
             .on_action(cx.listener(|this, _: &FindGrid, window, cx| if this.grid.read(cx).focus_handle(cx).is_focused(window) { this.grid_search.update(cx, |search, cx| search.open(window, cx)) } else { cx.propagate(); }))
+            .on_action(cx.listener(|this, _: &EditCell, window, cx|this.begin_cell_edit(window,cx)))
+            .on_action(cx.listener(|this, _: &CancelCellEdit, window, cx| { if this.grid.read(cx).delegate().editor.is_some() {this.cancel_cell_edit(window,cx);}else{cx.propagate();} }))
             .on_action(cx.listener(|this, _: &FormatSql, window, cx| this.format_sql(window,cx)))
             .on_action(cx.listener(|this, _: &CopyCells, _, cx| this.copy_cells(crate::export::Format::Tsv, false,cx)))
             .on_action(cx.listener(|this, _: &BeginTransaction, window, cx| this.transaction_command("BEGIN", window, cx)))

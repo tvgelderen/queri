@@ -1,4 +1,6 @@
-use super::{browse_ordering, push_row, validate_original};
+use crate::row_updates::validate_original;
+mod updates;
+use super::{browse_ordering, push_row};
 use crate::{
     model::*,
     sql::{qualified, quote_identifier},
@@ -9,6 +11,7 @@ use rusqlite::{
     Connection, Statement, params, params_from_iter,
     types::{Value, ValueRef},
 };
+pub(super) use updates::apply as apply_updates;
 
 fn cell(value: ValueRef<'_>) -> Result<Cell> {
     Ok(match value {
@@ -331,6 +334,7 @@ pub(super) fn compile_browse(
         .join(",");
     Ok(super::BrowsePlan {
         metadata,
+        from_sql: format!("FROM {qualified}{filter}"),
         count_sql: format!("SELECT count(*) FROM {qualified}{filter}"),
         query: crate::parameters::BoundQuery {
             sql: format!(
@@ -459,35 +463,19 @@ pub fn change_rows(conn: &mut Connection, table: &TableRef, change: RowChange) -
                 values.len() == metadata.columns.len(),
                 "The table structure changed. Refresh before editing."
             );
-            let mut params = vec![];
-            let mut assignments = vec![];
-            for (column, field) in metadata.columns.iter().zip(values) {
-                if column.generated {
-                    continue;
-                }
-                let expression = match field {
-                    FieldValue::Default => column.default.clone().unwrap_or_else(|| "NULL".into()),
-                    FieldValue::Null => "NULL".into(),
-                    FieldValue::Value(cell) => {
-                        params.push(value(&cell));
-                        format!("?{}", params.len())
-                    }
-                };
-                assignments.push(format!("{}={expression}", quote_identifier(&column.name)?));
+            let row = crate::row_updates::RowUpdate::from_values(original, values, &metadata)?;
+            if row.fields.is_empty() {
+                0
+            } else {
+                let statement = updates::statement(&metadata, &qualified, &row)?;
+                let params = statement.values.iter().map(value).collect::<Vec<_>>();
+                let affected = tx.execute(&statement.sql, params_from_iter(params))?;
+                ensure!(
+                    affected == 1,
+                    "The row changed or was deleted. No changes were saved."
+                );
+                affected
             }
-            let predicate = predicate(&metadata, &original, &mut params)?;
-            let affected = tx.execute(
-                &format!(
-                    "UPDATE {qualified} SET {} WHERE {predicate}",
-                    assignments.join(",")
-                ),
-                params_from_iter(params),
-            )?;
-            ensure!(
-                affected == 1,
-                "The row changed or was deleted. Refresh and try again; no changes were saved."
-            );
-            affected
         }
         RowChange::Delete { originals } => {
             ensure!(!originals.is_empty(), "Select at least one row.");

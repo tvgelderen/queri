@@ -8,3 +8,7 @@ pub mod parameters;
 pub mod sql;
 pub mod storage;
 pub mod ui;
+
+pub mod query_plan;
+pub mod row_updates;
+pub mod statistics;

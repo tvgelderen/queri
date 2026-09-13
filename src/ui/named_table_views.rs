@@ -149,6 +149,10 @@ impl Document {
     }
 
     fn open_named_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_edits(cx) {
+            self.resolve_edits(window, cx, |this, w, cx| this.open_named_views(w, cx));
+            return;
+        }
         let Some(table) = self.table_ref().cloned() else {
             return;
         };

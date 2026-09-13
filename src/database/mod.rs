@@ -21,6 +21,7 @@ pub struct Session {
     pub profile: ConnectionProfile,
     timeout: Mutex<StatementTimeout>,
     read_write_observed: AtomicBool,
+    updates_cancelled: Arc<AtomicBool>,
 }
 
 enum Backend {
@@ -34,6 +35,7 @@ enum Backend {
 struct BrowsePlan {
     metadata: TableMetadata,
     count_sql: String,
+    from_sql: String,
     query: crate::parameters::BoundQuery,
 }
 
@@ -92,6 +94,7 @@ impl Session {
             profile,
             timeout: Mutex::new(StatementTimeout::Inherit),
             read_write_observed: AtomicBool::new(false),
+            updates_cancelled: Arc::new(AtomicBool::new(false)),
         }))
     }
 
@@ -240,6 +243,7 @@ impl Session {
     }
 
     pub async fn cancel(&self) -> Result<()> {
+        self.updates_cancelled.store(true, Ordering::Relaxed);
         match &self.backend {
             Backend::Postgres(pg) => pg
                 .cancel
@@ -339,6 +343,94 @@ impl Session {
             Backend::Sqlite { .. } => {
                 self.with_sqlite(move |conn| {
                     Ok(sqlite::compile_browse(conn, &table, &options)?.query)
+                })
+                .await
+            }
+        }
+    }
+
+    pub async fn column_statistics(
+        &self,
+        table: TableRef,
+        mut options: BrowseOptions,
+        column: String,
+    ) -> Result<crate::statistics::ColumnStatistics> {
+        options.sort.clear();
+        options.offset = 0;
+        let timeout = *self.timeout.lock().unwrap();
+        match &self.backend {
+            Backend::Postgres(pg) => {
+                let client = pg.client.lock().await;
+                pg.apply_timeout(&client, timeout, "SELECT").await?;
+                let plan = postgres::compile_browse(&client, &table, &options).await?;
+                let column = plan
+                    .metadata
+                    .columns
+                    .iter()
+                    .find(|c| c.name == column)
+                    .context("Column no longer exists")?;
+                let (sql, group, range) = crate::statistics::query(&plan.from_sql, column, true)?;
+                let values = plan
+                    .query
+                    .values
+                    .iter()
+                    .map(Cell::optional_text)
+                    .collect::<Vec<_>>();
+                let values = values.iter().map(|v| v.as_deref()).collect::<Vec<_>>();
+                let stream = client.query_text_raw(&sql, &values).await?;
+                let sets = postgres::collect_results(stream).await?;
+                crate::statistics::ColumnStatistics::from_result(
+                    sets.first().context("No statistics returned")?,
+                    group,
+                    range,
+                )
+            }
+            Backend::Sqlite { .. } => {
+                self.with_sqlite(move |conn| {
+                    let plan = sqlite::compile_browse(conn, &table, &options)?;
+                    let column = plan
+                        .metadata
+                        .columns
+                        .iter()
+                        .find(|c| c.name == column)
+                        .context("Column no longer exists")?;
+                    let (sql, group, range) =
+                        crate::statistics::query(&plan.from_sql, column, false)?;
+                    let sets = sqlite::query_bound(conn, &sql, timeout, &plan.query.values)?;
+                    crate::statistics::ColumnStatistics::from_result(
+                        sets.first().context("No statistics returned")?,
+                        group,
+                        range,
+                    )
+                })
+                .await
+            }
+        }
+    }
+
+    pub async fn apply_updates(
+        &self,
+        table: TableRef,
+        batch: crate::row_updates::UpdateBatch,
+    ) -> Result<u64> {
+        anyhow::ensure!(
+            !self.read_only(),
+            "Connection policy blocks generated row changes."
+        );
+        self.updates_cancelled.store(false, Ordering::Relaxed);
+        let timeout = *self.timeout.lock().unwrap();
+        match &self.backend {
+            Backend::Postgres(pg) => {
+                let client = pg.client.lock().await;
+                pg.apply_timeout(&client, timeout, "UPDATE").await?;
+                postgres::apply_updates(&client, &table, batch, &self.updates_cancelled)
+                    .await
+                    .map_err(classify_postgres_error)
+            }
+            Backend::Sqlite { .. } => {
+                let cancelled = self.updates_cancelled.clone();
+                self.with_sqlite(move |conn| {
+                    sqlite::apply_updates(conn, &table, batch, timeout, &cancelled)
                 })
                 .await
             }
@@ -481,28 +573,6 @@ fn browse_ordering(metadata: &TableMetadata, sort: &[(String, bool)]) -> Result<
     } else {
         format!(" ORDER BY {}", terms.join(","))
     })
-}
-
-pub(super) fn validate_original(
-    metadata: &TableMetadata,
-    table: &TableRef,
-    original: &[Cell],
-) -> Result<()> {
-    anyhow::ensure!(
-        metadata.editable(table),
-        "Editing requires a table with a primary key."
-    );
-    anyhow::ensure!(
-        original.len() == metadata.columns.len(),
-        "The table structure changed. Refresh before editing."
-    );
-    for (column, value) in metadata.columns.iter().zip(original) {
-        anyhow::ensure!(
-            !column.primary_key || !matches!(value, Cell::Null),
-            "Rows with a NULL primary-key component cannot be edited reliably."
-        );
-    }
-    Ok(())
 }
 
 #[derive(Debug)]

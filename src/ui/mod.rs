@@ -11,6 +11,7 @@ mod export_dialog;
 mod grid;
 mod grid_search;
 mod history;
+mod query_plan;
 mod row_editor;
 mod saved_queries;
 mod search;

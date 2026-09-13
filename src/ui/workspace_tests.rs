@@ -2095,3 +2095,129 @@ async fn safeguards_transaction_close_reconnect_profile_and_quit_guards(cx: &mut
     })
     .await;
 }
+
+#[gpui_kit::test]
+async fn staged_edits_guard_idle_tab_close_and_save_before_closing(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("edits.sqlite");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("CREATE TABLE items(id INTEGER PRIMARY KEY,name TEXT);INSERT INTO items VALUES(1,'Original')").unwrap();
+    let profile = ConnectionProfile {
+        id: Uuid::new_v4(),
+        name: "Edits".into(),
+        notes: String::new(),
+        color: String::new(),
+        environment: None,
+        policy: ExecutionPolicy::Normal,
+        remember_password: false,
+        config: ConnectionConfig::Sqlite {
+            path,
+            read_only: false,
+            create: false,
+            wal: true,
+            foreign_keys: true,
+        },
+    };
+    let store = Store::open(directory.path().join("app.sqlite")).unwrap();
+    store.save_profile(&profile).unwrap();
+    let services = Services::new(runtime().unwrap(), store);
+    let (window, workspace) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(1400.), px(950.)),
+                    cx,
+                ))),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                cx.new(|cx| {
+                    Workspace::new(
+                        services.clone(),
+                        Preferences {
+                            active_connection: Some(profile.id),
+                            ..Default::default()
+                        },
+                        vec![profile.clone()],
+                        window,
+                        cx,
+                    )
+                })
+            },
+        )
+        .unwrap()
+    });
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace.read(cx).connection_state == ConnectionState::Ready
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_table(
+                profile.clone(),
+                TableRef {
+                    schema: "main".into(),
+                    name: "items".into(),
+                    kind: RelationKind::Table,
+                },
+                window,
+                cx,
+            )
+        })
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |window, cx| {
+        workspace.read(cx).documents.len() == 1
+            && !workspace.read(cx).documents[0].read(cx).busy()
+            && window.try_find("table-cell-0:2").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("table-cell-0:2", cx);
+        window.press("f2", cx);
+        window.press("ctrl-a", cx);
+        window.input("Saved before close", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace.read(cx).documents[0].read(cx).has_edits(cx)
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.close_document(0, window, cx))
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.try_find("guard-cancel-edits").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| {
+        window.click("guard-cancel-edits", cx);
+        assert_eq!(workspace.read(cx).documents.len(), 1);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.close_document(0, window, cx))
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |window, _| {
+        window.try_find("guard-save-edits").is_some()
+    })
+    .await;
+    cx.update_window(window, |_, window, cx| window.click("guard-save-edits", cx))
+        .unwrap();
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace.read(cx).documents.is_empty()
+    })
+    .await;
+    assert_eq!(
+        db.query_row("SELECT name FROM items", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "Saved before close"
+    );
+}

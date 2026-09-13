@@ -173,13 +173,35 @@ impl RowEditor {
         }
         let session = self.session.clone();
         let table = self.table.clone();
+        let metadata = self.metadata.clone();
         self.busy = true;
         self.error.clear();
         task(
             &self.services,
             window,
             cx,
-            async move { session.change_rows(table, change).await },
+            async move {
+                match change {
+                    RowChange::Update { original, values } => {
+                        let row = crate::row_updates::RowUpdate::from_values(
+                            original, values, &metadata,
+                        )?;
+                        if row.fields.is_empty() {
+                            return Ok(0);
+                        }
+                        session
+                            .apply_updates(
+                                table,
+                                crate::row_updates::UpdateBatch {
+                                    columns: metadata.columns,
+                                    rows: vec![row],
+                                },
+                            )
+                            .await
+                    }
+                    change => session.change_rows(table, change).await,
+                }
+            },
             |this, result, window, cx| {
                 this.busy = false;
                 match result {

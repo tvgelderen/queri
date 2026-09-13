@@ -1,4 +1,6 @@
-use super::{AsyncMutex, browse_ordering, push_row, validate_original};
+use crate::row_updates::validate_original;
+mod updates;
+use super::{AsyncMutex, browse_ordering, push_row};
 use crate::{
     model::*,
     sql::{qualified, quote_identifier},
@@ -8,6 +10,7 @@ use futures::TryStreamExt;
 use postgres_native_tls::MakeTlsConnector;
 use std::time::Duration;
 use tokio_postgres::{Client, GenericClient, SimpleQueryMessage, types::ToSql};
+pub(super) use updates::apply as apply_updates;
 
 pub struct Postgres {
     pub client: AsyncMutex<Client>,
@@ -328,6 +331,7 @@ pub(super) async fn compile_browse(
         .join(",");
     Ok(super::BrowsePlan {
         metadata,
+        from_sql: format!("FROM {table_name}{filter}"),
         count_sql: format!("SELECT count(*) FROM {table_name}{filter}"),
         query: crate::parameters::BoundQuery {
             sql: format!(
@@ -450,44 +454,8 @@ pub async fn change_rows(client: &mut Client, table: &TableRef, change: RowChang
                 values.len() == metadata.columns.len(),
                 "The table structure changed. Refresh before editing."
             );
-            let mut object = serde_json::Map::new();
-            let mut assignments = vec![];
-            for (column, field) in metadata.columns.iter().zip(values) {
-                if column.generated {
-                    continue;
-                }
-                let name = quote_identifier(&column.name)?;
-                if matches!(field, FieldValue::Default) {
-                    assignments.push(format!("{name}=DEFAULT"));
-                } else {
-                    object.insert(column.name.clone(), field_json(&field));
-                    assignments.push(format!(
-                        "{name}=(json_populate_record(NULL::{table_name},$1::json)).{name}"
-                    ));
-                }
-            }
-            let json = serde_json::Value::Object(object);
-            let old = original.iter().map(Cell::optional_text).collect::<Vec<_>>();
-            let mut params: Vec<&(dyn ToSql + Sync)> = vec![&json];
-            for cell in &old {
-                params.push(cell);
-            }
-            // The harmless JSON predicate keeps parameter 1 typed even when every field uses DEFAULT.
-            let affected = tx
-                .execute(
-                    &format!(
-                        "UPDATE {table_name} SET {} WHERE $1::json IS NOT NULL AND {}",
-                        assignments.join(","),
-                        predicate(&metadata, 2)?
-                    ),
-                    &params,
-                )
-                .await?;
-            ensure!(
-                affected == 1,
-                "The row changed or was deleted. Refresh and retry; no changes were saved."
-            );
-            affected
+            let row = crate::row_updates::RowUpdate::from_values(original, values, &metadata)?;
+            updates::update(&tx, &metadata, &table_name, &row).await?
         }
         RowChange::Delete { originals } => {
             ensure!(!originals.is_empty(), "Select at least one row.");

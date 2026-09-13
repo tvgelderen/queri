@@ -344,7 +344,7 @@ impl TableRef {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Column {
     pub name: String,
     pub data_type: String,
@@ -423,7 +423,7 @@ pub struct TablePage {
     pub metadata: TableMetadata,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum FieldValue {
     Default,
     Null,
