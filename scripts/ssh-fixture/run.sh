@@ -40,13 +40,23 @@ openssl x509 -req -in "$fixture/server.csr" -CA "$fixture/ca.crt" -CAkey "$fixtu
   -CAcreateserial -days 1 -extfile "$fixture/server.ext" -out "$fixture/server.crt" >/dev/null 2>&1
 export SSL_CERT_FILE="$fixture/ca.crt"
 export SSH_AUTH_SOCK="$fixture/agent.sock"
+# Exercise agent confirmation beyond Queri's network deadline without a desktop prompt.
+cat > "$fixture/confirm-key" <<'ASKPASS'
+#!/usr/bin/env sh
+sleep 16
+exit 0
+ASKPASS
+chmod 700 "$fixture/confirm-key"
+export SSH_ASKPASS="$fixture/confirm-key"
+export SSH_ASKPASS_REQUIRE=force
+export DISPLAY="${DISPLAY:-:0}"
 ssh-agent -a "$SSH_AUTH_SOCK" -D >"$fixture/agent.log" 2>&1 &
 agent_pid=$!
 for ((attempt=0; attempt<50; attempt++)); do
   [[ ! -S $SSH_AUTH_SOCK ]] || break
   sleep .1
 done
-ssh-add "$fixture/plain_key"
+ssh-add -c "$fixture/plain_key"
 docker build -t queri-ssh-fixture .
 docker network create "$name" >/dev/null
 docker run -d --name "$name-pg" --network "$name" --network-alias database --network-alias wrong-database \

@@ -156,6 +156,49 @@ impl client::Handler for HostHandler {
     }
 }
 
+/// Agent signing may wait for a person to unlock a key or approve its use.
+struct InteractiveSigner<S> {
+    signer: S,
+    waiting: watch::Sender<bool>,
+}
+
+impl<S: russh::Signer + Send> russh::Signer for InteractiveSigner<S> {
+    type Error = S::Error;
+
+    async fn auth_sign(
+        &mut self,
+        key: &AgentIdentity,
+        hash_alg: Option<HashAlg>,
+        data: Vec<u8>,
+    ) -> std::result::Result<Vec<u8>, Self::Error> {
+        self.waiting.send_replace(true);
+        let result = self.signer.auth_sign(key, hash_alg, data).await;
+        self.waiting.send_replace(false);
+        result
+    }
+}
+
+async fn with_network_deadline<T>(
+    work: impl std::future::Future<Output = Result<T>>,
+    mut waiting: watch::Receiver<bool>,
+    deadline: Duration,
+) -> Result<T> {
+    tokio::pin!(work);
+    loop {
+        let human = *waiting.borrow_and_update();
+        tokio::select! {
+            result = &mut work => return result,
+            changed = waiting.changed() => {
+                if changed.is_err() {
+                    return tokio::time::timeout(deadline, work).await
+                        .context("SSH authentication timed out")?;
+                }
+            },
+            _ = tokio::time::sleep(deadline), if !human => bail!("SSH authentication timed out"),
+        }
+    }
+}
+
 pub struct Transport {
     handle: Arc<client::Handle<HostHandler>>,
     pub closed: CancellationToken,
@@ -235,6 +278,7 @@ pub struct Connector {
     supplied: Mutex<HashMap<Uuid, String>>,
     receiver: Mutex<Option<mpsc::UnboundedReceiver<Prompt>>>,
     progress: Option<watch::Sender<&'static str>>,
+    persist_credentials: bool,
 }
 
 impl Connector {
@@ -250,6 +294,7 @@ impl Connector {
             slots: Mutex::new(HashMap::new()),
             supplied: Mutex::new(HashMap::new()),
             progress: None,
+            persist_credentials: true,
             receiver: Mutex::new(Some(receiver)),
         })
     }
@@ -351,6 +396,7 @@ impl Connector {
             slots: Mutex::new(HashMap::new()),
             supplied: Mutex::new(HashMap::from([(profile.id, passphrase)])),
             progress,
+            persist_credentials: false,
             receiver: Mutex::new(None),
         });
         let session = isolated.connect(profile, password).await?;
@@ -534,60 +580,69 @@ impl Connector {
             }
         };
         self.stage("Authenticating SSH public key…");
-        let authenticated = tokio::time::timeout(NETWORK_TIMEOUT, async {
-            let hash = handle.best_supported_rsa_hash().await?.flatten();
-            if let Some(key) = private_key {
-                if key.algorithm().is_rsa() {
-                    ensure!(
-                        hash.is_some(),
-                        "SSH server does not support RSA SHA-2 signatures"
-                    );
-                }
-                Ok::<_, anyhow::Error>(
-                    handle
-                        .authenticate_publickey(
-                            &ssh.user,
-                            PrivateKeyWithHashAlg::new(Arc::new(key), hash),
-                        )
+        let (waiting, signing) = watch::channel(false);
+        let authenticated = with_network_deadline(
+            async {
+                let hash = handle.best_supported_rsa_hash().await?.flatten();
+                if let Some(key) = private_key {
+                    if key.algorithm().is_rsa() {
+                        ensure!(
+                            hash.is_some(),
+                            "SSH server does not support RSA SHA-2 signatures"
+                        );
+                    }
+                    Ok::<_, anyhow::Error>(
+                        handle
+                            .authenticate_publickey(
+                                &ssh.user,
+                                PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+                            )
+                            .await?
+                            .success(),
+                    )
+                } else {
+                    let SshAuth::Agent { fingerprint } = &ssh.auth else {
+                        unreachable!()
+                    };
+                    let mut agent = AgentClient::connect_env()
+                        .await
+                        .context("Could not connect to SSH_AUTH_SOCK")?;
+                    let identity = agent
+                        .request_identities()
                         .await?
-                        .success(),
-                )
-            } else {
-                let SshAuth::Agent { fingerprint } = &ssh.auth else {
-                    unreachable!()
-                };
-                let mut agent = AgentClient::connect_env()
-                    .await
-                    .context("Could not connect to SSH_AUTH_SOCK")?;
-                let identity = agent
-                    .request_identities()
-                    .await?
-                    .into_iter()
-                    .find_map(|identity| match identity {
-                        AgentIdentity::PublicKey { key, .. }
-                            if key.fingerprint(HashAlg::Sha256).to_string() == *fingerprint =>
-                        {
-                            Some(key)
-                        }
-                        _ => None,
-                    })
-                    .context("Chosen SSH agent identity is unavailable")?;
-                if identity.algorithm().is_rsa() {
-                    ensure!(
-                        hash.is_some(),
-                        "SSH server does not support RSA SHA-2 signatures"
-                    );
+                        .into_iter()
+                        .find_map(|identity| match identity {
+                            AgentIdentity::PublicKey { key, .. }
+                                if key.fingerprint(HashAlg::Sha256).to_string() == *fingerprint =>
+                            {
+                                Some(key)
+                            }
+                            _ => None,
+                        })
+                        .context("Chosen SSH agent identity is unavailable")?;
+                    if identity.algorithm().is_rsa() {
+                        ensure!(
+                            hash.is_some(),
+                            "SSH server does not support RSA SHA-2 signatures"
+                        );
+                    }
+                    let mut signer = InteractiveSigner {
+                        signer: agent,
+                        waiting,
+                    };
+                    Ok(handle
+                        .authenticate_publickey_with(&ssh.user, identity, hash, &mut signer)
+                        .await?
+                        .success())
                 }
-                Ok(handle
-                    .authenticate_publickey_with(&ssh.user, identity, hash, &mut agent)
-                    .await?
-                    .success())
-            }
-        })
-        .await
-        .context("SSH authentication timed out")??;
+            },
+            signing,
+            NETWORK_TIMEOUT,
+        )
+        .await?;
         ensure!(authenticated, "SSH public key authentication rejected");
-        if ssh.remember_passphrase
+        if self.persist_credentials
+            && ssh.remember_passphrase
             && let Some(passphrase) = unlocked_passphrase
         {
             let store = self.trust.store.clone();

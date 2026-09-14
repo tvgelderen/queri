@@ -244,7 +244,9 @@ fn ssh_full_route() -> Result<()> {
         let fingerprint = keys::load_secret_key(env("QUERI_SSH_KEY"), None)?.public_key().fingerprint(HashAlg::Sha256).to_string();
         assert!(queri::ssh::agent_identities().await?.contains(&fingerprint));
         agent.ssh.as_mut().unwrap().auth = SshAuth::Agent { fingerprint };
+        let signing_started = std::time::Instant::now();
         assert_eq!(scalar(&connect(&connector, agent).await??, "SELECT 10").await?, "10");
+        assert!(signing_started.elapsed() >= Duration::from_secs(16), "Fixture must exercise delayed agent confirmation");
 
         let mut tls = p.clone(); tls.id = Uuid::new_v4();
         if let ConnectionConfig::Postgres { tls: mode, .. } = &mut tls.config { *mode = TlsMode::Verify; }
@@ -330,6 +332,46 @@ fn ssh_full_route() -> Result<()> {
         assert!(reply.send(HostDecision::Persist).is_err());
         assert!(isolated_store.ssh_host(&p.ssh.as_ref().unwrap().endpoint())?.is_none());
         eprintln!("Verified real SSH: keys, agent, trust, forwarding DNS, TLS names, cancel, independent tabs, transport loss and explicit reconnect.");
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "Requires disposable OpenSSH/PostgreSQL fixture"]
+fn ssh_test_connection_does_not_save_passphrase() -> Result<()> {
+    runtime()?.block_on(async {
+        let directory = tempfile::tempdir()?;
+        let store = Store::open(directory.path().join("app.db"))?;
+        let connector = Connector::new(store.clone());
+        let mut prompts = connector.take_prompts().unwrap();
+        let mut profile = profile();
+        let ssh = profile.ssh.as_mut().unwrap();
+        ssh.auth = SshAuth::PrivateKey {
+            path: env("QUERI_SSH_ENCRYPTED_KEY").into(),
+        };
+        ssh.remember_passphrase = true;
+        store.save_profile(&profile)?;
+        let id = profile.id;
+        let attempt = tokio::spawn(async move {
+            connector
+                .test(profile, env("QUERI_SSH_DATABASE_PASSWORD"), String::new())
+                .await
+        });
+        match tokio::time::timeout(Duration::from_secs(10), prompts.recv())
+            .await?
+            .context("Missing passphrase prompt")?
+        {
+            Prompt::Passphrase { reply, .. } => {
+                let _ = reply.send(Some(env("QUERI_SSH_PASSPHRASE")));
+            }
+            _ => anyhow::bail!("Expected passphrase prompt"),
+        }
+        prompt(&mut prompts, HostDecision::Session, false).await?;
+        attempt.await??;
+        assert!(
+            store.load_ssh_passphrase(id)?.is_none(),
+            "Test connection must not save credentials"
+        );
         Ok(())
     })
 }
