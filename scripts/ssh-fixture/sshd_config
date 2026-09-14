@@ -1,0 +1,14 @@
+Port 22
+HostKey /fixture/host_key
+AuthorizedKeysFile /fixture/authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AllowUsers tunnel
+AllowTcpForwarding local
+PermitOpen database:5432 wrong-database:5432
+X11Forwarding no
+AllowAgentForwarding no
+PermitTTY no
+StrictModes no
+Subsystem sftp internal-sftp

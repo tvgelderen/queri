@@ -15,6 +15,7 @@ mod query_plan;
 mod row_editor;
 mod saved_queries;
 mod search;
+mod ssh_prompt;
 mod table_finder;
 mod theme;
 mod transaction_guard;
@@ -55,6 +56,7 @@ impl ConnectionState {
 
 #[derive(Clone)]
 pub struct Services {
+    pub connector: Arc<crate::ssh::Connector>,
     pub runtime: Arc<tokio::runtime::Runtime>,
     pub store: Store,
     preferences: tokio::sync::mpsc::UnboundedSender<PreferenceWrite>,
@@ -81,6 +83,7 @@ impl Services {
             }
         });
         Self {
+            connector: crate::ssh::Connector::new(store.clone()),
             runtime,
             store,
             preferences: sender,
@@ -105,7 +108,10 @@ pub fn task<V: 'static, T: Send + 'static>(
     complete: impl FnOnce(&mut V, Result<T>, &mut Window, &mut Context<V>) + 'static,
 ) {
     let job = services.runtime.spawn(future);
+    let abort = job.abort_handle();
+    let released = cx.on_release(move |_, _| abort.abort());
     cx.spawn_in(window, async move |view, cx| {
+        let _released = released;
         let result = job
             .await
             .map_err(anyhow::Error::from)

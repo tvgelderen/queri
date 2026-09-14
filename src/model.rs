@@ -33,6 +33,36 @@ pub enum ConnectionConfig {
     },
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SshAuth {
+    Agent { fingerprint: String },
+    PrivateKey { path: PathBuf },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SshConfig {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub auth: SshAuth,
+    #[serde(default)]
+    pub remember_passphrase: bool,
+}
+
+impl SshConfig {
+    pub fn endpoint(&self) -> String {
+        format!(
+            "[{}]:{}",
+            self.host
+                .trim()
+                .trim_matches(['[', ']'])
+                .trim_end_matches('.')
+                .to_ascii_lowercase(),
+            self.port
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Environment {
     Development,
@@ -70,6 +100,8 @@ impl ExecutionPolicy {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConnectionProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshConfig>,
     #[serde(default)]
     pub environment: Option<Environment>,
     #[serde(default)]
@@ -128,6 +160,29 @@ impl ConnectionProfile {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if let Some(ssh) = &self.ssh {
+            ensure!(
+                matches!(self.config, ConnectionConfig::Postgres { .. }),
+                "SSH tunneling requires PostgreSQL."
+            );
+            ensure!(
+                !ssh.host.trim().is_empty() && ssh.port > 0 && !ssh.user.trim().is_empty(),
+                "Enter an SSH host, port and user."
+            );
+            match &ssh.auth {
+                SshAuth::PrivateKey { path } => {
+                    ensure!(!path.as_os_str().is_empty(), "Choose an SSH private key.")
+                }
+                SshAuth::Agent { fingerprint } => ensure!(
+                    fingerprint.starts_with("SHA256:"),
+                    "Choose an SSH agent identity."
+                ),
+            }
+            ensure!(
+                !ssh.remember_passphrase || matches!(ssh.auth, SshAuth::PrivateKey { .. }),
+                "An agent identity has no saved passphrase."
+            );
+        }
         ensure!(
             self.policy != ExecutionPolicy::ReadOnlyByDefault
                 || matches!(self.config, ConnectionConfig::Postgres { .. }),

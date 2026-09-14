@@ -76,6 +76,7 @@ enum ConnectionAttempt {
     Connected {
         password: String,
         databases: Vec<String>,
+        transport: Option<Arc<crate::ssh::Transport>>,
     },
     PasswordRequired,
 }
@@ -88,7 +89,9 @@ pub struct Workspace {
     selected: Option<Uuid>,
     passwords: HashMap<Uuid, String>,
     generation: Uuid,
+    generation_cancel: tokio_util::sync::CancellationToken,
     connection_state: ConnectionState,
+    ssh_transport: Option<Arc<crate::ssh::Transport>>,
     databases: Vec<String>,
     branches: BTreeMap<String, DatabaseBranch>,
     loading: BTreeSet<String>,
@@ -116,6 +119,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         Document::init(cx);
+        super::ssh_prompt::install(&services, window, cx);
         cx.bind_keys([
             KeyBinding::new("ctrl-n", NewQuery, Some("QueriWorkspace")),
             KeyBinding::new("ctrl-p", FindTable, Some("QueriWorkspace")),
@@ -201,6 +205,7 @@ impl Workspace {
                     if let Err(error) = result {
                         eprintln!("Could not save workspace: {error:#}");
                     }
+                    let connector = services.connector.clone();
                     let job = services.runtime.spawn(async move {
                         for session in sessions {
                             let _ = session.cancel().await;
@@ -211,6 +216,7 @@ impl Workspace {
                                 let _ = session.query("ROLLBACK".into()).await;
                             }
                         }
+                        connector.shutdown();
                     });
                     let _ = job.await;
                 }
@@ -232,7 +238,9 @@ impl Workspace {
             selected: None,
             passwords: HashMap::new(),
             generation: Uuid::new_v4(),
+            generation_cancel: tokio_util::sync::CancellationToken::new(),
             connection_state: ConnectionState::Disconnected,
+            ssh_transport: None,
             databases: vec![],
             branches: BTreeMap::new(),
             loading: BTreeSet::new(),
@@ -352,6 +360,10 @@ impl Workspace {
         else {
             return;
         };
+        self.generation_cancel.cancel();
+        self.generation_cancel = tokio_util::sync::CancellationToken::new();
+        self.ssh_transport = None;
+        self.services.connector.prepare_reconnect(id);
         self.selected = Some(id);
         self.connection_picker
             .update(cx, |picker, cx| picker.set_selected(Some(id), window, cx));
@@ -371,38 +383,50 @@ impl Workspace {
         self.error.clear();
         let cached = self.passwords.get(&id).cloned();
         let store = self.services.store.clone();
+        let connector = self.services.connector.clone();
+        let cancellation = self.generation_cancel.clone();
         task(
             &self.services,
             window,
             cx,
             async move {
-                let password = if let Some(password) = cached {
-                    password
-                } else if matches!(profile.config, ConnectionConfig::Postgres { .. }) {
-                    let password = if profile.remember_password {
-                        match tokio::task::spawn_blocking(move || store.load_password(id)).await? {
-                            Ok(password) => password,
-                            Err(error) => {
-                                eprintln!("Could not load the connection password: {error:#}");
+                cancellation
+                    .run_until_cancelled(async move {
+                        let password = if let Some(password) = cached {
+                            password
+                        } else if matches!(profile.config, ConnectionConfig::Postgres { .. }) {
+                            let password = if profile.remember_password {
+                                match tokio::task::spawn_blocking(move || store.load_password(id))
+                                    .await?
+                                {
+                                    Ok(password) => password,
+                                    Err(error) => {
+                                        eprintln!(
+                                            "Could not load the connection password: {error:#}"
+                                        );
+                                        None
+                                    }
+                                }
+                            } else {
                                 None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    let Some(password) = password else {
-                        return Ok(ConnectionAttempt::PasswordRequired);
-                    };
-                    password
-                } else {
-                    String::new()
-                };
-                let session = Session::connect(profile, password.clone()).await?;
-                let databases = session.databases().await?;
-                Ok(ConnectionAttempt::Connected {
-                    password,
-                    databases,
-                })
+                            };
+                            let Some(password) = password else {
+                                return Ok(ConnectionAttempt::PasswordRequired);
+                            };
+                            password
+                        } else {
+                            String::new()
+                        };
+                        let session = connector.connect(profile, password.clone()).await?;
+                        let databases = session.databases().await?;
+                        Ok(ConnectionAttempt::Connected {
+                            transport: session.ssh_transport(),
+                            password,
+                            databases,
+                        })
+                    })
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("Connection attempt cancelled"))?
             },
             move |this, result, window, cx| {
                 if this.generation != generation {
@@ -412,7 +436,23 @@ impl Workspace {
                     Ok(ConnectionAttempt::Connected {
                         password,
                         databases,
+                        transport,
                     }) => {
+                        if let Some(transport) = &transport {
+                            let lost = transport.closed.clone();
+                            cx.spawn_in(window, async move |view, cx| {
+                                lost.cancelled().await;
+                                let _ = view.update_in(cx, |this, window, cx| {
+                                    if this.generation != generation { return; }
+                                    this.connection_state = ConnectionState::Failed;
+                                    this.status = "SSH connection lost · reconnect explicitly".into();
+                                    this.error = "The bastion connection closed. Tab results and local edits are stale; transaction outcomes may be unknown.".into();
+                                    this.sync_connections(window, cx);
+                                    cx.notify();
+                                });
+                            }).detach();
+                        }
+                        this.ssh_transport = transport;
                         this.connection_state = ConnectionState::Ready;
                         this.passwords.insert(id, password.clone());
                         this.databases = databases;
@@ -576,19 +616,26 @@ impl Workspace {
                 let password = self.passwords.get(&profile.id).cloned().unwrap_or_default();
                 self.loading.insert(id.clone());
                 let profile = profile.for_database(&database);
+                let connector = self.services.connector.clone();
+                let cancellation = self.generation_cancel.clone();
                 task(
                     &self.services,
                     window,
                     cx,
                     async move {
-                        let session = Session::connect(profile, password).await?;
-                        let schemas = session
-                            .schemas()
-                            .await?
-                            .into_iter()
-                            .map(|name| (name, None))
-                            .collect();
-                        Ok(DatabaseBranch { session, schemas })
+                        cancellation
+                            .run_until_cancelled(async move {
+                                let session = connector.connect(profile, password).await?;
+                                let schemas = session
+                                    .schemas()
+                                    .await?
+                                    .into_iter()
+                                    .map(|name| (name, None))
+                                    .collect();
+                                Ok(DatabaseBranch { session, schemas })
+                            })
+                            .await
+                            .ok_or_else(|| anyhow::anyhow!("Connection attempt cancelled"))?
                     },
                     move |this, result, _, cx| {
                         if this.generation != generation {
@@ -1229,6 +1276,7 @@ impl Workspace {
                     view.update(cx, |this, cx| {
                         let store = this.services.store.clone();
                         let id = profile.id;
+                        this.services.connector.invalidate(id);
                         task(
                             &this.services,
                             window,
@@ -1246,6 +1294,8 @@ impl Workspace {
                                         this.refresh_draft_search(window, cx);
                                         this.active = 0;
                                         if this.selected == Some(id) {
+                                            this.generation_cancel.cancel();
+                                            this.ssh_transport = None;
                                             this.selected = None;
                                             this.generation = Uuid::new_v4();
                                             this.connection_state = ConnectionState::Disconnected;

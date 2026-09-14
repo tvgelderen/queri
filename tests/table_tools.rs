@@ -54,6 +54,7 @@ async fn session(pg: bool, path: std::path::PathBuf) -> Result<Arc<Session>> {
     };
     let session = Session::connect(
         ConnectionProfile {
+            ssh: None,
             id: uuid::Uuid::new_v4(),
             name: "Tools fixture".into(),
             notes: String::new(),

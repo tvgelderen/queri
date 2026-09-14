@@ -1,5 +1,5 @@
 use super::{Services, controls::disclosure_button, field, input, task};
-use crate::{database::Session, model::*};
+use crate::model::*;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, Sizable, WindowExt,
@@ -128,12 +128,14 @@ impl DatabaseAdmin {
         let password = self.password.clone();
         self.busy = true;
         self.error.clear();
+        let connector = self.services.connector.clone();
         task(
             &self.services,
             window,
             cx,
             async move {
-                Session::connect(profile, password)
+                connector
+                    .connect(profile, password)
                     .await?
                     .database_connections(database)
                     .await
@@ -240,12 +242,14 @@ impl DatabaseAdmin {
         let completed = action.clone();
         self.busy = true;
         self.error.clear();
+        let connector = self.services.connector.clone();
         task(
             &self.services,
             window,
             cx,
             async move {
-                Session::connect(profile, password)
+                connector
+                    .connect(profile, password)
                     .await?
                     .database_action(action)
                     .await
@@ -352,6 +356,7 @@ mod tests {
             Store::open(directory.path().join("app.db")).unwrap(),
         );
         let profile = ConnectionProfile {
+            ssh: None,
             id: uuid::Uuid::new_v4(),
             name: "Protected".into(),
             notes: String::new(),

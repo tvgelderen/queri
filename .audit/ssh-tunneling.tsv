@@ -1,0 +1,25 @@
+step	decision_or_check	result
+inspection	Read model, PostgreSQL connection/cancellation, storage schema, UI connection callsites	Existing connections are direct; no SSH implementation added
+api	Consulted https://docs.rs/russh/latest/russh/client/struct.Handle.html and trait.Handler.html	Required channel and host-key callback documented; Rust compatibility NOT compiled
+api	Read vendored config.rs and cancel_token.rs	connect_raw and cancel_query_raw accept AsyncRead + AsyncWrite streams
+fixture	Generate temporary host and plain/encrypted client keys; publish only SSH port	Implemented disposable Docker fixture; no developer keys used
+verification	bash -n scripts/ssh-fixture/run.sh	Passed
+verification	Initial fixture invocation with internal Docker network	Failed: no published SSH port; changed to ordinary isolated named bridge
+verification	Run psql SELECT 1 inside bastion against database DNS alias	Passed: returned 1; cleanup completed
+remaining	SSH protocol/client integration, trust, storage, lifecycle, UI, failure handling, full test matrix	NOT IMPLEMENTED; fixture alone is not feature completion or raw-stream proof
+implementation	Added optional SSH profile settings and embedded russh 0.65.1 with native PostgreSQL raw streams	Complete production path; backward-compatible default off; no shell or localhost forwarding listener
+api-verified	Read current official russh Handler and Handle docs plus downloaded crate source; read vendored connect_raw/cancel_query_raw	Actual handshake key verified before authentication; cancellation opens a fresh direct-tcpip channel on the original transport
+trust	App-owned normalized endpoint trust; GPUI cancel/session/persist choices and separate changed-key replacement confirmation	Persistent compare-and-swap protects replacement; storage errors fail closed; no known_hosts/config integration
+credentials	Schema v6 adds authenticated credential purposes and preserves legacy ciphertext without requiring its key	Database-password and SSH-passphrase substitution fails; legacy records upgrade on successful read; missing/damaged-key protections retained
+lifecycle	Weak transport cache plus shared establishment waiters, exact generation and attempt checks, owner/generation cancellation	Independent PG sessions per tab; one waiter can cancel without cancelling another; stale completions cannot replace current sessions
+reconnect	Loss signals mark documents/results stale; guarded explicit reconnect reapplies policy/timeout	No SQL/temporary-object replay; old cancel tokens cannot use replacement transports; explorer retains only its transport lease
+fixture-failure	Real reconnect initially failed because Docker changed a randomly published SSH port on restart	Fixed fixture to publish an explicitly selected temporary port; reran real restart checks successfully
+fixture-failure	No-replay check initially put fixture setup and BEGIN in one PG simple-query batch	PG correctly rolled back that implicit transaction; split durable setup from the transaction under test
+race-failure	Repeated changed-key verification exposed reuse of a just-completed failed establishment	Only unfinished pending attempts can accept new waiters; completion additionally checks the exact pending attempt
+verification	bash scripts/check-ssh.sh	Passed native SSH UI tests, storage tests, and real SSH/PG suite; final expanded route suite also passed after a 16-second human trust wait
+verification	Real SSH/PG fixture algorithm/format matrix	Passed plain/encrypted Ed25519 OpenSSH, ECDSA P-256 OpenSSH, RSA PEM, encrypted RSA PKCS#8, and SSH_AUTH_SOCK signing
+verification	Real SSH/PG fixture trust/TLS/cancellation/lifecycle checks	Passed reject/session/persistent/change/replace trust, remote-only DNS, TLS Verify/Require/Disable and hostname mismatch, pg_sleep cancel, independent transactions, policy/timeout, maintenance DB routing, isolated test transport, final-consumer release, cancellation/edit races
+verification	Real lost-outcome/reconnect check	Committed write remained exactly once after transport loss; transaction status Unknown; temporary objects not restored; old cancel token rejected
+verification	QUERI_TEST_POSTGRES=<disposable PostgreSQL 18> bash scripts/check.sh	Passed formatting, strict Clippy, normal suite, plus 5 PostgreSQL native tests, 19 PostgreSQL database tests, and 1 PostgreSQL table-tools test
+verification	bash scripts/check.sh after final credential migration and UI changes	Passed final formatting/strict Clippy, 79 unit/native tests, 3 backdrop tests, 22 database tests, 17 storage tests, and 2 table-tool tests; external-service ignores were run separately where noted
+limits	Validation environment	Linux tested; no macOS/Windows or hardware-backed-agent testing; no packet-blackhole keepalive test; OS file-picker window not automated

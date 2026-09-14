@@ -8,7 +8,8 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use futures::TryStreamExt;
 use postgres_native_tls::MakeTlsConnector;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
+use tokio_postgres::tls::MakeTlsConnect;
 use tokio_postgres::{Client, GenericClient, SimpleQueryMessage, types::ToSql};
 pub(super) use updates::apply as apply_updates;
 
@@ -16,17 +17,45 @@ pub struct Postgres {
     pub client: AsyncMutex<Client>,
     pub cancel: tokio_postgres::CancelToken,
     pub tls: MakeTlsConnector,
+    pub(super) transport: Option<Arc<crate::ssh::Transport>>,
+    host: String,
+    port: u16,
+    deadline: Duration,
+    pub lost: tokio_util::sync::CancellationToken,
     initial_timeout: String,
     driver: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for Postgres {
     fn drop(&mut self) {
+        self.lost.cancel();
         self.driver.abort();
     }
 }
 
 impl Postgres {
+    pub async fn cancel_query(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.lost.is_cancelled(),
+            "The original database session was lost; cancellation cannot target a replacement session"
+        );
+        tokio::time::timeout(self.deadline, async {
+            if let Some(transport) = &self.transport {
+                let stream = transport.channel(&self.host, self.port).await?;
+                let tls = <MakeTlsConnector as MakeTlsConnect<
+                    russh::ChannelStream<russh::client::Msg>,
+                >>::make_tls_connect(&mut self.tls.clone(), &self.host)?;
+                self.cancel.cancel_query_raw(stream, tls).await?;
+            } else {
+                self.cancel.cancel_query(self.tls.clone()).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("Cancellation request timed out")?
+        .context("Could not send the cancellation request")
+    }
+
     pub async fn apply_timeout(
         &self,
         client: &Client,
@@ -60,7 +89,11 @@ impl Postgres {
         Ok(())
     }
 
-    pub async fn connect(profile: &ConnectionProfile, password: &str) -> Result<Self> {
+    pub async fn connect(
+        profile: &ConnectionProfile,
+        password: &str,
+        transport: Option<Arc<crate::ssh::Transport>>,
+    ) -> Result<Self> {
         let ConnectionConfig::Postgres {
             host,
             port,
@@ -98,30 +131,68 @@ impl Postgres {
                 .danger_accept_invalid_hostnames(true);
         }
         let connector = MakeTlsConnector::new(builder.build()?);
-        let (client, connection) = tokio::time::timeout(
-            Duration::from_secs(*timeout_seconds),
-            config.connect(connector.clone()),
-        )
-        .await
-        .context("Connection timed out")??;
-        let driver = tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                eprintln!("PostgreSQL connection closed: {error}");
-            }
-        });
+        let deadline = Duration::from_secs(*timeout_seconds);
+        let lost = tokio_util::sync::CancellationToken::new();
+        let (client, driver) = if let Some(transport) = &transport {
+            let stream = transport.channel(host, *port).await?;
+            let tls = <MakeTlsConnector as MakeTlsConnect<
+                russh::ChannelStream<russh::client::Msg>,
+            >>::make_tls_connect(&mut connector.clone(), host)?;
+            let (client, connection) =
+                tokio::time::timeout(deadline, config.connect_raw(stream, tls))
+                    .await
+                    .context("PostgreSQL handshake over SSH timed out")?
+                    .context("PostgreSQL handshake / TLS over SSH failed")?;
+            let driver = drive(connection, lost.clone(), transport.closed.clone());
+            (client, driver)
+        } else {
+            let (client, connection) =
+                tokio::time::timeout(deadline, config.connect(connector.clone()))
+                    .await
+                    .context("PostgreSQL connection timed out")??;
+            let driver = drive(
+                connection,
+                lost.clone(),
+                tokio_util::sync::CancellationToken::new(),
+            );
+            (client, driver)
+        };
         let cancel = client.cancel_token();
-        let initial_timeout: String = client
-            .query_one("SHOW statement_timeout", &[])
-            .await?
-            .get(0);
-        Ok(Self {
+        let mut pg = Self {
             client: AsyncMutex::new(client),
             cancel,
             tls: connector,
-            initial_timeout,
+            transport,
+            host: host.clone(),
+            port: *port,
+            deadline,
+            lost,
+            initial_timeout: String::new(),
             driver,
-        })
+        };
+        pg.initial_timeout = tokio::time::timeout(
+            deadline,
+            pg.client
+                .lock()
+                .await
+                .query_one("SHOW statement_timeout", &[]),
+        )
+        .await
+        .context("PostgreSQL session initialization timed out")??
+        .get(0);
+        Ok(pg)
     }
+}
+
+fn drive(
+    connection: impl std::future::Future<Output = Result<(), tokio_postgres::Error>> + Send + 'static,
+    lost: tokio_util::sync::CancellationToken,
+    transport_closed: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let _signal = lost.clone().drop_guard();
+        tokio::select! { _ = connection => {}, _ = transport_closed.cancelled() => {} }
+    })
 }
 
 /// The simple protocol preserves exact server text for arbitrary extension types, numerics,

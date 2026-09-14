@@ -41,10 +41,22 @@ struct BrowsePlan {
 
 impl Session {
     pub async fn connect(profile: ConnectionProfile, password: String) -> Result<Arc<Self>> {
+        anyhow::ensure!(
+            profile.ssh.is_none(),
+            "SSH profiles require the shared connection service"
+        );
+        Self::connect_transport(profile, password, None).await
+    }
+
+    pub(crate) async fn connect_transport(
+        profile: ConnectionProfile,
+        password: String,
+        transport: Option<Arc<crate::ssh::Transport>>,
+    ) -> Result<Arc<Self>> {
         profile.validate()?;
         let backend = match &profile.config {
             ConnectionConfig::Postgres { .. } => Backend::Postgres(Box::new(
-                postgres::Postgres::connect(&profile, &password).await?,
+                postgres::Postgres::connect(&profile, &password, transport).await?,
             )),
             ConnectionConfig::Sqlite {
                 path,
@@ -96,6 +108,20 @@ impl Session {
             read_write_observed: AtomicBool::new(false),
             updates_cancelled: Arc::new(AtomicBool::new(false)),
         }))
+    }
+
+    pub(crate) fn ssh_transport(&self) -> Option<Arc<crate::ssh::Transport>> {
+        match &self.backend {
+            Backend::Postgres(pg) => pg.transport.clone(),
+            _ => None,
+        }
+    }
+
+    pub fn connection_lost(&self) -> Option<tokio_util::sync::CancellationToken> {
+        match &self.backend {
+            Backend::Postgres(pg) => Some(pg.lost.clone()),
+            _ => None,
+        }
     }
 
     async fn with_sqlite<T: Send + 'static>(
@@ -245,11 +271,7 @@ impl Session {
     pub async fn cancel(&self) -> Result<()> {
         self.updates_cancelled.store(true, Ordering::Relaxed);
         match &self.backend {
-            Backend::Postgres(pg) => pg
-                .cancel
-                .cancel_query(pg.tls.clone())
-                .await
-                .context("Could not send the cancellation request"),
+            Backend::Postgres(pg) => pg.cancel_query().await,
             Backend::Sqlite { interrupt, .. } => {
                 interrupt.interrupt();
                 Ok(())

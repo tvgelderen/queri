@@ -152,6 +152,9 @@ pub struct Document {
     pub(super) transaction: TransactionStatus,
     transaction_started: Option<Instant>,
     session_generation: u64,
+    connect_cancel: tokio_util::sync::CancellationToken,
+    stale: bool,
+    connected_once: bool,
     pub(super) releasing: bool,
     cancel_pending: bool,
     status: String,
@@ -359,6 +362,9 @@ impl Document {
             transaction: TransactionStatus::Idle,
             transaction_started: None,
             session_generation: 0,
+            connect_cancel: tokio_util::sync::CancellationToken::new(),
+            stale: false,
+            connected_once: false,
             releasing: false,
             cancel_pending: false,
             status: "Connecting…".into(),
@@ -436,6 +442,9 @@ impl Document {
             editor_height: self.editor_height,
         }
     }
+    fn has_loaded_results(&self) -> bool {
+        !self.results.is_empty() || matches!(self.kind, DocumentKind::Table { page: Some(_), .. })
+    }
     pub fn busy(&self) -> bool {
         self.operation != Operation::Idle || self.releasing || self.cancel_pending
     }
@@ -448,6 +457,8 @@ impl Document {
         password: String,
         cx: &mut Context<Self>,
     ) {
+        self.connect_cancel.cancel();
+        self.stale = self.has_loaded_results();
         self.profile = profile.for_database(&self.profile.database());
         self.password = Some(password);
         self.applied_browse = None;
@@ -465,6 +476,8 @@ impl Document {
         self.database_available = true;
     }
     pub fn disconnect(&mut self, cx: &mut Context<Self>) {
+        self.connect_cancel.cancel();
+        self.stale = self.has_loaded_results();
         self.applied_browse = None;
         self.parameter_seed = None;
         self.session_generation += 1;
@@ -509,6 +522,11 @@ impl Document {
             }
             None => String::new(),
         };
+        let initial_load = !self.connected_once;
+        self.connect_cancel.cancel();
+        self.connect_cancel = tokio_util::sync::CancellationToken::new();
+        let cancellation = self.connect_cancel.clone();
+        self.services.connector.prepare_reconnect(self.profile.id);
         self.operation = Operation::Connecting;
         self.error.clear();
         self.status = "Connecting…".into();
@@ -517,12 +535,17 @@ impl Document {
         self.parameter_seed = None;
         self.session_generation += 1;
         let generation = self.session_generation;
+        let connector = self.services.connector.clone();
         task(
             &self.services,
             window,
             cx,
             async move {
-                let session = Session::connect(profile, password).await?;
+                let session = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => anyhow::bail!("Connection attempt cancelled"),
+                    session = connector.connect(profile, password) => session?,
+                };
                 let state = session
                     .transaction_status()
                     .await
@@ -536,14 +559,29 @@ impl Document {
                 this.operation = Operation::Idle;
                 match result {
                     Ok((session, state)) => {
+                        this.connected_once = true;
                         if let Err(error) = session.set_statement_timeout(this.statement_timeout) {
                             this.error = error.to_string();
                         }
                         this.completion.set_session(Some(session.clone()));
+                        if let Some(lost) = session.connection_lost() {
+                            cx.spawn_in(window, async move |view, cx| {
+                                lost.cancelled().await;
+                                let _ = view.update_in(cx, |this, _, cx| {
+                                    if this.session_generation != generation { return; }
+                                    this.completion.set_session(None);
+                                    this.transaction = TransactionStatus::Unknown;
+                                    this.stale = true;
+                                    this.status = "Connection lost · results and local edits are stale".into();
+                                    this.error = "Connection lost. A query or COMMIT may have taken effect; its outcome is unknown. Results and edits are retained. Reconnect explicitly after checking the server; Queri never replays SQL.".into();
+                                    cx.notify();
+                                });
+                            }).detach();
+                        }
                         this.session = Some(session);
                         this.observe_transaction(state, cx);
                         this.status = "Connected · ready".into();
-                        if matches!(this.kind, DocumentKind::Table { .. }) {
+                        if initial_load && matches!(this.kind, DocumentKind::Table { .. }) {
                             this.refresh(window, cx);
                         }
                     }
@@ -661,6 +699,7 @@ impl Document {
                 this.operation = Operation::Idle;
                 match result {
                     Ok(page) => {
+                        this.stale = false;
                         this.applied_browse = Some(applied_options);
                         this.status = format!(
                             "{} matching rows{}",
@@ -1075,6 +1114,7 @@ impl Document {
                 this.operation = Operation::Idle;
                 match result {
                     Ok((Ok(output), history_error, _)) => {
+                        this.stale = false;
                         this.query_outcome = QueryOutcome::Succeeded;
                         this.status = format!(
                             "Completed in {} ms{}",
@@ -1402,6 +1442,12 @@ impl Document {
     }
 
     pub fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.operation == Operation::Connecting {
+            self.connect_cancel.cancel();
+            self.status = "Cancelling connection…".into();
+            cx.notify();
+            return;
+        }
         if self.operation != Operation::Running {
             return;
         }
@@ -3539,6 +3585,7 @@ impl Render for Document {
                             }),
                     ),
             )
+            .when(self.stale, |view| view.child(div().id("stale-session-results").role(Role::Status).px_4().py_2().text_sm().bg(cx.theme().muted).child("Results and local edits are stale after a session change. Refresh the table or run SQL explicitly to load current data.")))
             .child(self.grid_search.clone())
             .child(div().flex_1().min_h_0().overflow_hidden().child(content))
             .when(!self.error.is_empty(), |view| {

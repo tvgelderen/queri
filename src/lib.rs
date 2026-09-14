@@ -12,3 +12,5 @@ pub mod ui;
 pub mod query_plan;
 pub mod row_updates;
 pub mod statistics;
+
+pub mod ssh;

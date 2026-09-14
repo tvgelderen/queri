@@ -25,6 +25,7 @@ impl Fixture {
         let directory = tempfile::tempdir().expect("temporary data directory");
         let store = Store::open(directory.path().join("app.db")).expect("open app database");
         let profile = ConnectionProfile {
+            ssh: None,
             environment: None,
             policy: ExecutionPolicy::Normal,
             remember_password: false,

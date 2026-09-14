@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 fn sqlite_profile(path: std::path::PathBuf) -> ConnectionProfile {
     ConnectionProfile {
+        ssh: None,
         environment: None,
         policy: ExecutionPolicy::Normal,
         remember_password: false,
@@ -590,6 +591,7 @@ fn postgres_profile() -> Result<(ConnectionProfile, String)> {
     };
     Ok((
         ConnectionProfile {
+            ssh: None,
             environment: None,
             policy: ExecutionPolicy::Normal,
             remember_password: false,

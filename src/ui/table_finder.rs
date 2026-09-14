@@ -1,8 +1,5 @@
 use super::{Services, controls::empty_state, task};
-use crate::{
-    database::Session,
-    model::{ConnectionProfile, TableRef},
-};
+use crate::model::{ConnectionProfile, TableRef};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme, Icon, IndexPath, Sizable, WindowExt,
@@ -61,12 +58,13 @@ impl TableFinder {
         self.state = LoadState::Loading;
         let profile = self.profile.clone();
         let password = self.password.clone();
+        let connector = self.services.connector.clone();
         task(
             &self.services,
             window,
             cx,
             async move {
-                let session = Session::connect(profile, password).await?;
+                let session = connector.connect(profile, password).await?;
                 let mut tables = vec![];
                 // Load every schema in this database, even if its tree branch was never opened.
                 for schema in session.schemas().await? {

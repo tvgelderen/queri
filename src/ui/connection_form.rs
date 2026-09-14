@@ -3,7 +3,7 @@ use super::{
     controls::{choice, disclosure_button, setting_switch},
     input, task,
 };
-use crate::{database::Session, model::*};
+use crate::model::*;
 use anyhow::Result;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -11,7 +11,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     form::Field,
     h_flex,
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     tab::{Tab, TabBar},
     v_flex,
 };
@@ -26,6 +26,18 @@ pub struct SavedConnection {
 
 pub struct ConnectionForm {
     services: Services,
+    ssh_enabled: bool,
+    ssh_host: Entity<InputState>,
+    ssh_port: Entity<InputState>,
+    ssh_user: Entity<InputState>,
+    ssh_key: Entity<InputState>,
+    ssh_passphrase: Entity<InputState>,
+    ssh_remember: bool,
+    ssh_agent: bool,
+    ssh_identity: String,
+    ssh_identities: Vec<String>,
+    test_cancel: Option<futures::future::AbortHandle>,
+    key_subscription: Option<Subscription>,
     id: Uuid,
     sqlite: bool,
     existing: bool,
@@ -66,6 +78,73 @@ impl ConnectionForm {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut form = Self {
+            ssh_enabled: existing.as_ref().is_some_and(|p| p.ssh.is_some()),
+            ssh_host: input(
+                existing
+                    .as_ref()
+                    .and_then(|p| p.ssh.as_ref())
+                    .map(|s| s.host.clone())
+                    .unwrap_or_default(),
+                window,
+                cx,
+            ),
+            ssh_port: input(
+                existing
+                    .as_ref()
+                    .and_then(|p| p.ssh.as_ref())
+                    .map(|s| s.port)
+                    .unwrap_or(22)
+                    .to_string(),
+                window,
+                cx,
+            ),
+            ssh_user: input(
+                existing
+                    .as_ref()
+                    .and_then(|p| p.ssh.as_ref())
+                    .map(|s| s.user.clone())
+                    .unwrap_or_default(),
+                window,
+                cx,
+            ),
+            ssh_key: input(
+                existing
+                    .as_ref()
+                    .and_then(|p| p.ssh.as_ref())
+                    .and_then(|s| {
+                        if let SshAuth::PrivateKey { path } = &s.auth {
+                            Some(path.to_string_lossy().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default(),
+                window,
+                cx,
+            ),
+            ssh_passphrase: cx.new(|cx| InputState::new(window, cx).masked(true)),
+            ssh_remember: existing
+                .as_ref()
+                .and_then(|p| p.ssh.as_ref())
+                .is_some_and(|s| s.remember_passphrase),
+            ssh_agent: existing
+                .as_ref()
+                .and_then(|p| p.ssh.as_ref())
+                .is_some_and(|s| matches!(s.auth, SshAuth::Agent { .. })),
+            ssh_identity: existing
+                .as_ref()
+                .and_then(|p| p.ssh.as_ref())
+                .and_then(|s| {
+                    if let SshAuth::Agent { fingerprint } = &s.auth {
+                        Some(fingerprint.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default(),
+            ssh_identities: vec![],
+            test_cancel: None,
+            key_subscription: None,
             existing: existing.is_some(),
             advanced: false,
             uri_mode: false,
@@ -124,6 +203,47 @@ impl ConnectionForm {
             error: false,
             field_error: None,
         };
+        form.key_subscription = Some(cx.subscribe_in(
+            &form.ssh_key,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Change) && !this.busy {
+                    this.ssh_passphrase
+                        .update(cx, |state, cx| state.set_value("", window, cx));
+                    this.services.connector.clear_passphrase(this.id);
+                }
+            },
+        ));
+        if form.ssh_remember {
+            let store = form.services.store.clone();
+            let id = form.id;
+            let expected_key = form.ssh_key.read(cx).value().to_string();
+            task(
+                &form.services,
+                window,
+                cx,
+                async move { tokio::task::spawn_blocking(move || store.load_ssh_passphrase(id)).await? },
+                move |this, result, window, cx| {
+                    match result {
+                        Ok(Some(passphrase))
+                            if this.ssh_remember
+                                && !this.ssh_agent
+                                && this.ssh_key.read(cx).value().as_str() == expected_key
+                                && this.ssh_passphrase.read(cx).value().is_empty() =>
+                        {
+                            this.ssh_passphrase
+                                .update(cx, |state, cx| state.set_value(passphrase, window, cx))
+                        }
+                        Err(error) => {
+                            this.error = true;
+                            this.message = format!("Could not read SSH passphrase: {error:#}");
+                        }
+                        _ => {}
+                    }
+                    cx.notify();
+                },
+            );
+        }
         if let Some(profile) = existing {
             match profile.config {
                 ConnectionConfig::Postgres {
@@ -232,6 +352,30 @@ impl ConnectionForm {
             }
         };
         let profile = ConnectionProfile {
+            ssh: if self.ssh_enabled && !self.sqlite {
+                Some(SshConfig {
+                    host: self.ssh_host.read(cx).value().to_string(),
+                    port: self
+                        .ssh_port
+                        .read(cx)
+                        .value()
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("SSH port must be between 1 and 65535"))?,
+                    user: self.ssh_user.read(cx).value().to_string(),
+                    auth: if self.ssh_agent {
+                        SshAuth::Agent {
+                            fingerprint: self.ssh_identity.clone(),
+                        }
+                    } else {
+                        SshAuth::PrivateKey {
+                            path: self.ssh_key.read(cx).value().to_string().into(),
+                        }
+                    },
+                    remember_passphrase: self.ssh_remember && !self.ssh_agent,
+                })
+            } else {
+                None
+            },
             environment: self.environment,
             policy: self.policy,
             remember_password: !self.sqlite && self.remember,
@@ -398,6 +542,32 @@ impl ConnectionForm {
             }
         };
         let password = self.password.read(cx).value().to_string();
+        let passphrase = self.ssh_passphrase.read(cx).value().to_string();
+        let connector = self.services.connector.clone();
+        let (progress, mut stages) = tokio::sync::watch::channel("Starting connection test…");
+        if !save {
+            cx.spawn_in(window, async move |view, cx| {
+                while stages.changed().await.is_ok() {
+                    let message = *stages.borrow_and_update();
+                    if view
+                        .update_in(cx, |this, _, cx| {
+                            if this.busy {
+                                this.message = message.into();
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+        let (abort, cancellation) = futures::future::AbortHandle::new_pair();
+        if !save {
+            self.test_cancel = Some(abort);
+        }
         let store = self.services.store.clone();
         let sqlite = self.sqlite;
         let creating = sqlite && self.create && !self.existing;
@@ -414,27 +584,56 @@ impl ConnectionForm {
             window,
             cx,
             async move {
-                if save {
-                    if let ConnectionConfig::Sqlite { path, create, .. } = &mut profile.config {
-                        if creating {
-                            crate::database::create_sqlite_file(path.clone()).await?;
+                futures::future::Abortable::new(
+                    async move {
+                        if save {
+                            if let ConnectionConfig::Sqlite { path, create, .. } =
+                                &mut profile.config
+                            {
+                                if creating {
+                                    crate::database::create_sqlite_file(path.clone()).await?;
+                                }
+                                *create = false;
+                            }
+                            let profile_copy = profile.clone();
+                            let password_copy = password.clone();
+                            let passphrase_copy = passphrase.clone();
+                            tokio::task::spawn_blocking(move || {
+                                store.save_connection_with_ssh(
+                                    &profile_copy,
+                                    &password_copy,
+                                    Some(&passphrase_copy),
+                                )
+                            })
+                            .await??;
+                            connector.invalidate(profile.id);
+                            if profile
+                                .ssh
+                                .as_ref()
+                                .is_some_and(|s| matches!(s.auth, SshAuth::PrivateKey { .. }))
+                            {
+                                connector.supply_passphrase(profile.id, passphrase);
+                            }
+                        } else {
+                            connector
+                                .test_progress(
+                                    profile.clone(),
+                                    password.clone(),
+                                    passphrase,
+                                    Some(progress),
+                                )
+                                .await?;
                         }
-                        *create = false;
-                    }
-                    let profile_copy = profile.clone();
-                    let password_copy = password.clone();
-                    tokio::task::spawn_blocking(move || {
-                        store.save_connection(&profile_copy, &password_copy)
-                    })
-                    .await??;
-                } else {
-                    let session = Session::connect(profile.clone(), password.clone()).await?;
-                    session.query("SELECT 1".into()).await?;
-                }
-                Ok(SavedConnection { profile, password })
+                        Ok(SavedConnection { profile, password })
+                    },
+                    cancellation,
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("Connection test cancelled"))?
             },
             move |this, result, window, cx| {
                 this.busy = false;
+                this.test_cancel = None;
                 match result {
                     Ok(saved) => {
                         this.message = "Connection successful.".into();
@@ -462,6 +661,89 @@ impl ConnectionForm {
             },
         );
         cx.notify();
+    }
+
+    fn clear_passphrase(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.ssh_passphrase
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        let store = self.services.store.clone();
+        let id = self.id;
+        self.services.connector.clear_passphrase(id);
+        task(
+            &self.services,
+            window,
+            cx,
+            async move { tokio::task::spawn_blocking(move || store.clear_ssh_passphrase(id)).await? },
+            |this, result, _, cx| {
+                this.busy = false;
+                if let Err(error) = result {
+                    this.error = true;
+                    this.message = format!("Could not clear saved SSH passphrase: {error:#}");
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    fn browse_ssh_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose SSH private key".into()),
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = receiver.await;
+            let _ = view.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(Ok(Some(paths))) => {
+                        if let Some(path) = paths.first() {
+                            this.ssh_key.update(cx, |state, cx| {
+                                state.set_value(path.to_string_lossy().to_string(), window, cx)
+                            });
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        this.error = true;
+                        this.message =
+                            format!("File picker failed: {error}. Enter a path manually.");
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn load_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        task(
+            &self.services,
+            window,
+            cx,
+            crate::ssh::agent_identities(),
+            |this, result, _, cx| {
+                match result {
+                    Ok(identities) => {
+                        this.ssh_identities = identities;
+                        this.message = if this.ssh_identities.is_empty() {
+                            "No public key identities in SSH_AUTH_SOCK.".into()
+                        } else {
+                            "Choose an SSH agent identity.".into()
+                        };
+                    }
+                    Err(error) => {
+                        this.error = true;
+                        this.message = format!("{error:#}");
+                    }
+                }
+                cx.notify();
+            },
+        );
     }
 
     fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -517,8 +799,16 @@ impl ConnectionForm {
             .child(
                 Button::new("cancel-connection")
                     .label("Cancel")
-                    .disabled(self.busy)
-                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                    .disabled(self.busy && self.test_cancel.is_none())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if let Some(abort) = this.test_cancel.take() {
+                            abort.abort();
+                            this.message = "Cancelling connection test…".into();
+                            cx.notify();
+                        } else {
+                            window.close_dialog(cx);
+                        }
+                    })),
             )
             .when(!(self.sqlite && self.create && !self.existing), |footer| {
                 footer.child(
@@ -658,6 +948,104 @@ impl Render for ConnectionForm {
                         cx.notify();
                     }),
                 ));
+        }
+        if !self.sqlite {
+            form = form.child(setting_switch(
+                "ssh-enabled",
+                "Connect through SSH",
+                self.ssh_enabled,
+                cx.listener(|this, on, window, cx| {
+                    if this.busy {
+                        return;
+                    }
+                    this.ssh_enabled = *on;
+                    if !on {
+                        this.ssh_remember = false;
+                        this.clear_passphrase(window, cx);
+                    }
+                    cx.notify();
+                }),
+            ));
+            if self.ssh_enabled {
+                form = form.child(div().text_sm().child("The database host is resolved on the bastion. Database and SSH credentials are separate."))
+                    .child(h_flex().gap_3().child(div().flex_1().child(self.field("SSH host", &self.ssh_host))).child(div().w(px(110.)).child(self.field("SSH port", &self.ssh_port))))
+                    .child(self.field("SSH user", &self.ssh_user))
+                    .child(TabBar::new("ssh-auth").segmented().selected_index(usize::from(self.ssh_agent))
+                        .child(Tab::new().label("Private key")).child(Tab::new().label("SSH agent"))
+                        .on_click(cx.listener(|this, index, window, cx| { if this.busy { return; } this.ssh_agent = *index == 1; this.ssh_remember = false; this.clear_passphrase(window, cx); if this.ssh_agent { this.load_agent(window, cx); } cx.notify(); })));
+                if self.ssh_agent {
+                    form = form
+                        .child(choice(
+                            Button::new("ssh-agent-identity").disabled(self.busy).label(
+                                if self.ssh_identity.is_empty() {
+                                    "Choose identity".to_owned()
+                                } else {
+                                    self.ssh_identity.clone()
+                                },
+                            ),
+                            self.ssh_identity.clone(),
+                            self.ssh_identities
+                                .iter()
+                                .map(|fp| (fp.clone(), fp.clone().into())),
+                            cx.listener(|this, fp: &String, _, cx| {
+                                if this.busy {
+                                    return;
+                                }
+                                this.ssh_identity = fp.clone();
+                                cx.notify();
+                            }),
+                        ))
+                        .child(
+                            Button::new("ssh-agent-refresh")
+                                .disabled(self.busy)
+                                .label("Refresh agent identities")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.load_agent(window, cx)),
+                                ),
+                        );
+                } else {
+                    form = form
+                        .child(self.field_with_content(
+                            "SSH private key path",
+                            &self.ssh_key,
+                            |input| {
+                                h_flex().gap_2().child(div().flex_1().child(input)).child(
+                                    Button::new("ssh-key-picker")
+                                        .disabled(self.busy)
+                                        .label("Choose key…")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.browse_ssh_key(window, cx)
+                                        })),
+                                )
+                            },
+                        ))
+                        .child(self.field_with_content(
+                            "SSH key passphrase",
+                            &self.ssh_passphrase,
+                            |input| input.mask_toggle(),
+                        ))
+                        .child(setting_switch(
+                            "ssh-remember-passphrase",
+                            "Remember SSH passphrase",
+                            self.ssh_remember,
+                            cx.listener(|this, on, window, cx| {
+                                if this.busy {
+                                    return;
+                                }
+                                this.ssh_remember = *on;
+                                if !on {
+                                    this.clear_passphrase(window, cx);
+                                }
+                                cx.notify();
+                            }),
+                        ));
+                }
+                form = form.child(Button::new("ssh-forget-host").disabled(self.busy).label("Forget trust for this SSH host").on_click(cx.listener(|this, _, window, cx| {
+                    let endpoint = SshConfig { host: this.ssh_host.read(cx).value().to_string(), port: this.ssh_port.read(cx).value().parse().unwrap_or(22), user: String::new(), auth: SshAuth::Agent { fingerprint: String::new() }, remember_passphrase: false }.endpoint();
+                    let connector = this.services.connector.clone();
+                    task(&this.services, window, cx, async move { tokio::task::spawn_blocking(move || connector.forget_host(&endpoint)).await? }, |this, result, _, cx| { this.error = result.is_err(); this.message = result.map(|_| "SSH host trust removed. The next handshake requires verification.".into()).unwrap_or_else(|e| format!("{e:#}")); cx.notify(); });
+                })));
+            }
         }
         form = form
             .child(h_flex().gap_2().flex_wrap()
@@ -811,7 +1199,7 @@ mod tests {
         ui::Services,
     };
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
-    use gpui_kit::{AppContext, TestAppContext, WindowOptions};
+    use gpui_kit::{AppContext, Bounds, TestAppContext, WindowBounds, WindowOptions, px, size};
 
     #[gpui_kit::test]
     async fn safeguards_form_labels_and_policy_are_independent(cx: &mut TestAppContext) {
@@ -857,5 +1245,170 @@ mod tests {
             assert!(form.read(cx).config(cx).unwrap().blocks_mutations());
         })
         .unwrap();
+    }
+    #[gpui_kit::test]
+    async fn ssh_form_defaults_and_credentials_follow_authentication(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("app.db")).unwrap();
+        let services = Services::new(runtime().unwrap(), store.clone());
+        let (window, form) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                        None,
+                        size(px(1000.), px(1800.)),
+                        cx,
+                    ))),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| ConnectionForm::new(services, None, None, window, cx)),
+            )
+            .unwrap()
+        });
+        cx.update_window(window, |_, window, cx| {
+            form.update(cx, |form, cx| {
+                form.name
+                    .update(cx, |s, cx| s.set_value("SSH connection", window, cx))
+            });
+            assert!(form.read(cx).config(cx).unwrap().ssh.is_none());
+            assert!(!form.read(cx).ssh_remember);
+            window.click("ssh-enabled", cx);
+            form.update(cx, |form, cx| {
+                for (input, value) in [
+                    (&form.ssh_host, "bastion"),
+                    (&form.ssh_user, "tunnel"),
+                    (&form.ssh_key, "/keys/id_ed25519"),
+                ] {
+                    input.update(cx, |s, cx| s.set_value(value, window, cx));
+                }
+            });
+        })
+        .unwrap();
+        cx.wait_for(window, std::time::Duration::from_secs(5), |_, cx| {
+            !form.read(cx).busy()
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| {
+            form.update(cx, |form, cx| {
+                form.ssh_passphrase
+                    .update(cx, |s, cx| s.set_value("private-secret", window, cx))
+            });
+            let profile = form.read(cx).config(cx).unwrap();
+            assert_eq!(profile.ssh.as_ref().unwrap().port, 22);
+            assert!(
+                !serde_json::to_string(&profile)
+                    .unwrap()
+                    .contains("private-secret")
+            );
+            window.click("ssh-remember-passphrase", cx);
+            assert!(
+                form.read(cx)
+                    .config(cx)
+                    .unwrap()
+                    .ssh
+                    .unwrap()
+                    .remember_passphrase
+            );
+            store
+                .save_connection_with_ssh(
+                    &form.read(cx).config(cx).unwrap(),
+                    "db",
+                    Some("private-secret"),
+                )
+                .unwrap();
+            window.click("ssh-remember-passphrase", cx);
+            assert!(form.read(cx).ssh_passphrase.read(cx).value().is_empty());
+        })
+        .unwrap();
+        let id = form.read_with(cx, |f, _| f.id);
+        cx.wait_for(window, std::time::Duration::from_secs(5), |_, cx| {
+            !form.read(cx).busy() && store.load_ssh_passphrase(id).unwrap().is_none()
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| {
+            window.click("ssh-enabled", cx);
+            assert!(form.read(cx).config(cx).unwrap().ssh.is_none());
+        })
+        .unwrap();
+    }
+    #[gpui_kit::test]
+    async fn ssh_connection_test_cancel_closes_socket_and_does_not_save(cx: &mut TestAppContext) {
+        use gpui_kit::{ParentElement, component::WindowExt};
+        use tokio::io::AsyncReadExt;
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("app.db")).unwrap();
+        let services = Services::new(runtime().unwrap(), store.clone());
+        let listener = services
+            .runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let socket_closed = services.runtime.spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+                while socket.read(&mut buffer).await.unwrap_or(0) > 0 {}
+            })
+            .await
+            .unwrap();
+        });
+        let (window, form) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| ConnectionForm::new(services, None, None, window, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(window, |_, window, cx| {
+            form.update(cx, |form, cx| {
+                form.name
+                    .update(cx, |s, cx| s.set_value("Cancelled SSH test", window, cx));
+                form.ssh_enabled = true;
+                form.ssh_agent = true;
+                form.ssh_identity = "SHA256:fixture".into();
+                for (input, value) in [
+                    (&form.ssh_host, "127.0.0.1".to_owned()),
+                    (&form.ssh_port, port.to_string()),
+                    (&form.ssh_user, "fixture".into()),
+                ] {
+                    input.update(cx, |s, cx| s.set_value(value, window, cx));
+                }
+            });
+            let form = form.clone();
+            window.open_dialog(cx, move |dialog, _, cx| {
+                dialog
+                    .footer(form.update(cx, |f, cx| f.render_footer(cx)))
+                    .child(form.clone())
+            });
+            window.click("test-connection", cx);
+        })
+        .unwrap();
+        cx.wait_for(window, std::time::Duration::from_secs(5), |_, cx| {
+            form.read(cx).message.contains("SSH handshake")
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| {
+            window.click("cancel-connection", cx);
+        })
+        .unwrap();
+        cx.wait_for(window, std::time::Duration::from_secs(5), |_, cx| {
+            !form.read(cx).busy()
+        })
+        .await;
+        assert!(form.read_with(cx, |form, _| form.message.contains("cancelled")));
+        assert!(store.profiles().unwrap().is_empty());
+        socket_closed.await.unwrap();
+    }
+}
+
+impl Drop for ConnectionForm {
+    fn drop(&mut self) {
+        if let Some(abort) = self.test_cancel.take() {
+            abort.abort();
+        }
     }
 }

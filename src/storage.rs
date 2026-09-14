@@ -39,7 +39,7 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         ensure!(
-            version <= 5,
+            version <= 6,
             "This application database was created by a newer Queri version."
         );
         if version == 0 {
@@ -89,6 +89,18 @@ impl Store {
         }
         if version < 5 {
             tx.execute_batch("ALTER TABLE saved_queries ADD COLUMN parameters TEXT NOT NULL DEFAULT '[]'; PRAGMA user_version=5;")?;
+        }
+        if version < 6 {
+            tx.execute_batch("ALTER TABLE credentials RENAME TO legacy_credentials;
+                CREATE TABLE credentials (
+                    connection_id TEXT NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+                    purpose TEXT NOT NULL, aad_version INTEGER NOT NULL,
+                    nonce BLOB NOT NULL, ciphertext BLOB NOT NULL,
+                    PRIMARY KEY(connection_id,purpose));
+                INSERT INTO credentials SELECT connection_id,'database',0,nonce,ciphertext FROM legacy_credentials;
+                DROP TABLE legacy_credentials;
+                CREATE TABLE ssh_hosts (endpoint TEXT PRIMARY KEY, algorithm TEXT NOT NULL, fingerprint TEXT NOT NULL);
+                PRAGMA user_version=6;")?;
         }
         tx.commit()?;
         Ok(store)
@@ -297,58 +309,242 @@ impl Store {
 
     pub fn save_profile(&self, profile: &ConnectionProfile) -> Result<()> {
         profile.validate()?;
-        write_profile(&self.connection()?, profile)
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT profile FROM connections WHERE id=?1",
+                [profile.id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let previous = previous
+            .map(|p| serde_json::from_str::<ConnectionProfile>(&p))
+            .transpose()?;
+        if !profile.ssh.as_ref().is_some_and(|s| s.remember_passphrase)
+            || previous
+                .as_ref()
+                .and_then(|p| p.ssh.as_ref())
+                .map(|s| &s.auth)
+                != profile.ssh.as_ref().map(|s| &s.auth)
+        {
+            tx.execute(
+                "DELETE FROM credentials WHERE connection_id=?1 AND purpose='ssh-passphrase'",
+                [profile.id.to_string()],
+            )?;
+        }
+        write_profile(&tx, profile)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn save_connection(&self, profile: &ConnectionProfile, password: &str) -> Result<()> {
+        self.save_connection_with_ssh(profile, password, None)
+    }
+
+    pub fn save_connection_with_ssh(
+        &self,
+        profile: &ConnectionProfile,
+        password: &str,
+        passphrase: Option<&str>,
+    ) -> Result<()> {
         profile.validate()?;
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT profile FROM connections WHERE id=?1",
+                [profile.id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let previous = previous
+            .map(|p| serde_json::from_str::<ConnectionProfile>(&p))
+            .transpose()?;
         write_profile(&tx, profile)?;
-        if profile.remember_password && matches!(profile.config, ConnectionConfig::Postgres { .. })
+        self.write_credential(
+            &tx,
+            profile.id,
+            "database",
+            if profile.remember_password
+                && matches!(profile.config, ConnectionConfig::Postgres { .. })
+            {
+                Some(password)
+            } else {
+                None
+            },
+        )?;
+        let remember = profile.ssh.as_ref().is_some_and(|ssh| {
+            ssh.remember_passphrase && matches!(ssh.auth, SshAuth::PrivateKey { .. })
+        });
+        if !remember
+            || previous
+                .as_ref()
+                .and_then(|p| p.ssh.as_ref())
+                .map(|s| &s.auth)
+                != profile.ssh.as_ref().map(|s| &s.auth)
         {
-            let cipher = self.encryption_cipher(&tx)?;
-            let mut nonce = XNonce::default();
-            getrandom::fill(&mut nonce).context("Could not generate a password nonce")?;
-            let ciphertext = cipher
-                .encrypt(
-                    &nonce,
-                    Payload {
-                        msg: password.as_bytes(),
-                        aad: profile.id.as_bytes(),
-                    },
-                )
-                .map_err(|_| anyhow::anyhow!("Could not encrypt the password"))?;
-            tx.execute("INSERT INTO credentials(connection_id, nonce, ciphertext) VALUES (?1, ?2, ?3)
-                ON CONFLICT(connection_id) DO UPDATE SET nonce=excluded.nonce, ciphertext=excluded.ciphertext",
-                params![profile.id.to_string(), nonce.as_slice(), ciphertext])?;
-        } else {
             tx.execute(
-                "DELETE FROM credentials WHERE connection_id=?1",
+                "DELETE FROM credentials WHERE connection_id=?1 AND purpose='ssh-passphrase'",
                 [profile.id.to_string()],
             )?;
+        }
+        if remember && let Some(passphrase) = passphrase {
+            self.write_credential(&tx, profile.id, "ssh-passphrase", Some(passphrase))?;
         }
         tx.commit()?;
         Ok(())
     }
 
+    fn write_credential(
+        &self,
+        conn: &Connection,
+        id: Uuid,
+        purpose: &str,
+        value: Option<&str>,
+    ) -> Result<()> {
+        if let Some(value) = value {
+            let cipher = self.encryption_cipher(conn)?;
+            let mut nonce = XNonce::default();
+            getrandom::fill(&mut nonce).context("Could not generate a credential nonce")?;
+            let aad = credential_aad(id, purpose);
+            let ciphertext = cipher
+                .encrypt(
+                    &nonce,
+                    Payload {
+                        msg: value.as_bytes(),
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| anyhow::anyhow!("Could not encrypt the credential"))?;
+            conn.execute("INSERT INTO credentials(connection_id,purpose,aad_version,nonce,ciphertext) VALUES(?1,?2,1,?3,?4)
+                ON CONFLICT(connection_id,purpose) DO UPDATE SET aad_version=1,nonce=excluded.nonce,ciphertext=excluded.ciphertext",
+                params![id.to_string(),purpose,nonce.as_slice(),ciphertext])?;
+        } else {
+            conn.execute(
+                "DELETE FROM credentials WHERE connection_id=?1 AND purpose=?2",
+                params![id.to_string(), purpose],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn load_password(&self, id: Uuid) -> Result<Option<String>> {
-        let credential = self
-            .connection()?
+        self.load_credential(id, "database")
+    }
+
+    pub fn remember_ssh_passphrase(
+        &self,
+        profile: &ConnectionProfile,
+        passphrase: &str,
+    ) -> Result<()> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual: Option<String> = tx
             .query_row(
-                "SELECT nonce, ciphertext FROM credentials WHERE connection_id=?1",
-                [id.to_string()],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                "SELECT profile FROM connections WHERE id=?1",
+                [profile.id.to_string()],
+                |r| r.get(0),
             )
             .optional()?;
-        let Some((nonce, ciphertext)) = credential else {
+        if let Some(actual) = actual {
+            let actual: ConnectionProfile = serde_json::from_str(&actual)?;
+            ensure!(
+                actual.ssh == profile.ssh
+                    && actual.ssh.as_ref().is_some_and(|s| s.remember_passphrase),
+                "SSH credentials changed while unlocking the key; retry using current settings"
+            );
+            self.write_credential(&tx, profile.id, "ssh-passphrase", Some(passphrase))?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_ssh_passphrase(&self, id: Uuid) -> Result<()> {
+        self.connection()?.execute(
+            "DELETE FROM credentials WHERE connection_id=?1 AND purpose='ssh-passphrase'",
+            [id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_ssh_passphrase(&self, id: Uuid) -> Result<Option<String>> {
+        self.load_credential(id, "ssh-passphrase")
+    }
+
+    fn load_credential(&self, id: Uuid, purpose: &str) -> Result<Option<String>> {
+        let credential = self.connection()?.query_row(
+            "SELECT nonce,ciphertext,aad_version FROM credentials WHERE connection_id=?1 AND purpose=?2",
+            params![id.to_string(),purpose], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, u32>(2)?))).optional()?;
+        let Some((nonce, ciphertext, version)) = credential else {
             return Ok(None);
         };
         let key =
             std::fs::read(self.key_path()).context("Could not read the password encryption key")?;
         let cipher =
             XChaCha20Poly1305::new_from_slice(&key).context("Invalid password encryption key")?;
-        decrypt_password(&cipher, id, &nonce, &ciphertext).map(Some)
+        let plaintext = decrypt_credential(&cipher, id, purpose, version, &nonce, &ciphertext)?;
+        if version == 0 {
+            let mut upgraded_nonce = XNonce::default();
+            getrandom::fill(&mut upgraded_nonce)
+                .context("Could not generate a credential nonce")?;
+            let aad = credential_aad(id, purpose);
+            let upgraded = cipher
+                .encrypt(
+                    &upgraded_nonce,
+                    Payload {
+                        msg: plaintext.as_bytes(),
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| anyhow::anyhow!("Could not migrate the saved credential"))?;
+            // A concurrent save wins over migration of the older snapshot.
+            self.connection()?.execute("UPDATE credentials SET aad_version=1,nonce=?3,ciphertext=?4 WHERE connection_id=?1 AND purpose=?2 AND aad_version=0 AND nonce=?5 AND ciphertext=?6",
+                params![id.to_string(), purpose, upgraded_nonce.as_slice(), upgraded, nonce, ciphertext])?;
+        }
+        Ok(Some(plaintext))
+    }
+
+    pub fn ssh_host(&self, endpoint: &str) -> Result<Option<(String, String)>> {
+        Ok(self
+            .connection()?
+            .query_row(
+                "SELECT algorithm,fingerprint FROM ssh_hosts WHERE endpoint=?1",
+                [endpoint],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn save_ssh_host(
+        &self,
+        endpoint: &str,
+        algorithm: &str,
+        fingerprint: &str,
+        previous: Option<&str>,
+    ) -> Result<()> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual: Option<String> = tx
+            .query_row(
+                "SELECT fingerprint FROM ssh_hosts WHERE endpoint=?1",
+                [endpoint],
+                |r| r.get(0),
+            )
+            .optional()?;
+        ensure!(
+            actual.as_deref() == previous,
+            "SSH host trust changed during this attempt. Retry verification."
+        );
+        tx.execute("INSERT INTO ssh_hosts(endpoint,algorithm,fingerprint) VALUES(?1,?2,?3) ON CONFLICT(endpoint) DO UPDATE SET algorithm=excluded.algorithm,fingerprint=excluded.fingerprint", params![endpoint,algorithm,fingerprint])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_ssh_host(&self, endpoint: &str) -> Result<()> {
+        self.connection()?
+            .execute("DELETE FROM ssh_hosts WHERE endpoint=?1", [endpoint])?;
+        Ok(())
     }
 
     fn key_path(&self) -> PathBuf {
@@ -361,13 +557,15 @@ impl Store {
     fn encryption_cipher(&self, conn: &Connection) -> Result<XChaCha20Poly1305> {
         let credential = conn
             .query_row(
-                "SELECT connection_id, nonce, ciphertext FROM credentials LIMIT 1",
+                "SELECT connection_id, nonce, ciphertext, purpose, aad_version FROM credentials LIMIT 1",
                 [],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, Vec<u8>>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, u32>(4)?,
                     ))
                 },
             )
@@ -404,9 +602,16 @@ impl Store {
         };
         let cipher =
             XChaCha20Poly1305::new_from_slice(&key).context("Invalid password encryption key")?;
-        if let Some((id, nonce, ciphertext)) = credential {
+        if let Some((id, nonce, ciphertext, purpose, version)) = credential {
             // Check an existing record before writing with a possibly damaged key file.
-            decrypt_password(&cipher, Uuid::parse_str(&id)?, &nonce, &ciphertext)?;
+            decrypt_credential(
+                &cipher,
+                Uuid::parse_str(&id)?,
+                &purpose,
+                version,
+                &nonce,
+                &ciphertext,
+            )?;
         }
         Ok(cipher)
     }
@@ -490,19 +695,34 @@ fn write_profile(conn: &Connection, profile: &ConnectionProfile) -> Result<()> {
     Ok(())
 }
 
-fn decrypt_password(
+fn credential_aad(id: Uuid, purpose: &str) -> Vec<u8> {
+    [id.as_bytes().as_slice(), b"\0queri:", purpose.as_bytes()].concat()
+}
+
+fn decrypt_credential(
     cipher: &XChaCha20Poly1305,
     id: Uuid,
+    purpose: &str,
+    version: u32,
     nonce: &[u8],
     ciphertext: &[u8],
 ) -> Result<String> {
     let nonce = XNonce::try_from(nonce).context("Invalid saved password nonce")?;
+    ensure!(
+        version <= 1 && (version != 0 || purpose == "database"),
+        "Invalid credential format"
+    );
+    let aad = if version == 0 {
+        id.as_bytes().to_vec()
+    } else {
+        credential_aad(id, purpose)
+    };
     let plaintext = cipher
         .decrypt(
             &nonce,
             Payload {
                 msg: ciphertext,
-                aad: id.as_bytes(),
+                aad: &aad,
             },
         )
         .map_err(|_| {

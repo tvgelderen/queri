@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 fn profile() -> ConnectionProfile {
     ConnectionProfile {
+        ssh: None,
         environment: None,
         policy: ExecutionPolicy::Normal,
         id: Uuid::new_v4(),
@@ -204,7 +205,7 @@ fn version_one_migration_preserves_settings_drafts_and_history() -> Result<()> {
     let store = Store::open(&path)?;
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-        5
+        6
     );
     assert_eq!(
         serde_json::to_value(&store.profiles()?[0])?,
@@ -552,7 +553,7 @@ fn named_table_views_migrate_conflict_restart_and_retain_orphans() -> Result<()>
     })?;
     drop(store);
     let conn = Connection::open(&path)?;
-    conn.execute_batch("DROP TABLE saved_table_views; ALTER TABLE saved_queries DROP COLUMN parameters; PRAGMA user_version=3;")?;
+    conn.execute_batch("DROP TABLE ssh_hosts; DROP TABLE credentials; CREATE TABLE credentials(connection_id TEXT PRIMARY KEY REFERENCES connections(id) ON DELETE CASCADE,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL); DROP TABLE saved_table_views; ALTER TABLE saved_queries DROP COLUMN parameters; PRAGMA user_version=3;")?;
     drop(conn);
     let store = Store::open(&path)?;
     assert_eq!(store.saved_queries("", None)?[0].sql, query.sql);
@@ -650,7 +651,7 @@ fn parameter_definitions_migrate_and_round_trip_without_values() -> Result<()> {
     })?;
     drop(store);
     let conn = Connection::open(&path)?;
-    conn.execute_batch("ALTER TABLE saved_queries DROP COLUMN parameters; PRAGMA user_version=4;")?;
+    conn.execute_batch("DROP TABLE ssh_hosts; DROP TABLE credentials; CREATE TABLE credentials(connection_id TEXT PRIMARY KEY REFERENCES connections(id) ON DELETE CASCADE,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL); ALTER TABLE saved_queries DROP COLUMN parameters; PRAGMA user_version=4;")?;
     let store = Store::open(&path)?;
     assert!(store.saved_queries("", None)?[0].parameters.is_empty());
     query.parameters = vec![
@@ -689,5 +690,145 @@ fn parameter_definitions_migrate_and_round_trip_without_values() -> Result<()> {
             }
         ]
     );
+    Ok(())
+}
+
+#[test]
+fn ssh_credentials_are_separate_bound_to_purpose_and_clear_on_auth_changes() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("app.db");
+    let store = Store::open(&path)?;
+    let mut p = profile();
+    p.ssh = Some(SshConfig {
+        host: "BASTION.example.".into(),
+        port: 22,
+        user: "tunnel".into(),
+        auth: SshAuth::PrivateKey {
+            path: "/keys/private".into(),
+        },
+        remember_passphrase: true,
+    });
+    assert_eq!(p.ssh.as_ref().unwrap().endpoint(), "[bastion.example]:22");
+    store.save_connection_with_ssh(&p, "db-secret", Some("ssh-secret"))?;
+    assert_eq!(store.load_password(p.id)?.as_deref(), Some("db-secret"));
+    assert_eq!(
+        store.load_ssh_passphrase(p.id)?.as_deref(),
+        Some("ssh-secret")
+    );
+    let serialized = serde_json::to_string(&store.profiles()?[0])?;
+    assert!(!serialized.contains("db-secret") && !serialized.contains("ssh-secret"));
+    let conn = Connection::open(&path)?;
+    let (nonce, ciphertext): (Vec<u8>, Vec<u8>) = conn.query_row(
+        "SELECT nonce,ciphertext FROM credentials WHERE purpose='ssh-passphrase'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    conn.execute(
+        "UPDATE credentials SET nonce=?1,ciphertext=?2 WHERE purpose='database'",
+        params![nonce, ciphertext],
+    )?;
+    assert!(
+        store.load_password(p.id).is_err(),
+        "Secrets cannot be substituted between purposes"
+    );
+    // Restore without writing through a damaged database record.
+    conn.execute("DELETE FROM credentials WHERE purpose='database'", [])?;
+    store.save_connection_with_ssh(&p, "db-secret", Some("ssh-secret"))?;
+    p.ssh.as_mut().unwrap().auth = SshAuth::PrivateKey {
+        path: "/keys/other".into(),
+    };
+    store.save_connection_with_ssh(&p, "db-secret", None)?;
+    assert!(store.load_ssh_passphrase(p.id)?.is_none());
+    store.save_connection_with_ssh(&p, "db-secret", Some("again"))?;
+    p.ssh.as_mut().unwrap().remember_passphrase = false;
+    store.save_connection_with_ssh(&p, "db-secret", Some("ignored"))?;
+    assert!(store.load_ssh_passphrase(p.id)?.is_none());
+    p.ssh.as_mut().unwrap().remember_passphrase = true;
+    store.save_connection_with_ssh(&p, "db-secret", Some("again"))?;
+    store.delete_profile(p.id)?;
+    assert!(store.load_ssh_passphrase(p.id)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn version_five_password_migration_is_lossless_even_without_key() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("app.db");
+    let store = Store::open(&path)?;
+    let p = profile();
+    store.save_profile(&p)?;
+    let key = [37_u8; 32];
+    let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
+    let nonce = XNonce::from([13_u8; 24]);
+    let ciphertext = cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: b"legacy-password",
+                aad: p.id.as_bytes(),
+            },
+        )
+        .unwrap();
+    let conn = Connection::open(&path)?;
+    conn.execute_batch("DROP TABLE credentials; DROP TABLE ssh_hosts; CREATE TABLE credentials(connection_id TEXT PRIMARY KEY REFERENCES connections(id) ON DELETE CASCADE,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL); PRAGMA user_version=5;")?;
+    conn.execute(
+        "INSERT INTO credentials VALUES(?1,?2,?3)",
+        params![p.id.to_string(), nonce.as_slice(), ciphertext],
+    )?;
+    // Opening migrates metadata without decrypting or inventing a replacement key.
+    let migrated = Store::open(&path)?;
+    assert!(migrated.load_password(p.id).is_err());
+    assert!(migrated.save_connection(&p, "replacement").is_err());
+    assert_eq!(
+        credential(&conn, p.id)?,
+        (nonce.to_vec(), ciphertext.clone())
+    );
+    fs::write(directory.path().join("app.db.key"), key)?;
+    assert_eq!(
+        migrated.load_password(p.id)?.as_deref(),
+        Some("legacy-password")
+    );
+    assert_eq!(
+        conn.query_row("SELECT aad_version FROM credentials", [], |r| r
+            .get::<_, u32>(0))?,
+        1
+    );
+    migrated.save_connection(&p, "upgraded-password")?;
+    assert_eq!(
+        migrated.load_password(p.id)?.as_deref(),
+        Some("upgraded-password")
+    );
+    assert_eq!(
+        conn.query_row("SELECT aad_version FROM credentials", [], |r| r
+            .get::<_, u32>(0))?,
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn ssh_trust_is_persistent_endpoint_scoped_and_compares_replacements() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("app.db");
+    let store = Store::open(&path)?;
+    store.save_ssh_host("[bastion]:22", "ssh-ed25519", "SHA256:old", None)?;
+    assert!(
+        store
+            .save_ssh_host("[bastion]:22", "ssh-ed25519", "SHA256:rogue", None)
+            .is_err()
+    );
+    assert!(store.ssh_host("[bastion]:2222")?.is_none());
+    store.save_ssh_host(
+        "[bastion]:22",
+        "ssh-ed25519",
+        "SHA256:new",
+        Some("SHA256:old"),
+    )?;
+    assert_eq!(
+        Store::open(&path)?.ssh_host("[bastion]:22")?.unwrap().1,
+        "SHA256:new"
+    );
+    store.remove_ssh_host("[bastion]:22")?;
+    assert!(store.ssh_host("[bastion]:22")?.is_none());
     Ok(())
 }

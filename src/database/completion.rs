@@ -234,6 +234,7 @@ mod tests {
     fn sqlite_completion_does_not_wait_for_execution_lock() {
         super::super::runtime().unwrap().block_on(async {
             let profile = ConnectionProfile {
+                ssh: None,
                 id: uuid::Uuid::new_v4(),
                 name: "completion".into(),
                 notes: String::new(),

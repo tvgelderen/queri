@@ -94,13 +94,31 @@ Editing a connection checks its affected document sessions using the transaction
 - Use **Explain** on a single SQL statement or selection to inspect a query-plan tree and its raw output. PostgreSQL also offers **Explain and run**: this executes the statement, including writes, and follows the tab’s transaction policy. Parameters use the normal input prompts. Costs are estimates; actual PostgreSQL timings are per loop and include child work.
 - Double-click an editable table cell or press **F2** to edit it in place. **Enter** stages the value; **Escape** cancels the current cell edit. Use **Set NULL** or **Use default** for those distinct values. **Save changes** applies all staged rows atomically with conflict detection; inside an open transaction the changes remain uncommitted. **Revert row** and **Discard all** undo local edits. Replacing the page or closing the session asks you to save, discard, or cancel. SQLite can roll back an entire transaction when a write is interrupted; Queri reports that outcome.
 - Right-click a column header or select a cell and choose **Column statistics** for a loaded-row summary. **Calculate all matching rows** explicitly scans the active filtered/relationship dataset, without pagination. The tab’s timeout and cancellation apply. Results show their scope and timestamp; reopen them after data changes. Loaded PostgreSQL values expose counts and NULLs only because server comparison rules cannot be reproduced locally; unsupported exact metrics are marked unavailable.
+## SSH tunneling
+
+For PostgreSQL, enable **Connect through SSH** in the connection form. Enter the bastion's host, port, and user. The default SSH port is 22. Enter the database's private hostname and port in the PostgreSQL fields. The bastion resolves that hostname. Database passwords, TLS settings, and SSH authentication remain separate.
+
+Choose **Private key** to select a local key file or enter its absolute path. Encrypted keys use the masked **SSH key passphrase** field. **Remember SSH passphrase** starts off. Choose **SSH agent** and **Refresh agent identities** to select a public key fingerprint from `SSH_AUTH_SOCK`. Queri signs with only that identity and does not forward the agent.
+
+Queri uses embedded russh with Ed25519, ECDSA, and RSA keys. RSA authentication requires SHA-2 signatures. Key files can use OpenSSH or PEM formats supported by russh, including encrypted OpenSSH and PKCS#8 files. The integration fixture exercises plain and encrypted OpenSSH Ed25519 keys, ECDSA P-256, RSA PEM, encrypted RSA PKCS#8, and an OpenSSH agent. Certificates, DSA keys, SSH passwords, keyboard-interactive authentication, MFA, multiple bastions, shell commands, and SSH configuration files are unsupported. Private keys remain in their original files.
+
+Before authentication, Queri verifies the key from the actual SSH handshake. An unknown host shows its normalized hostname, port, algorithm, and SHA256 fingerprint. Verify that fingerprint independently before choosing **Trust for this session** or **Trust and remember**. Session trust lasts for this application instance. Persistent trust belongs to Queri's local application database and is scoped to the normalized hostname and port. Queri does not read or write `~/.ssh/known_hosts`.
+
+A changed key blocks authentication. **Replace trusted key…** shows the old and new fingerprints and requires a separate confirmation. **Forget trust for this SSH host** removes the current endpoint's session and persistent trust. Existing authenticated transports stay open until released. A later handshake requires verification again.
+
+Each tab has its own PostgreSQL channel and transaction. Tabs for the same saved profile share an authenticated SSH transport. The last consumer closes that transport. **Test connection** uses an isolated transport, checks the complete SSH, TLS, authentication, and query route, and supports **Cancel**. Human trust and passphrase prompts have no network deadline. SSH network stages have a 15-second deadline. Keepalives run every 10 seconds and close an unresponsive transport after three unanswered probes. PostgreSQL handshakes and cancellation use the configured database timeout.
+
+Database TLS uses the database hostname, including through SSH. **Verify certificate and hostname** uses the system's native TLS trust roots. **Encrypt without verification** requires TLS but skips certificate and hostname checks. **Disabled** sends plaintext PostgreSQL inside the encrypted SSH connection.
+
+A lost connection marks results and local edits stale. Use the tab's **Reconnect session** action to reconnect after resolving its transaction and edit guards. SQL drafts and loaded results remain available. Reconnect reapplies policy and timeout settings, but does not replay SQL, restore temporary objects, or refresh loaded rows. Use **Refresh** when you want new rows. A lost query or COMMIT acknowledgment leaves the outcome unknown. Verify the server's state before repeating the operation.
+
 ## Storage
 
-Application data lives in `$XDG_DATA_HOME/queri/queri.sqlite3` (normally `~/.local/share/queri/queri.sqlite3`). Set `QUERI_DATA_DIR` to choose another directory. Connection metadata, preferences, drafts, saved queries, named table views, and SQL history are stored locally. Remembered passwords use XChaCha20-Poly1305 encryption in the same database, with a random key in `queri.sqlite3.key` beside it. The key file has owner-only permissions (`0600`). Anyone who can read both files can decrypt the passwords. SQL text itself may contain sensitive values and is retained in drafts, saved queries, and history.
+Application data lives in `$XDG_DATA_HOME/queri/queri.sqlite3` (normally `~/.local/share/queri/queri.sqlite3`). Set `QUERI_DATA_DIR` to choose another directory. Connection metadata, preferences, drafts, saved queries, named table views, and SQL history are stored locally. Remembered database passwords and SSH passphrases use separate, purpose-authenticated XChaCha20-Poly1305 records in the same database, with a random key in `queri.sqlite3.key` beside it. The key file has owner-only permissions (`0600`). Anyone who can read both files can decrypt the saved credentials. There is no desktop keyring or master password. SSH profiles contain the key path and public identity fingerprint, never a private key or passphrase. Turning off passphrase remembering, changing authentication or the key path, or removing the connection clears its saved passphrase. SQL text itself may contain sensitive values and is retained in drafts, saved queries, and history.
 
-Back up both the database and its `.key` file to restore remembered passwords. Losing or damaging the key makes those passwords unrecoverable; Queri will not replace it while saved passwords remain. Restore the original key, or turn off **Remember password** for the affected connections to remove their saved passwords. Connections can also be removed without the key. If a damaged key file remains after all saved passwords are removed, delete that file before remembering passwords again.
+Back up both the database and its `.key` file to restore remembered credentials. Losing or damaging the key makes those credentials unrecoverable. Queri will not replace the key while saved credentials remain. Restore the original key, or turn off **Remember password** for the affected connections to remove their saved passwords. Turn off **Remember SSH passphrase** to remove a saved SSH passphrase. Connections can also be removed without the key. If a damaged key file remains after all saved passwords are removed, delete that file before remembering passwords again.
 
-Connections saved by older desktop versions retain their settings, drafts, and history. Enter previously remembered passwords once after updating. Queri no longer accesses desktop-keyring entries and leaves them untouched.
+Schema migration preserves existing locally encrypted passwords without requiring their key file. Queri binds legacy passwords to their database purpose when next read with the original key. Connections saved by older desktop versions retain their settings, drafts, and history. Passwords from the former desktop-keyring implementation must be entered once after updating. Queri no longer accesses desktop-keyring entries and leaves them untouched.
 
 This desktop rewrite uses fresh storage. The former web application's `data/` and `.env` files are not imported.
 
@@ -122,6 +140,14 @@ QUERI_TEST_POSTGRES='postgresql://queri_test:queri-test@127.0.0.1:55439/queri_te
 docker stop queri-test-postgres
 ```
 
+The SSH integration suite runs against disposable OpenSSH and PostgreSQL containers:
+
+```sh
+bash scripts/check-ssh.sh
+```
+
+It requires Docker, OpenSSH client tools, OpenSSL, and Python 3. PostgreSQL has no published port. The suite exercises keys, the agent, host trust, bastion DNS, database TLS hostname checks, cancellation, independent tab transactions, transport loss, explicit reconnect, and cancellation or edit races. See [the fixture instructions](scripts/ssh-fixture/README.md).
+
 ## Linux bundle
 
 ```sh
@@ -134,4 +160,4 @@ The archive contains the release binary, desktop launcher, icon, and a user-loca
 
 ## Code
 
-`src/database/` owns database I/O and mutations; `src/storage.rs` owns application persistence and credentials; `src/ui/` owns GPUI views and UI-thread completions. Tokio handles PostgreSQL I/O and dispatches SQLite and credential storage to blocking workers. GPUI Kit is pinned to `0.8.1`; `Cargo.lock` pins its GPUI snapshot and the remaining dependencies. `vendor/README.md` documents the pinned Linux renderer and shared-dialog patches for true backdrop blur.
+`src/ssh/` owns transport coordination and host trust; `src/database/` owns database I/O and mutations; `src/storage.rs` owns application persistence and credentials; `src/ui/` owns GPUI views and UI-thread completions. Tokio handles PostgreSQL I/O and dispatches SQLite and credential storage to blocking workers. GPUI Kit is pinned to `0.8.1`; `Cargo.lock` pins its GPUI snapshot and the remaining dependencies. `vendor/README.md` documents the pinned Linux renderer and shared-dialog patches for true backdrop blur.

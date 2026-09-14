@@ -15,6 +15,7 @@ async fn middle_click_closes_tabs_without_selecting_them(cx: &mut TestAppContext
     let path = directory.path().join("catalog.sqlite");
     rusqlite::Connection::open(&path).expect("database");
     let profile = ConnectionProfile {
+        ssh: None,
         environment: None,
         policy: ExecutionPolicy::Normal,
         id: Uuid::new_v4(),
@@ -126,6 +127,7 @@ async fn find_unopened_table_and_use_history_in_compact_workspace(cx: &mut TestA
         .execute_batch("CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT); INSERT INTO products VALUES(1,'Keyboard'); CREATE TABLE orders(id INTEGER PRIMARY KEY);")
         .expect("tables");
     let profile = ConnectionProfile {
+        ssh: None,
         environment: None,
         policy: ExecutionPolicy::Normal,
         id: Uuid::new_v4(),
@@ -325,7 +327,8 @@ async fn explorer_switching_keyboard_navigation_and_restart(cx: &mut TestAppCont
     let profiles = ["first", "second"].map(|name| {
         let path = directory.path().join(format!("{name}.db"));
         rusqlite::Connection::open(&path).expect("fixture database").execute_batch("CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT); INSERT INTO items VALUES(1,'fixture');").expect("fixture table");
-        let profile = ConnectionProfile { environment: None, policy: ExecutionPolicy::Normal, id: Uuid::new_v4(), name: name.into(), notes: String::new(), color: String::new(), remember_password: false,
+        let profile = ConnectionProfile { ssh: None,
+environment: None, policy: ExecutionPolicy::Normal, id: Uuid::new_v4(), name: name.into(), notes: String::new(), color: String::new(), remember_password: false,
             config: ConnectionConfig::Sqlite { path, read_only: false, create: false, wal: true, foreign_keys: true } };
         store.save_profile(&profile).expect("save profile");
         profile
@@ -778,6 +781,7 @@ async fn sidebar_retry_recovers_after_dismissing_the_connection_error(cx: &mut T
     let directory = tempfile::tempdir().expect("fixture directory");
     let path = directory.path().join("restored.sqlite");
     let profile = ConnectionProfile {
+        ssh: None,
         environment: None,
         policy: ExecutionPolicy::Normal,
         id: Uuid::new_v4(),
@@ -860,6 +864,7 @@ async fn missing_passwords_prompt_before_connecting_and_on_document_retry(cx: &m
         let directory = tempfile::tempdir().expect("directory");
         let store = Store::open(directory.path().join("app.db")).expect("store");
         let profile = ConnectionProfile {
+            ssh: None,
             environment: None,
             policy: ExecutionPolicy::Normal,
             id: Uuid::new_v4(),
@@ -1029,6 +1034,7 @@ fn postgres_test_profile() -> (ConnectionProfile, String) {
         String::from_utf8(config.get_password().unwrap_or_default().to_vec()).expect("password");
     (
         ConnectionProfile {
+            ssh: None,
             environment: None,
             policy: ExecutionPolicy::Normal,
             id: Uuid::new_v4(),
@@ -1442,6 +1448,7 @@ async fn saved_library_sql_files_and_related_tabs_keep_work_separate(cx: &mut Te
         )
         .unwrap();
     let profile = ConnectionProfile {
+        ssh: None,
         environment: None,
         policy: ExecutionPolicy::Normal,
         id: Uuid::new_v4(),
@@ -1677,6 +1684,7 @@ async fn workspace_search_live_drafts_selects_text_offline_and_drops_closed_tabs
     cx.executor().allow_parking();
     let directory = tempfile::tempdir().unwrap();
     let profile = ConnectionProfile {
+        ssh: None,
         environment: None,
         policy: ExecutionPolicy::Normal,
         id: Uuid::new_v4(),
@@ -1888,6 +1896,7 @@ async fn safeguards_transaction_close_reconnect_profile_and_quit_guards(cx: &mut
     cx.executor().allow_parking();
     let directory = tempfile::tempdir().unwrap();
     let profile = ConnectionProfile {
+        ssh: None,
         environment: None,
         policy: ExecutionPolicy::Normal,
         id: Uuid::new_v4(),
@@ -2104,6 +2113,7 @@ async fn staged_edits_guard_idle_tab_close_and_save_before_closing(cx: &mut Test
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch("CREATE TABLE items(id INTEGER PRIMARY KEY,name TEXT);INSERT INTO items VALUES(1,'Original')").unwrap();
     let profile = ConnectionProfile {
+        ssh: None,
         id: Uuid::new_v4(),
         name: "Edits".into(),
         notes: String::new(),
