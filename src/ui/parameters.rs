@@ -106,13 +106,6 @@ impl Document {
             )
         })
     }
-    pub(super) fn parameter_dialect(&self) -> sql::SqlDialect {
-        if matches!(self.profile.config, ConnectionConfig::Sqlite { .. }) {
-            sql::SqlDialect::Sqlite
-        } else {
-            sql::SqlDialect::Postgres
-        }
-    }
     pub(super) fn parameter_definitions(&self, cx: &App) -> Vec<Definition> {
         let Some(editor) = self.sql_editor() else {
             return vec![];
@@ -125,7 +118,7 @@ impl Document {
         } else {
             &self.parameter_definitions
         };
-        crate::parameters::discover(&editor.read(cx).value(), self.parameter_dialect())
+        crate::parameters::discover(&editor.read(cx).value(), self.profile.config.dialect())
             .map(|p| p.definitions(previous))
             .unwrap_or_else(|_| previous.to_vec())
     }
@@ -137,7 +130,7 @@ impl Document {
         cx: &mut Context<Self>,
     ) {
         let definitions = parameters.definitions(&self.parameter_definitions(cx));
-        let postgres = matches!(self.parameter_dialect(), sql::SqlDialect::Postgres);
+        let postgres = matches!(self.profile.config.dialect(), sql::SqlDialect::Postgres);
         let seed = self.parameter_seed.take().filter(|seed| seed.sql == sql);
         let form = cx.new(|cx| ParameterForm {
             fields: definitions

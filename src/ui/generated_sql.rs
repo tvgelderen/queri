@@ -15,7 +15,7 @@ impl Document {
             .enumerate()
             .map(|(index, value)| Definition {
                 name: (index + 1).to_string(),
-                kind: if matches!(self.parameter_dialect(), sql::SqlDialect::Postgres) {
+                kind: if matches!(self.profile.config.dialect(), sql::SqlDialect::Postgres) {
                     ParameterType::Text
                 } else {
                     ParameterType::for_cell(value)

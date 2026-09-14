@@ -113,9 +113,7 @@ pub struct Workspace {
     diagram_request: Uuid,
     schema_request: Uuid,
     schema_comparison: Option<Entity<super::schema_compare_setup::SchemaCompareSetup>>,
-    schema_draft_key: Option<String>,
-    schema_designer: Option<Entity<super::schema_designer::SchemaDesigner>>,
-    schema_review: Option<Entity<super::schema_review::SchemaReview>>,
+    schema_draft: Option<workspace_schema::SchemaDraft>,
     documents: Vec<Entity<Document>>,
     active: usize,
     draft_search: Option<WeakEntity<DraftSearch>>,
@@ -269,9 +267,7 @@ impl Workspace {
             schema_request: Uuid::new_v4(),
             schema_comparison: None,
             active_content: ActiveContent::Document,
-            schema_draft_key: None,
-            schema_designer: None,
-            schema_review: None,
+            schema_draft: None,
             diagram_request: Uuid::new_v4(),
             documents: vec![],
             active: 0,
@@ -377,6 +373,22 @@ impl Workspace {
         });
     }
 
+    /// Cancels work for the selected connection and drops everything loaded from it.
+    /// Bumping the generation makes late results from the old connection ignored.
+    fn reset_connection(&mut self) {
+        self.generation_cancel.cancel();
+        self.generation_cancel = tokio_util::sync::CancellationToken::new();
+        self.generation = Uuid::new_v4();
+        self.ssh_transport = None;
+        self.diagram = None;
+        self.databases.clear();
+        self.branches.clear();
+        self.nodes.clear();
+        self.loading.clear();
+        self.expanded.clear();
+        self.history = None;
+    }
+
     fn activate(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         let Some(profile) = self
             .profiles
@@ -386,26 +398,16 @@ impl Workspace {
         else {
             return;
         };
-        self.generation_cancel.cancel();
-        self.generation_cancel = tokio_util::sync::CancellationToken::new();
-        self.ssh_transport = None;
+        self.reset_connection();
         self.services.connector.prepare_reconnect(id);
         self.selected = Some(id);
         self.connection_picker
             .update(cx, |picker, cx| picker.set_selected(Some(id), window, cx));
-        self.diagram = None;
-        self.generation = Uuid::new_v4();
         let generation = self.generation;
         self.connection_state = ConnectionState::Connecting;
         self.connection_picker
             .update(cx, |picker, cx| picker.set_state(self.connection_state, cx));
-        self.databases.clear();
-        self.branches.clear();
-        self.nodes.clear();
-        self.loading.clear();
-        self.expanded.clear();
         self.tree.update(cx, |tree, cx| tree.set_items(vec![], cx));
-        self.history = None;
         self.status = format!("Connecting to {}…", profile.name);
         self.error.clear();
         let cached = self.passwords.get(&id).cloned();
@@ -787,7 +789,7 @@ impl Workspace {
         connect: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Entity<Document> {
         let password = self.passwords.get(&profile.id).cloned();
         let query_number = self
             .documents
@@ -859,7 +861,7 @@ impl Workspace {
             |this, doc, event: &super::document::OpenRelated, window, cx| {
                 let profile = doc.read(cx).profile.clone();
                 let scope = event.0.clone();
-                this.add_document(
+                let target = this.add_document(
                     profile,
                     Some(scope.destination().clone()),
                     String::new(),
@@ -867,13 +869,11 @@ impl Workspace {
                     window,
                     cx,
                 );
-                if let Some(target) = this.documents.last() {
-                    target.update(cx, |doc, cx| {
-                        doc.set_relationship(Some(scope));
-                        doc.connect(window, cx);
-                        doc.focus(window, cx);
-                    });
-                }
+                target.update(cx, |doc, cx| {
+                    doc.set_relationship(Some(scope));
+                    doc.connect(window, cx);
+                    doc.focus(window, cx);
+                });
                 this.schedule_save(window, cx);
             },
         ));
@@ -882,20 +882,13 @@ impl Workspace {
             window,
             |this, doc, event: &super::document::OpenGeneratedSql, window, cx| {
                 let profile = doc.read(cx).profile.clone();
-                this.add_document(profile, None, event.0.sql.clone(), true, window, cx);
-                if let Some(target) = this.documents.last() {
-                    target.update(cx, |doc, _| doc.seed_generated_parameters(event.0.clone()));
-                }
+                this.add_document(profile, None, event.0.sql.clone(), true, window, cx)
+                    .update(cx, |doc, _| doc.seed_generated_parameters(event.0.clone()));
             },
         ));
         self.documents.push(doc.clone());
         self.refresh_draft_search(window, cx);
-        self.active = self.documents.len() - 1;
-        self.active_content = ActiveContent::Document;
-        if !self.history_docked(window) {
-            self.history = None;
-        }
-        self.reveal_active_tab(window, cx);
+        self.show_document(self.documents.len() - 1, window, cx);
         if connect {
             doc.update(cx, |doc, cx| {
                 doc.connect(window, cx);
@@ -904,6 +897,32 @@ impl Workspace {
             self.schedule_save(window, cx);
         }
         cx.notify();
+        doc
+    }
+
+    /// Brings a document tab to the front, replacing any schema or diagram content.
+    fn show_document(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.active = index;
+        self.active_content = ActiveContent::Document;
+        if !self.history_docked(window) {
+            self.history = None;
+        }
+        self.reveal_active_tab(window, cx);
+    }
+
+    fn open_saved_query(
+        &mut self,
+        profile: ConnectionProfile,
+        query: SavedQuery,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let doc = self.add_document(profile, None, query.sql.clone(), true, window, cx);
+        doc.update(cx, |doc, cx| {
+            doc.saved_query = Some(query);
+            cx.emit(DocumentChanged);
+            cx.notify();
+        });
     }
 
     fn new_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -982,11 +1001,7 @@ impl Workspace {
                 }
                 window.close_dialog(cx);
                 // Opening a search hit must work offline and must not connect or run SQL.
-                this.active = index;
-                if !this.history_docked(window) {
-                    this.history = None;
-                }
-                this.reveal_active_tab(window, cx);
+                this.show_document(index, window, cx);
                 editor.update(cx, |editor, cx| {
                     editor.set_selected_range(hit.range.clone(), cx);
                     editor.focus(window, cx);
@@ -1039,12 +1054,7 @@ impl Workspace {
         let Some(doc) = self.documents.get(index).cloned() else {
             return;
         };
-        self.active_content = ActiveContent::Document;
-        self.active = index;
-        if !self.history_docked(window) {
-            self.history = None;
-        }
-        self.reveal_active_tab(window, cx);
+        self.show_document(index, window, cx);
         let id = doc.read(cx).profile.id;
         doc.update(cx, |doc, cx| doc.focus(window, cx));
         if self.selected != Some(id) || !self.passwords.contains_key(&id) {
@@ -1066,7 +1076,7 @@ impl Workspace {
         cx: &mut Context<Self>,
         complete: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) {
-        if self.schema_designer.is_some()
+        if self.schema_draft.is_some()
             || self
                 .schema_comparison
                 .as_ref()
@@ -1092,7 +1102,7 @@ impl Workspace {
     }
 
     pub fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.schema_designer.is_some() || self.schema_comparison.is_some() {
+        if self.schema_draft.is_some() || self.schema_comparison.is_some() {
             self.error =
                 "Close the schema workspace before quitting; pending work is retained.".into();
             cx.notify();
@@ -1341,14 +1351,9 @@ impl Workspace {
                                         this.refresh_draft_search(window, cx);
                                         this.active = 0;
                                         if this.selected == Some(id) {
-                                            this.generation_cancel.cancel();
-                                            this.ssh_transport = None;
+                                            this.reset_connection();
                                             this.selected = None;
-                                            this.generation = Uuid::new_v4();
                                             this.connection_state = ConnectionState::Disconnected;
-                                            this.databases.clear();
-                                            this.branches.clear();
-                                            this.history = None;
                                             this.rebuild_tree(cx);
                                         }
                                         this.status = "Choose a connection to begin".into();
@@ -1386,21 +1391,7 @@ impl Workspace {
                     .cloned()
                 {
                     window.close_dialog(cx);
-                    this.add_document(
-                        profile.for_database(&query.database),
-                        None,
-                        query.sql.clone(),
-                        true,
-                        window,
-                        cx,
-                    );
-                    if let Some(doc) = this.documents.last() {
-                        doc.update(cx, |doc, cx| {
-                            doc.saved_query = Some(query);
-                            cx.emit(DocumentChanged);
-                            cx.notify();
-                        });
-                    }
+                    this.open_saved_query(profile.for_database(&query.database), query, window, cx);
                 } else {
                     let profiles = this.profiles.clone();
                     let view = cx.entity().downgrade();
@@ -1421,20 +1412,12 @@ impl Workspace {
                                             window.close_dialog(cx);
                                             window.close_dialog(cx);
                                             let _ = view.update(cx, |this, cx| {
-                                                this.add_document(
+                                                this.open_saved_query(
                                                     profile.clone(),
-                                                    None,
-                                                    query.sql.clone(),
-                                                    true,
+                                                    query.clone(),
                                                     window,
                                                     cx,
                                                 );
-                                                if let Some(doc) = this.documents.last() {
-                                                    doc.update(cx, |doc, cx| {
-                                                        doc.saved_query = Some(query.clone());
-                                                        cx.emit(DocumentChanged);
-                                                    });
-                                                }
                                             });
                                         })
                                 })),
@@ -2670,57 +2653,42 @@ impl Render for Workspace {
                 .flex_shrink_0()
                 .bg(cx.theme().tab_bar)
                 .child(tab_bar_baseline(cx))
-                .when(self.schema_designer.is_some(), |bar| {
-                    bar.child(
-                        document_tab(
-                            usize::MAX - 2,
+                .children(
+                    [
+                        (
+                            ActiveContent::Designer,
+                            self.schema_draft.is_some(),
                             "Schema draft",
-                            "Schema draft",
-                            IconName::Table2,
-                            self.active_content == ActiveContent::Designer,
-                            cx,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.active_content = ActiveContent::Designer;
-                            this.history = None;
-                            cx.notify();
-                        })),
-                    )
-                })
-                .when(self.schema_comparison.is_some(), |bar| {
-                    bar.child(
-                        document_tab(
-                            usize::MAX - 1,
+                        ),
+                        (
+                            ActiveContent::Comparison,
+                            self.schema_comparison.is_some(),
                             "Compare schemas",
-                            "Compare schemas",
-                            IconName::Table2,
-                            self.active_content == ActiveContent::Comparison,
-                            cx,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.active_content = ActiveContent::Comparison;
-                            this.history = None;
-                            cx.notify();
-                        })),
-                    )
-                })
-                .when(self.diagram.is_some(), |bar| {
-                    bar.child(
+                        ),
+                        (
+                            ActiveContent::Diagram,
+                            self.diagram.is_some(),
+                            "Relationships",
+                        ),
+                    ]
+                    .into_iter()
+                    .filter(|(_, open, _)| *open)
+                    .map(|(content, _, title)| {
                         document_tab(
-                            usize::MAX,
-                            "Relationships",
-                            "Relationships",
+                            title,
+                            title,
+                            title,
                             IconName::Table2,
-                            self.active_content == ActiveContent::Diagram,
+                            self.active_content == content,
                             cx,
                         )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.active_content = ActiveContent::Diagram;
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.active_content = content;
                             this.history = None;
                             cx.notify();
-                        })),
-                    )
-                })
+                        }))
+                    }),
+                )
                 .when(!self.documents.is_empty(), |bar| {
                     bar.child(
                         div().flex_1().min_w_0().child(
@@ -2871,8 +2839,9 @@ impl Render for Workspace {
         {
             body.child(div().flex_1().min_h_0().child(comparison.clone()))
         } else if let Some(review) = self
-            .schema_review
+            .schema_draft
             .as_ref()
+            .and_then(|draft| draft.review.as_ref())
             .filter(|_| self.active_content == ActiveContent::Designer)
         {
             body.child(
@@ -2884,8 +2853,8 @@ impl Render for Workspace {
                         ),
                 ),
             )
-        } else if let Some(designer) = self
-            .schema_designer
+        } else if let Some(draft) = self
+            .schema_draft
             .as_ref()
             .filter(|_| self.active_content == ActiveContent::Designer)
         {
@@ -2893,7 +2862,7 @@ impl Render for Workspace {
                 v_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(designer.clone())
+                    .child(draft.designer.clone())
                     .child(
                         Button::new("save-close-schema")
                             .label("Save draft and close")

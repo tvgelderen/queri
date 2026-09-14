@@ -64,9 +64,21 @@ pub struct ConnectionForm {
     foreign_keys: bool,
     remember: bool,
     busy: bool,
-    message: String,
-    error: bool,
+    notice: Option<Notice>,
     field_error: Option<(Entity<InputState>, String)>,
+}
+/// The single path chosen in an open-file prompt; a cancelled prompt picks nothing.
+fn first_path<E>(
+    result: std::result::Result<Result<Option<Vec<std::path::PathBuf>>>, E>,
+) -> Result<Option<std::path::PathBuf>> {
+    Ok(result
+        .unwrap_or(Ok(None))?
+        .and_then(|paths| paths.into_iter().next()))
+}
+/// Feedback shown below the form; errors render as alerts.
+enum Notice {
+    Info(String),
+    Error(String),
 }
 impl EventEmitter<SavedConnection> for ConnectionForm {}
 
@@ -84,6 +96,13 @@ fn hinted(
 }
 
 impl ConnectionForm {
+    #[cfg(test)]
+    fn notice_text(&self) -> &str {
+        match &self.notice {
+            Some(Notice::Info(text) | Notice::Error(text)) => text,
+            None => "",
+        }
+    }
     pub fn new(
         services: Services,
         existing: Option<ConnectionProfile>,
@@ -220,8 +239,7 @@ impl ConnectionForm {
                 .as_ref()
                 .is_none_or(|profile| profile.remember_password),
             busy: false,
-            message: String::new(),
-            error: false,
+            notice: None,
             field_error: None,
         };
         form.key_subscription = Some(cx.subscribe_in(
@@ -256,8 +274,9 @@ impl ConnectionForm {
                                 .update(cx, |state, cx| state.set_value(passphrase, window, cx))
                         }
                         Err(error) => {
-                            this.error = true;
-                            this.message = format!("Could not read SSH passphrase: {error:#}");
+                            this.notice = Some(Notice::Error(format!(
+                                "Could not read SSH passphrase: {error:#}"
+                            )));
                         }
                         _ => {}
                     }
@@ -291,7 +310,8 @@ impl ConnectionForm {
                         return form;
                     }
                     if !form.remember {
-                        form.message = "Enter your password to reconnect.".into();
+                        form.notice =
+                            Some(Notice::Info("Enter your password to reconnect.".into()));
                         return form;
                     }
                     let id = form.id;
@@ -311,12 +331,13 @@ impl ConnectionForm {
                                     .password
                                     .update(cx, |state, cx| state.set_value(password, window, cx)),
                                 Ok(None) => {
-                                    this.message = "Enter your password again to reconnect.".into();
+                                    this.notice = Some(Notice::Info(
+                                        "Enter your password again to reconnect.".into(),
+                                    ));
                                 }
                                 Err(error) => {
                                     eprintln!("Could not load the connection password: {error:#}");
-                                    this.message = "Could not read the saved password. Enter it again; turn off Remember password if saving fails.".into();
-                                    this.error = true;
+                                    this.notice = Some(Notice::Error("Could not read the saved password. Enter it again; turn off Remember password if saving fails.".into()));
                                 }
                             }
                             cx.notify();
@@ -463,8 +484,7 @@ impl ConnectionForm {
     ) {
         input.read(cx).focus_handle(cx).focus(window, cx);
         self.field_error = Some((input, message));
-        self.message.clear();
-        self.error = true;
+        self.notice = None;
         cx.notify();
     }
 
@@ -507,9 +527,8 @@ impl ConnectionForm {
                         };
                         self.uri
                             .update(cx, |state, cx| state.set_value("", window, cx));
-                        self.message = "Connection string applied.".into();
+                        self.notice = Some(Notice::Info("Connection string applied.".into()));
                         self.uri_mode = false;
-                        self.error = false;
                     }
                     Err(error) => {
                         self.invalid_field(self.uri.clone(), error.to_string(), window, cx);
@@ -530,7 +549,7 @@ impl ConnectionForm {
         self.field_error = None;
         if !self.sqlite && self.uri_mode {
             self.parse_uri(window, cx);
-            if self.error {
+            if self.field_error.is_some() {
                 return;
             }
         }
@@ -556,8 +575,7 @@ impl ConnectionForm {
                     self.invalid_field(input, validation.to_string(), window, cx);
                     return;
                 }
-                self.message = format!("{error:#}");
-                self.error = true;
+                self.notice = Some(Notice::Error(format!("{error:#}")));
                 cx.notify();
                 return;
             }
@@ -573,7 +591,7 @@ impl ConnectionForm {
                     if view
                         .update_in(cx, |this, _, cx| {
                             if this.busy {
-                                this.message = message.into();
+                                this.notice = Some(Notice::Info(message.into()));
                                 cx.notify();
                             }
                         })
@@ -593,13 +611,14 @@ impl ConnectionForm {
         let sqlite = self.sqlite;
         let creating = sqlite && self.create && !self.existing;
         self.busy = true;
-        self.error = false;
-        self.message = if save {
-            "Saving…"
-        } else {
-            "Testing connection…"
-        }
-        .into();
+        self.notice = Some(Notice::Info(
+            if save {
+                "Saving…"
+            } else {
+                "Testing connection…"
+            }
+            .into(),
+        ));
         task(
             &self.services,
             window,
@@ -657,14 +676,14 @@ impl ConnectionForm {
                 this.test_cancel = None;
                 match result {
                     Ok(saved) => {
-                        this.message = "Connection successful.".into();
+                        this.notice = Some(Notice::Info("Connection successful.".into()));
                         if save {
                             cx.emit(saved);
                             window.close_dialog(cx);
                         }
                     }
                     Err(error) => {
-                        this.message = if save {
+                        let message = if save {
                             eprintln!("Could not save the connection: {error:#}");
                             if this.sqlite || !this.remember {
                                 "Could not save the connection. Check file permissions and retry."
@@ -675,7 +694,7 @@ impl ConnectionForm {
                         } else {
                             format!("Connection test failed.\n\n{error:#}")
                         };
-                        this.error = true;
+                        this.notice = Some(Notice::Error(message));
                     }
                 }
                 cx.notify();
@@ -702,8 +721,9 @@ impl ConnectionForm {
             |this, result, _, cx| {
                 this.busy = false;
                 if let Err(error) = result {
-                    this.error = true;
-                    this.message = format!("Could not clear saved SSH passphrase: {error:#}");
+                    this.notice = Some(Notice::Error(format!(
+                        "Could not clear saved SSH passphrase: {error:#}"
+                    )));
                 }
                 cx.notify();
             },
@@ -717,23 +737,31 @@ impl ConnectionForm {
             multiple: false,
             prompt: Some("Choose SSH private key".into()),
         });
+        let picked = async move { first_path(receiver.await) };
+        self.fill_path_from_picker(self.ssh_key.clone(), picked, window, cx);
+    }
+
+    /// Fills `input` with the picked path. A failed picker leaves typing the path as the fallback.
+    fn fill_path_from_picker(
+        &self,
+        input: Entity<InputState>,
+        picked: impl Future<Output = Result<Option<std::path::PathBuf>>> + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn_in(window, async move |view, cx| {
-            let result = receiver.await;
+            let result = picked.await;
             let _ = view.update_in(cx, |this, window, cx| {
                 match result {
-                    Ok(Ok(Some(paths))) => {
-                        if let Some(path) = paths.first() {
-                            this.ssh_key.update(cx, |state, cx| {
-                                state.set_value(path.to_string_lossy().to_string(), window, cx)
-                            });
-                        }
+                    Ok(Some(path)) => input.update(cx, |state, cx| {
+                        state.set_value(path.to_string_lossy().to_string(), window, cx)
+                    }),
+                    Ok(None) => {}
+                    Err(error) => {
+                        this.notice = Some(Notice::Error(format!(
+                            "Could not open the file picker: {error}. Enter a path instead."
+                        )))
                     }
-                    Ok(Err(error)) => {
-                        this.error = true;
-                        this.message =
-                            format!("File picker failed: {error}. Enter a path manually.");
-                    }
-                    _ => {}
                 }
                 cx.notify();
             });
@@ -751,16 +779,16 @@ impl ConnectionForm {
                 match result {
                     Ok(identities) => {
                         this.ssh_identities = identities;
-                        this.message = if this.ssh_identities.is_empty() {
-                            "No public key identities in SSH_AUTH_SOCK.".into()
-                        } else {
-                            "Choose an SSH agent identity.".into()
-                        };
+                        this.notice = Some(Notice::Info(
+                            if this.ssh_identities.is_empty() {
+                                "No public key identities in SSH_AUTH_SOCK."
+                            } else {
+                                "Choose an SSH agent identity."
+                            }
+                            .into(),
+                        ));
                     }
-                    Err(error) => {
-                        this.error = true;
-                        this.message = format!("{error:#}");
-                    }
+                    Err(error) => this.notice = Some(Notice::Error(format!("{error:#}"))),
                 }
                 cx.notify();
             },
@@ -771,17 +799,9 @@ impl ConnectionForm {
         if self.create && !self.existing {
             let receiver =
                 cx.prompt_for_new_path(std::path::Path::new("."), Some("database.sqlite"));
-            cx.spawn_in(window, async move |view, cx| {
-                let result = receiver.await;
-                let _ = view.update_in(cx, |this, window, cx| {
-                    match result {
-                        Ok(Ok(Some(path))) => this.path.update(cx, |state, cx| state.set_value(path.to_string_lossy().to_string(), window, cx)),
-                        Ok(Err(error)) => { this.message = format!("Could not open the file picker: {error}. Enter a file path instead."); this.error = true; }
-                        _ => {}
-                    }
-                    cx.notify();
-                });
-            }).detach();
+            // A cancelled prompt picks nothing.
+            let picked = async move { receiver.await.unwrap_or(Ok(None)) };
+            self.fill_path_from_picker(self.path.clone(), picked, window, cx);
             return;
         }
         let receiver = cx.prompt_for_paths(PathPromptOptions {
@@ -790,27 +810,8 @@ impl ConnectionForm {
             multiple: false,
             prompt: Some("Open SQLite database".into()),
         });
-        cx.spawn_in(window, async move |view, cx| {
-            let result = receiver.await;
-            let _ = view.update_in(cx, |this, window, cx| {
-                match result {
-                    Ok(Ok(Some(paths))) => {
-                        if let Some(path) = paths.first() {
-                            this.path.update(cx, |state, cx| {
-                                state.set_value(path.to_string_lossy().to_string(), window, cx)
-                            });
-                        }
-                    }
-                    Ok(Err(error)) => {
-                        this.message = error.to_string();
-                        this.error = true;
-                    }
-                    _ => {}
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        let picked = async move { first_path(receiver.await) };
+        self.fill_path_from_picker(self.path.clone(), picked, window, cx);
     }
 
     fn forget_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -831,12 +832,12 @@ impl ConnectionForm {
             cx,
             async move { tokio::task::spawn_blocking(move || connector.forget_host(&endpoint)).await? },
             |this, result, _, cx| {
-                this.error = result.is_err();
-                this.message = result
-                    .map(|_| {
-                        "SSH host trust removed. The next handshake requires verification.".into()
-                    })
-                    .unwrap_or_else(|e| format!("{e:#}"));
+                this.notice = Some(match result {
+                    Ok(()) => Notice::Info(
+                        "SSH host trust removed. The next handshake requires verification.".into(),
+                    ),
+                    Err(error) => Notice::Error(format!("{error:#}")),
+                });
                 cx.notify();
             },
         );
@@ -1187,7 +1188,7 @@ impl ConnectionForm {
                     .on_click(cx.listener(|this, _, window, cx| {
                         if let Some(abort) = this.test_cancel.take() {
                             abort.abort();
-                            this.message = "Cancelling connection test…".into();
+                            this.notice = Some(Notice::Info("Cancelling connection test…".into()));
                             cx.notify();
                         } else {
                             window.close_dialog(cx);
@@ -1451,29 +1452,32 @@ impl Render for ConnectionForm {
                         if this.sqlite && this.policy == ExecutionPolicy::ReadOnlyByDefault {
                             this.policy = ExecutionPolicy::Normal;
                         }
-                        this.error = false;
                         this.field_error = None;
-                        this.message.clear();
+                        this.notice = None;
                         cx.notify();
                     })),
             )
             .child(form)
-            .when(!self.message.is_empty(), |view| {
+            .when_some(self.notice.as_ref(), |view, notice| {
+                let (error, message) = match notice {
+                    Notice::Info(message) => (false, message),
+                    Notice::Error(message) => (true, message),
+                };
                 view.child(
                     v_flex()
                         .id("connection-feedback")
-                        .role(if self.error { Role::Alert } else { Role::Status })
+                        .role(if error { Role::Alert } else { Role::Status })
                         .gap_2().p_3().rounded(cx.theme().radius)
                         .bg(cx.theme().muted)
                         .text_sm().line_height(relative(1.5))
-                        .text_color(if self.error {
+                        .text_color(if error {
                             cx.theme().danger
                         } else {
                             cx.theme().muted_foreground
                         })
                         .child(h_flex().items_start().gap_2()
-                            .child(div().flex_shrink_0().child(Icon::new(if self.error { IconName::CircleAlert } else if self.busy { IconName::RefreshCw } else { IconName::Check }).small()))
-                            .child(div().flex_1().min_w_0().whitespace_normal().child(self.message.clone()))),
+                            .child(div().flex_shrink_0().child(Icon::new(if error { IconName::CircleAlert } else if self.busy { IconName::RefreshCw } else { IconName::Check }).small()))
+                            .child(div().flex_1().min_w_0().whitespace_normal().child(message.clone()))),
                 )
             })
     }
@@ -1689,7 +1693,7 @@ mod tests {
         })
         .unwrap();
         cx.wait_for(window, std::time::Duration::from_secs(5), |_, cx| {
-            form.read(cx).message.contains("SSH handshake")
+            form.read(cx).notice_text().contains("SSH handshake")
         })
         .await;
         cx.update_window(window, |_, window, cx| {
@@ -1700,7 +1704,7 @@ mod tests {
             !form.read(cx).busy()
         })
         .await;
-        assert!(form.read_with(cx, |form, _| form.message.contains("cancelled")));
+        assert!(form.read_with(cx, |form, _| form.notice_text().contains("cancelled")));
         assert!(store.profiles().unwrap().is_empty());
         socket_closed.await.unwrap();
     }

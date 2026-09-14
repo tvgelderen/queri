@@ -237,11 +237,7 @@ impl Session {
     }
 
     pub async fn query_params(&self, query: crate::parameters::BoundQuery) -> Result<QueryOutput> {
-        let dialect = match self.backend {
-            Backend::Postgres(_) => crate::sql::SqlDialect::Postgres,
-            _ => crate::sql::SqlDialect::Sqlite,
-        };
-        let parameters = crate::parameters::discover(&query.sql, dialect)?;
+        let parameters = crate::parameters::discover(&query.sql, self.profile.config.dialect())?;
         let query = parameters.bind(query.values)?;
         match &self.backend {
             Backend::Postgres(_) => {
@@ -330,10 +326,7 @@ impl Session {
     }
 
     pub async fn browse(&self, table: TableRef, options: BrowseOptions) -> Result<TablePage> {
-        anyhow::ensure!(
-            (1..=1000).contains(&options.limit),
-            "Page size must be 1–1000 rows."
-        );
+        validate_page_size(options.limit)?;
         match &self.backend {
             Backend::Postgres(pg) => {
                 postgres::browse(&*pg.client.lock().await, &table, &options).await
@@ -351,10 +344,7 @@ impl Session {
         table: TableRef,
         options: BrowseOptions,
     ) -> Result<crate::parameters::BoundQuery> {
-        anyhow::ensure!(
-            (1..=1000).contains(&options.limit),
-            "Page size must be 1–1000 rows."
-        );
+        validate_page_size(options.limit)?;
         match &self.backend {
             Backend::Postgres(pg) => {
                 Ok(

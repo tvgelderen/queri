@@ -254,10 +254,7 @@ impl Store {
 
     pub fn save_table_view(&self, view: &SavedTableView) -> Result<SavedTableView> {
         ensure!(!view.name.trim().is_empty(), "Enter a view name.");
-        ensure!(
-            (1..=1000).contains(&view.settings.page_size),
-            "Page size must be 1–1000 rows."
-        );
+        validate_page_size(view.settings.page_size)?;
         ensure!(
             view.relationship
                 .as_ref()
@@ -311,28 +308,7 @@ impl Store {
         profile.validate()?;
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let previous: Option<String> = tx
-            .query_row(
-                "SELECT profile FROM connections WHERE id=?1",
-                [profile.id.to_string()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let previous = previous
-            .map(|p| serde_json::from_str::<ConnectionProfile>(&p))
-            .transpose()?;
-        if !profile.ssh.as_ref().is_some_and(|s| s.remember_passphrase)
-            || previous
-                .as_ref()
-                .and_then(|p| p.ssh.as_ref())
-                .map(|s| &s.auth)
-                != profile.ssh.as_ref().map(|s| &s.auth)
-        {
-            tx.execute(
-                "DELETE FROM credentials WHERE connection_id=?1 AND purpose='ssh-passphrase'",
-                [profile.id.to_string()],
-            )?;
-        }
+        drop_stale_passphrase(&tx, profile)?;
         write_profile(&tx, profile)?;
         tx.commit()?;
         Ok(())
@@ -351,16 +327,7 @@ impl Store {
         profile.validate()?;
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let previous: Option<String> = tx
-            .query_row(
-                "SELECT profile FROM connections WHERE id=?1",
-                [profile.id.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let previous = previous
-            .map(|p| serde_json::from_str::<ConnectionProfile>(&p))
-            .transpose()?;
+        let remember = drop_stale_passphrase(&tx, profile)?;
         write_profile(&tx, profile)?;
         self.write_credential(
             &tx,
@@ -374,21 +341,6 @@ impl Store {
                 None
             },
         )?;
-        let remember = profile.ssh.as_ref().is_some_and(|ssh| {
-            ssh.remember_passphrase && matches!(ssh.auth, SshAuth::PrivateKey { .. })
-        });
-        if !remember
-            || previous
-                .as_ref()
-                .and_then(|p| p.ssh.as_ref())
-                .map(|s| &s.auth)
-                != profile.ssh.as_ref().map(|s| &s.auth)
-        {
-            tx.execute(
-                "DELETE FROM credentials WHERE connection_id=?1 AND purpose='ssh-passphrase'",
-                [profile.id.to_string()],
-            )?;
-        }
         if remember && let Some(passphrase) = passphrase {
             self.write_credential(&tx, profile.id, "ssh-passphrase", Some(passphrase))?;
         }
@@ -729,6 +681,37 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// Deletes the stored SSH key passphrase unless `profile` still remembers it for the
+/// same private key. Returns whether a passphrase may be remembered.
+/// Must run before `profile` replaces the stored one.
+fn drop_stale_passphrase(tx: &rusqlite::Transaction, profile: &ConnectionProfile) -> Result<bool> {
+    let previous: Option<String> = tx
+        .query_row(
+            "SELECT profile FROM connections WHERE id=?1",
+            [profile.id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let previous = previous
+        .map(|p| serde_json::from_str::<ConnectionProfile>(&p))
+        .transpose()?;
+    let remember = profile.ssh.as_ref().is_some_and(|ssh| {
+        ssh.remember_passphrase && matches!(ssh.auth, SshAuth::PrivateKey { .. })
+    });
+    let same_auth = previous
+        .as_ref()
+        .and_then(|p| p.ssh.as_ref())
+        .map(|s| &s.auth)
+        == profile.ssh.as_ref().map(|s| &s.auth);
+    if !remember || !same_auth {
+        tx.execute(
+            "DELETE FROM credentials WHERE connection_id=?1 AND purpose='ssh-passphrase'",
+            [profile.id.to_string()],
+        )?;
+    }
+    Ok(remember)
 }
 
 fn write_profile(conn: &Connection, profile: &ConnectionProfile) -> Result<()> {

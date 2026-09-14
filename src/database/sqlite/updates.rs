@@ -96,23 +96,10 @@ pub(super) fn statement(
         };
         assignments.push(format!("{}={expression}", quote_identifier(&column.name)?));
     }
-    let predicates = metadata
-        .columns
-        .iter()
-        .zip(&row.original)
-        .map(|(column, old)| {
-            params.push(old.clone());
-            Ok(format!(
-                "{} IS ?{}",
-                quote_identifier(&column.name)?,
-                params.len()
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let predicate = original_row_predicate(metadata, &row.original, &mut params)?;
     let sql = format!(
-        "UPDATE {table_name} SET {} WHERE {}",
-        assignments.join(","),
-        predicates.join(" AND ")
+        "UPDATE {table_name} SET {} WHERE {predicate}",
+        assignments.join(",")
     );
     Ok(crate::parameters::BoundQuery {
         sql,

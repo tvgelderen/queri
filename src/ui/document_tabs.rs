@@ -65,7 +65,7 @@ pub fn document_tab_bar(
 }
 
 pub fn document_tab(
-    index: usize,
+    id: impl Into<ElementId>,
     title: impl Into<SharedString>,
     context: impl Into<SharedString>,
     icon: IconName,
@@ -73,7 +73,7 @@ pub fn document_tab(
     cx: &App,
 ) -> Tab {
     let context = context.into();
-    Tab::new(index)
+    Tab::new(id)
         .selected(selected)
         .accessibility_label(context.clone())
         .group("document-tab")

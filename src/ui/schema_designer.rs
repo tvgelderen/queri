@@ -34,10 +34,217 @@ struct ColumnFields {
     nullable: bool,
     primary: bool,
 }
-struct ExtraFields {
-    original_index: Option<Index>,
-    kind: usize,
-    fields: Vec<Entity<InputState>>,
+#[derive(Clone, Copy)]
+enum ExtraKind {
+    PrimaryKey,
+    Unique,
+    Check,
+    ForeignKey,
+    Index,
+    UniqueIndex,
+}
+impl ExtraKind {
+    const ALL: [Self; 6] = [
+        Self::PrimaryKey,
+        Self::Unique,
+        Self::Check,
+        Self::ForeignKey,
+        Self::Index,
+        Self::UniqueIndex,
+    ];
+    fn title(self) -> &'static str {
+        match self {
+            Self::PrimaryKey => "primary key",
+            Self::Unique => "unique constraint",
+            Self::Check => "check constraint",
+            Self::ForeignKey => "foreign key",
+            Self::Index => "index",
+            Self::UniqueIndex => "unique index",
+        }
+    }
+}
+const COLUMNS_LABEL: &str = "Columns (comma separated)";
+/// An editable constraint or index; each variant owns exactly the inputs its kind needs.
+enum ExtraFields {
+    PrimaryKey {
+        columns: Entity<InputState>,
+    },
+    Unique {
+        columns: Entity<InputState>,
+    },
+    Check {
+        expression: Entity<InputState>,
+    },
+    ForeignKey {
+        columns: Entity<InputState>,
+        target: Entity<InputState>,
+        referenced_columns: Entity<InputState>,
+        on_update: Entity<InputState>,
+        on_delete: Entity<InputState>,
+        deferral: Entity<InputState>,
+    },
+    Index {
+        /// Preserves properties the designer does not edit, such as the definition.
+        original: Option<Index>,
+        unique: bool,
+        name: Entity<InputState>,
+        columns: Entity<InputState>,
+    },
+}
+impl ExtraFields {
+    fn blank(kind: ExtraKind, window: &mut Window, cx: &mut Context<SchemaDesigner>) -> Self {
+        let mut empty = || draft_input("", window, cx);
+        match kind {
+            ExtraKind::PrimaryKey => Self::PrimaryKey { columns: empty() },
+            ExtraKind::Unique => Self::Unique { columns: empty() },
+            ExtraKind::Check => Self::Check {
+                expression: empty(),
+            },
+            ExtraKind::ForeignKey => Self::ForeignKey {
+                columns: empty(),
+                target: empty(),
+                referenced_columns: empty(),
+                on_update: empty(),
+                on_delete: empty(),
+                deferral: empty(),
+            },
+            ExtraKind::Index | ExtraKind::UniqueIndex => Self::Index {
+                original: None,
+                unique: matches!(kind, ExtraKind::UniqueIndex),
+                name: empty(),
+                columns: empty(),
+            },
+        }
+    }
+    /// Primary keys are edited through column toggles, so they have no extra fields.
+    fn from_constraint(
+        constraint: &Constraint,
+        window: &mut Window,
+        cx: &mut Context<SchemaDesigner>,
+    ) -> Option<Self> {
+        let mut input = |value: String| draft_input(value, window, cx);
+        Some(match constraint {
+            Constraint::Primary { .. } => return None,
+            Constraint::Unique { columns } => Self::Unique {
+                columns: input(columns.join(",")),
+            },
+            Constraint::Check { expression } => Self::Check {
+                expression: input(expression.clone()),
+            },
+            Constraint::ForeignKey {
+                columns,
+                target,
+                referenced_columns,
+                on_update,
+                on_delete,
+                deferral,
+            } => Self::ForeignKey {
+                columns: input(columns.join(",")),
+                target: input(target.clone()),
+                referenced_columns: input(referenced_columns.join(",")),
+                on_update: input(on_update.clone()),
+                on_delete: input(on_delete.clone()),
+                deferral: input(deferral.clone().unwrap_or_default()),
+            },
+        })
+    }
+    fn from_index(index: &Index, window: &mut Window, cx: &mut Context<SchemaDesigner>) -> Self {
+        Self::Index {
+            original: Some(index.clone()),
+            unique: index.unique,
+            name: draft_input(index.name.clone(), window, cx),
+            columns: draft_input(index.columns.join(","), window, cx),
+        }
+    }
+    fn kind(&self) -> ExtraKind {
+        match self {
+            Self::PrimaryKey { .. } => ExtraKind::PrimaryKey,
+            Self::Unique { .. } => ExtraKind::Unique,
+            Self::Check { .. } => ExtraKind::Check,
+            Self::ForeignKey { .. } => ExtraKind::ForeignKey,
+            Self::Index { unique: false, .. } => ExtraKind::Index,
+            Self::Index { unique: true, .. } => ExtraKind::UniqueIndex,
+        }
+    }
+    fn inputs(&self) -> Vec<(&'static str, &Entity<InputState>)> {
+        match self {
+            Self::PrimaryKey { columns } | Self::Unique { columns } => {
+                vec![(COLUMNS_LABEL, columns)]
+            }
+            Self::Check { expression } => vec![("Check expression", expression)],
+            Self::ForeignKey {
+                columns,
+                target,
+                referenced_columns,
+                on_update,
+                on_delete,
+                deferral,
+            } => vec![
+                (COLUMNS_LABEL, columns),
+                ("Target table", target),
+                ("Referenced columns (comma separated)", referenced_columns),
+                ("On update", on_update),
+                ("On delete", on_delete),
+                ("Deferral (optional)", deferral),
+            ],
+            Self::Index { name, columns, .. } => {
+                vec![("Index name", name), (COLUMNS_LABEL, columns)]
+            }
+        }
+    }
+    fn apply(&self, table: &mut Table, cx: &App) {
+        let text = |input: &Entity<InputState>| input.read(cx).value().to_string();
+        let list = |input: &Entity<InputState>| {
+            text(input)
+                .split(',')
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+                .collect()
+        };
+        match self {
+            Self::PrimaryKey { columns } => table.constraints.push(Constraint::Primary {
+                columns: list(columns),
+            }),
+            Self::Unique { columns } => table.constraints.push(Constraint::Unique {
+                columns: list(columns),
+            }),
+            Self::Check { expression } => table.constraints.push(Constraint::Check {
+                expression: text(expression),
+            }),
+            Self::ForeignKey {
+                columns,
+                target,
+                referenced_columns,
+                on_update,
+                on_delete,
+                deferral,
+            } => table.constraints.push(Constraint::ForeignKey {
+                columns: list(columns),
+                target: text(target),
+                referenced_columns: list(referenced_columns),
+                on_update: text(on_update),
+                on_delete: text(on_delete),
+                deferral: Some(text(deferral)).filter(|value| !value.is_empty()),
+            }),
+            Self::Index {
+                original,
+                unique,
+                name,
+                columns,
+            } => {
+                let mut index = original.clone().unwrap_or(Index {
+                    name: String::new(),
+                    columns: vec![],
+                    unique: false,
+                    definition: None,
+                });
+                index.name = text(name);
+                index.columns = list(columns);
+                index.unique = *unique;
+                table.indexes.push(index);
+            }
+        }
+    }
 }
 pub struct SchemaDesigner {
     allow_destructive: bool,
@@ -86,49 +293,13 @@ impl SchemaDesigner {
             .cloned()
             .map(|c| Self::column(c, window, cx))
             .collect();
-        let mut extras = vec![];
-        for c in &table.constraints {
-            let (kind, values) = match c {
-                Constraint::Primary { .. } => continue,
-                Constraint::Unique { columns } => (1, vec![columns.join(",")]),
-                Constraint::Check { expression } => (2, vec![expression.clone()]),
-                Constraint::ForeignKey {
-                    columns,
-                    target,
-                    referenced_columns,
-                    on_update,
-                    on_delete,
-                    deferral,
-                } => (
-                    3,
-                    vec![
-                        columns.join(","),
-                        target.clone(),
-                        referenced_columns.join(","),
-                        on_update.clone(),
-                        on_delete.clone(),
-                        deferral.clone().unwrap_or_default(),
-                    ],
-                ),
-            };
-            extras.push(ExtraFields {
-                original_index: None,
-                kind,
-                fields: values
-                    .into_iter()
-                    .map(|v| draft_input(v, window, cx))
-                    .collect(),
-            });
-        }
+        let mut extras: Vec<_> = table
+            .constraints
+            .iter()
+            .filter_map(|c| ExtraFields::from_constraint(c, window, cx))
+            .collect();
         for index in &table.indexes {
-            extras.push(ExtraFields {
-                original_index: Some(index.clone()),
-                kind: if index.unique { 5 } else { 4 },
-                fields: vec![
-                    draft_input(index.name.clone(), window, cx),
-                    draft_input(index.columns.join(","), window, cx),
-                ],
-            });
+            extras.push(ExtraFields::from_index(index, window, cx));
         }
         Self {
             allow_destructive: false,
@@ -242,54 +413,8 @@ impl SchemaDesigner {
             .collect();
         table.constraints.clear();
         table.indexes.clear();
-        for e in &self.extras {
-            let values: Vec<String> = e
-                .fields
-                .iter()
-                .map(|f| f.read(cx).value().to_string())
-                .collect();
-            let list = |i: usize| {
-                values[i]
-                    .split(',')
-                    .map(|v| v.trim().to_owned())
-                    .filter(|v| !v.is_empty())
-                    .collect()
-            };
-            match e.kind {
-                0 => table
-                    .constraints
-                    .push(Constraint::Primary { columns: list(0) }),
-                1 => table
-                    .constraints
-                    .push(Constraint::Unique { columns: list(0) }),
-                2 => table.constraints.push(Constraint::Check {
-                    expression: values[0].clone(),
-                }),
-                3 => table.constraints.push(Constraint::ForeignKey {
-                    columns: list(0),
-                    target: values[1].clone(),
-                    referenced_columns: list(2),
-                    on_update: values[3].clone(),
-                    on_delete: values[4].clone(),
-                    deferral: if values[5].is_empty() {
-                        None
-                    } else {
-                        Some(values[5].clone())
-                    },
-                }),
-                _ => {
-                    let mut index = e.original_index.clone().unwrap_or(Index {
-                        name: values[0].clone(),
-                        columns: vec![],
-                        unique: false,
-                        definition: None,
-                    });
-                    index.name = values[0].clone();
-                    index.columns = list(1);
-                    index.unique = e.kind == 5;
-                    table.indexes.push(index);
-                }
-            }
+        for extra in &self.extras {
+            extra.apply(&mut table, cx);
         }
         let primary = table
             .constraints
@@ -425,16 +550,10 @@ impl Render for SchemaDesigner {
                     })),
             )
             .children(self.extras.iter().enumerate().map(|(i, e)| {
-                let labels = extra_labels(e.kind);
                 v_flex()
                     .gap_2()
-                    .child(extra_title(e.kind))
-                    .children(
-                        e.fields
-                            .iter()
-                            .zip(labels)
-                            .map(|(f, label)| field(*label, f)),
-                    )
+                    .child(e.kind().title())
+                    .children(e.inputs().into_iter().map(|(label, f)| field(label, f)))
                     .child(
                         Button::new(("remove-extra", i))
                             .label("Remove constraint or index")
@@ -445,22 +564,17 @@ impl Render for SchemaDesigner {
                             })),
                     )
             }))
-            .child(h_flex().flex_wrap().gap_2().children((0..6).map(|kind| {
-                Button::new(("add-extra", kind))
-                    .label(format!("Add {}", extra_title(kind)))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.extras.push(ExtraFields {
-                            original_index: None,
-                            kind,
-                            fields: extra_labels(kind)
-                                .iter()
-                                .map(|_| draft_input("", window, cx))
-                                .collect(),
-                        });
-                        cx.emit(SchemaDesignerEvent::Changed);
-                        cx.notify();
-                    }))
-            })))
+            .child(h_flex().flex_wrap().gap_2().children(
+                ExtraKind::ALL.into_iter().enumerate().map(|(i, kind)| {
+                    Button::new(("add-extra", i))
+                        .label(format!("Add {}", kind.title()))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.extras.push(ExtraFields::blank(kind, window, cx));
+                            cx.emit(SchemaDesignerEvent::Changed);
+                            cx.notify();
+                        }))
+                }),
+            ))
             .child(
                 Button::new("reset-schema")
                     .label("Reset draft")
@@ -498,32 +612,6 @@ impl Render for SchemaDesigner {
                         cx.emit(SchemaDesignerEvent::Review(Box::new(this.intent(cx))));
                     })),
             )
-    }
-}
-
-fn extra_title(kind: usize) -> &'static str {
-    [
-        "primary key",
-        "unique constraint",
-        "check constraint",
-        "foreign key",
-        "index",
-        "unique index",
-    ][kind]
-}
-fn extra_labels(kind: usize) -> &'static [&'static str] {
-    match kind {
-        0 | 1 => &["Columns (comma separated)"],
-        2 => &["Check expression"],
-        3 => &[
-            "Columns (comma separated)",
-            "Target table",
-            "Referenced columns (comma separated)",
-            "On update",
-            "On delete",
-            "Deferral (optional)",
-        ],
-        _ => &["Index name", "Columns (comma separated)"],
     }
 }
 
@@ -596,9 +684,9 @@ mod tests {
                         }, window, cx));
                     }
                     view.columns[1].primary = true;
-                    view.extras.push(super::ExtraFields {
-                        original_index: None, kind: 4,
-                        fields: vec![super::draft_input("lookup", window, cx), super::draft_input("description", window, cx)],
+                    view.extras.push(super::ExtraFields::Index {
+                        original: None, unique: false,
+                        name: super::draft_input("lookup", window, cx), columns: super::draft_input("description", window, cx),
                     });
                     view.columns[0].primary = true;
                     view.columns[0].original.primary_key_position = 2;

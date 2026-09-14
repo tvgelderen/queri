@@ -492,57 +492,13 @@ impl Connector {
         // Key decryption is deliberately outside Tokio's I/O workers and the GPUI thread.
         self.stage("Reading SSH authentication credentials…");
         let mut unlocked_passphrase = None;
-        let private_key = if let SshAuth::PrivateKey { path } = &ssh.auth {
-            let path = path.clone();
-            let supplied = self.supplied.lock().unwrap().remove(&profile.id);
-            let store = self.trust.store.clone();
-            let id = profile.id;
-            let remember = ssh.remember_passphrase;
-            let saved = tokio::task::spawn_blocking(move || {
-                if remember {
-                    store.load_ssh_passphrase(id)
-                } else {
-                    Ok(None)
-                }
-            })
-            .await??;
-            let passphrase = supplied.or(saved).filter(|value| !value.is_empty());
-            let key = tokio::task::spawn_blocking({
-                let path = path.clone();
-                let passphrase = passphrase.clone();
-                move || load_private_key(path, passphrase.as_deref())
-            })
-            .await?;
-            Some(match key {
-                Ok(key) => key,
-                Err(keys::Error::KeyIsEncrypted) if passphrase.is_none() => {
-                    let (reply, response) = oneshot::channel();
-                    let cancelled = CancellationToken::new();
-                    let _cancel_prompt = cancelled.clone().drop_guard();
-                    self.stage("Waiting for SSH key passphrase…");
-                    self.trust
-                        .prompts
-                        .send(Prompt::Passphrase {
-                            name: profile.display_name(),
-                            reply,
-                            cancelled,
-                        })
-                        .map_err(|_| anyhow::anyhow!("SSH passphrase UI unavailable"))?;
-                    let passphrase = response
-                        .await
-                        .context("SSH passphrase cancelled")?
-                        .context("SSH passphrase cancelled")?;
-                    unlocked_passphrase = Some(passphrase.clone());
-                    tokio::task::spawn_blocking(move || load_private_key(path, Some(&passphrase)))
-                        .await?
-                        .context("SSH private key could not be decrypted or parsed")?
-                }
-                Err(_) => bail!(
-                    "SSH private key could not be decrypted or parsed; check its path and passphrase"
-                ),
-            })
-        } else {
-            None
+        let credential = match &ssh.auth {
+            SshAuth::PrivateKey { path } => {
+                let (key, unlocked) = self.unlock_private_key(profile, path.clone()).await?;
+                unlocked_passphrase = unlocked;
+                Credential::Key(Arc::new(key))
+            }
+            SshAuth::Agent { fingerprint } => Credential::Agent { fingerprint },
         };
         self.stage("Connecting to SSH bastion…");
         let socket = tokio::time::timeout(
@@ -584,56 +540,57 @@ impl Connector {
         let authenticated = with_network_deadline(
             async {
                 let hash = handle.best_supported_rsa_hash().await?.flatten();
-                if let Some(key) = private_key {
-                    if key.algorithm().is_rsa() {
-                        ensure!(
-                            hash.is_some(),
-                            "SSH server does not support RSA SHA-2 signatures"
-                        );
+                match credential {
+                    Credential::Key(key) => {
+                        if key.algorithm().is_rsa() {
+                            ensure!(
+                                hash.is_some(),
+                                "SSH server does not support RSA SHA-2 signatures"
+                            );
+                        }
+                        Ok::<_, anyhow::Error>(
+                            handle
+                                .authenticate_publickey(
+                                    &ssh.user,
+                                    PrivateKeyWithHashAlg::new(key, hash),
+                                )
+                                .await?
+                                .success(),
+                        )
                     }
-                    Ok::<_, anyhow::Error>(
-                        handle
-                            .authenticate_publickey(
-                                &ssh.user,
-                                PrivateKeyWithHashAlg::new(Arc::new(key), hash),
-                            )
+                    Credential::Agent { fingerprint } => {
+                        let mut agent = AgentClient::connect_env()
+                            .await
+                            .context("Could not connect to SSH_AUTH_SOCK")?;
+                        let identity = agent
+                            .request_identities()
                             .await?
-                            .success(),
-                    )
-                } else {
-                    let SshAuth::Agent { fingerprint } = &ssh.auth else {
-                        unreachable!()
-                    };
-                    let mut agent = AgentClient::connect_env()
-                        .await
-                        .context("Could not connect to SSH_AUTH_SOCK")?;
-                    let identity = agent
-                        .request_identities()
-                        .await?
-                        .into_iter()
-                        .find_map(|identity| match identity {
-                            AgentIdentity::PublicKey { key, .. }
-                                if key.fingerprint(HashAlg::Sha256).to_string() == *fingerprint =>
-                            {
-                                Some(key)
-                            }
-                            _ => None,
-                        })
-                        .context("Chosen SSH agent identity is unavailable")?;
-                    if identity.algorithm().is_rsa() {
-                        ensure!(
-                            hash.is_some(),
-                            "SSH server does not support RSA SHA-2 signatures"
-                        );
+                            .into_iter()
+                            .find_map(|identity| match identity {
+                                AgentIdentity::PublicKey { key, .. }
+                                    if key.fingerprint(HashAlg::Sha256).to_string()
+                                        == fingerprint =>
+                                {
+                                    Some(key)
+                                }
+                                _ => None,
+                            })
+                            .context("Chosen SSH agent identity is unavailable")?;
+                        if identity.algorithm().is_rsa() {
+                            ensure!(
+                                hash.is_some(),
+                                "SSH server does not support RSA SHA-2 signatures"
+                            );
+                        }
+                        let mut signer = InteractiveSigner {
+                            signer: agent,
+                            waiting,
+                        };
+                        Ok(handle
+                            .authenticate_publickey_with(&ssh.user, identity, hash, &mut signer)
+                            .await?
+                            .success())
                     }
-                    let mut signer = InteractiveSigner {
-                        signer: agent,
-                        waiting,
-                    };
-                    Ok(handle
-                        .authenticate_publickey_with(&ssh.user, identity, hash, &mut signer)
-                        .await?
-                        .success())
                 }
             },
             signing,
@@ -658,6 +615,74 @@ impl Connector {
             closed,
         }))
     }
+
+    /// Loads the profile's private key, prompting for a passphrase when the key needs one
+    /// that was neither supplied nor saved. Returns the key and any passphrase the user typed.
+    async fn unlock_private_key(
+        &self,
+        profile: &ConnectionProfile,
+        path: std::path::PathBuf,
+    ) -> Result<(keys::PrivateKey, Option<String>)> {
+        let supplied = self.supplied.lock().unwrap().remove(&profile.id);
+        let store = self.trust.store.clone();
+        let id = profile.id;
+        let remember = profile
+            .ssh
+            .as_ref()
+            .is_some_and(|ssh| ssh.remember_passphrase);
+        let saved = tokio::task::spawn_blocking(move || {
+            if remember {
+                store.load_ssh_passphrase(id)
+            } else {
+                Ok(None)
+            }
+        })
+        .await??;
+        let passphrase = supplied.or(saved).filter(|value| !value.is_empty());
+        let key = tokio::task::spawn_blocking({
+            let path = path.clone();
+            let passphrase = passphrase.clone();
+            move || load_private_key(path, passphrase.as_deref())
+        })
+        .await?;
+        match key {
+            Ok(key) => Ok((key, None)),
+            Err(keys::Error::KeyIsEncrypted) if passphrase.is_none() => {
+                let (reply, response) = oneshot::channel();
+                let cancelled = CancellationToken::new();
+                let _cancel_prompt = cancelled.clone().drop_guard();
+                self.stage("Waiting for SSH key passphrase…");
+                self.trust
+                    .prompts
+                    .send(Prompt::Passphrase {
+                        name: profile.display_name(),
+                        reply,
+                        cancelled,
+                    })
+                    .map_err(|_| anyhow::anyhow!("SSH passphrase UI unavailable"))?;
+                let passphrase = response
+                    .await
+                    .context("SSH passphrase cancelled")?
+                    .context("SSH passphrase cancelled")?;
+                let key = tokio::task::spawn_blocking({
+                    let passphrase = passphrase.clone();
+                    move || load_private_key(path, Some(&passphrase))
+                })
+                .await?
+                .context("SSH private key could not be decrypted or parsed")?;
+                Ok((key, Some(passphrase)))
+            }
+            Err(_) => bail!(
+                "SSH private key could not be decrypted or parsed; check its path and passphrase"
+            ),
+        }
+    }
+}
+
+/// How the SSH client proves its identity to the bastion.
+enum Credential<'a> {
+    Key(Arc<keys::PrivateKey>),
+    Agent { fingerprint: &'a str },
 }
 
 fn load_private_key(

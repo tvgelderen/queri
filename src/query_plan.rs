@@ -10,6 +10,20 @@ use sqlparser::{
     parser::Parser,
 };
 
+const SQLITE_PLAN: &str = "EXPLAIN QUERY PLAN";
+const POSTGRES_PLAN: &str = "EXPLAIN (FORMAT JSON)";
+const POSTGRES_ANALYZE: &str = "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)";
+
+/// ANALYZE executes the statement, so hand-written ANALYZE variants also count.
+pub fn is_analyze(sql: &str) -> bool {
+    sql.starts_with("EXPLAIN (ANALYZE,")
+}
+
+/// Whether `sql` produces output that `QueryPlan::parse` understands.
+pub fn is_plan_sql(sql: &str) -> bool {
+    sql.starts_with(SQLITE_PLAN) || sql.starts_with(POSTGRES_PLAN) || is_analyze(sql)
+}
+
 pub fn explain_sql(sql: &str, dialect: SqlDialect, analyze: bool) -> Result<String> {
     let pg = matches!(dialect, SqlDialect::Postgres);
     ensure!(pg || !analyze, "SQLite provides estimated plans only.");
@@ -34,11 +48,11 @@ pub fn explain_sql(sql: &str, dialect: SqlDialect, analyze: bool) -> Result<Stri
         "Select a SELECT, INSERT, UPDATE, or DELETE statement."
     );
     let prefix = if !pg {
-        "EXPLAIN QUERY PLAN"
+        SQLITE_PLAN
     } else if analyze {
-        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)"
+        POSTGRES_ANALYZE
     } else {
-        "EXPLAIN (FORMAT JSON)"
+        POSTGRES_PLAN
     };
     Ok(format!("{prefix}\n{sql}"))
 }

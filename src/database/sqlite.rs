@@ -396,17 +396,19 @@ fn filter_value(text: &str, kind: FilterKind) -> Result<Value> {
     }
 }
 
-fn predicate(
+/// Matches only the row whose every column `IS` its original value.
+/// Original values are appended to `params`, numbered after any existing parameters.
+pub(super) fn original_row_predicate(
     metadata: &TableMetadata,
     original: &[Cell],
-    params: &mut Vec<Value>,
+    params: &mut Vec<Cell>,
 ) -> Result<String> {
     metadata
         .columns
         .iter()
         .zip(original)
         .map(|(col, old)| {
-            params.push(value(old));
+            params.push(old.clone());
             Ok(format!(
                 "{} IS ?{}",
                 quote_identifier(&col.name)?,
@@ -483,10 +485,10 @@ pub fn change_rows(conn: &mut Connection, table: &TableRef, change: RowChange) -
             for original in originals {
                 validate_original(&metadata, table, &original)?;
                 let mut params = vec![];
-                let predicate = predicate(&metadata, &original, &mut params)?;
+                let predicate = original_row_predicate(&metadata, &original, &mut params)?;
                 let affected = tx.execute(
                     &format!("DELETE FROM {qualified} WHERE {predicate}"),
-                    params_from_iter(params),
+                    params_from_iter(params.iter().map(value)),
                 )?;
                 ensure!(
                     affected == 1,

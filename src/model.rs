@@ -140,6 +140,15 @@ impl std::fmt::Display for ConnectionValidationError {
 
 impl std::error::Error for ConnectionValidationError {}
 
+impl ConnectionConfig {
+    pub fn dialect(&self) -> crate::sql::SqlDialect {
+        match self {
+            Self::Postgres { .. } => crate::sql::SqlDialect::Postgres,
+            Self::Sqlite { .. } => crate::sql::SqlDialect::Sqlite,
+        }
+    }
+}
+
 impl ConnectionProfile {
     pub fn display_name(&self) -> String {
         match self.environment {
@@ -460,6 +469,17 @@ impl TableViewSettings {
         );
         Ok(visible)
     }
+}
+
+/// Largest table page a browse or saved table view may request.
+pub const MAX_PAGE_SIZE: u32 = 1000;
+
+pub fn validate_page_size(rows: u32) -> Result<()> {
+    ensure!(
+        (1..=MAX_PAGE_SIZE).contains(&rows),
+        "Page size must be 1–1000 rows."
+    );
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default)]

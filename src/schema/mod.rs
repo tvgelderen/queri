@@ -159,17 +159,7 @@ fn equivalent(left: &Table, right: &Table, engine: &Engine) -> bool {
             .iter()
             .map(|sql| canonical_sql(sql))
             .collect();
-        table.definition = table.definition.as_ref().map(|sql| {
-            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, sql)
-                .map(|statements| {
-                    statements
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(";")
-                })
-                .unwrap_or_else(|_| sql.clone())
-        });
+        table.definition = table.definition.as_ref().map(|sql| canonical_sql(sql));
     }
     left == right
 }

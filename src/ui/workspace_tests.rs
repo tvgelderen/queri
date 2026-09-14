@@ -2231,3 +2231,181 @@ async fn staged_edits_guard_idle_tab_close_and_save_before_closing(cx: &mut Test
         "Saved before close"
     );
 }
+
+#[gpui_kit::test]
+async fn schema_draft_saves_restores_reviews_and_clears_after_apply(cx: &mut TestAppContext) {
+    use crate::ui::schema_designer::SchemaDesignerEvent;
+    use crate::ui::schema_review::SchemaReviewEvent;
+    cx.executor().allow_parking();
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let path = directory.path().join("catalog.sqlite");
+    rusqlite::Connection::open(&path)
+        .expect("database")
+        .execute_batch("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT)")
+        .expect("table");
+    let profile = ConnectionProfile {
+        ssh: None,
+        environment: None,
+        policy: ExecutionPolicy::Normal,
+        id: Uuid::new_v4(),
+        name: "Catalog".into(),
+        notes: String::new(),
+        color: String::new(),
+        remember_password: false,
+        config: ConnectionConfig::Sqlite {
+            path,
+            read_only: false,
+            create: false,
+            wal: true,
+            foreign_keys: true,
+        },
+    };
+    let draft_key = serde_json::json!([profile.id, "catalog.sqlite", "main", "items"]).to_string();
+    let store = Store::open(directory.path().join("app.db")).expect("store");
+    let services = Services::new(runtime().expect("runtime"), store);
+    let (window, workspace) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workspace::new(
+                    services,
+                    Preferences {
+                        active_connection: Some(profile.id),
+                        ..Default::default()
+                    },
+                    vec![profile],
+                    window,
+                    cx,
+                )
+            })
+        })
+        .expect("workspace")
+    });
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace.read(cx).connection_state == ConnectionState::Ready
+    })
+    .await;
+    let open_designer = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.open_schema_designer(
+                    "catalog.sqlite",
+                    "main",
+                    Some("items".into()),
+                    window,
+                    cx,
+                )
+            })
+        })
+        .expect("open designer");
+    };
+    open_designer(cx);
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace.read(cx).schema_draft.is_some()
+    })
+    .await;
+    let stored = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            workspace
+                .read(cx)
+                .services
+                .store
+                .schema_draft(&draft_key)
+                .expect("read draft")
+        })
+    };
+    assert!(stored(cx).is_none(), "opening alone does not persist");
+
+    cx.update(|cx| {
+        let designer = workspace
+            .read(cx)
+            .schema_draft
+            .as_ref()
+            .unwrap()
+            .designer
+            .clone();
+        designer.update(cx, |_, cx| cx.emit(SchemaDesignerEvent::Changed));
+    });
+    assert!(stored(cx).is_some(), "edits autosave under the draft key");
+
+    cx.update(|cx| workspace.update(cx, |this, cx| this.save_close_schema_draft(cx)));
+    cx.update(|cx| assert!(workspace.read(cx).schema_draft.is_none()));
+    assert!(
+        stored(cx).is_some(),
+        "save and close keeps the stored draft"
+    );
+
+    open_designer(cx);
+    cx.wait_for(window, Duration::from_secs(5), |_, cx| {
+        workspace.read(cx).schema_draft.is_some()
+    })
+    .await;
+    cx.update(|cx| {
+        assert!(
+            workspace
+                .read(cx)
+                .status
+                .starts_with("Saved schema draft restored")
+        )
+    });
+
+    cx.update(|cx| {
+        let designer = workspace
+            .read(cx)
+            .schema_draft
+            .as_ref()
+            .unwrap()
+            .designer
+            .clone();
+        designer.update(cx, |designer, cx| {
+            let intent = designer.intent(cx);
+            cx.emit(SchemaDesignerEvent::Review(Box::new(intent)))
+        });
+    });
+    let review = cx.update(|cx| {
+        workspace
+            .read(cx)
+            .schema_draft
+            .as_ref()
+            .unwrap()
+            .review
+            .clone()
+            .expect("review opens")
+    });
+    review.update(cx, |_, cx| cx.emit(SchemaReviewEvent::Back));
+    cx.update(|cx| {
+        let draft = workspace
+            .read(cx)
+            .schema_draft
+            .as_ref()
+            .expect("back keeps the draft");
+        assert!(draft.review.is_none());
+    });
+
+    cx.update(|cx| {
+        let designer = workspace
+            .read(cx)
+            .schema_draft
+            .as_ref()
+            .unwrap()
+            .designer
+            .clone();
+        designer.update(cx, |designer, cx| {
+            let intent = designer.intent(cx);
+            cx.emit(SchemaDesignerEvent::Review(Box::new(intent)))
+        });
+    });
+    let review = cx.update(|cx| {
+        workspace
+            .read(cx)
+            .schema_draft
+            .as_ref()
+            .unwrap()
+            .review
+            .clone()
+            .expect("review reopens")
+    });
+    review.update(cx, |_, cx| cx.emit(SchemaReviewEvent::Applied));
+    cx.update(|cx| assert!(workspace.read(cx).schema_draft.is_none()));
+    assert!(stored(cx).is_none(), "applying removes the stored draft");
+}

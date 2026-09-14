@@ -107,6 +107,21 @@ enum QueryOutcome {
     TimedOut,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransactionCommand {
+    Begin,
+    Commit,
+    Rollback,
+}
+impl TransactionCommand {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Begin => "BEGIN",
+            Self::Commit => "COMMIT",
+            Self::Rollback => "ROLLBACK",
+        }
+    }
+}
 pub struct DocumentChanged;
 struct TimeoutValidation(String);
 
@@ -457,25 +472,19 @@ impl Document {
         password: String,
         cx: &mut Context<Self>,
     ) {
-        self.connect_cancel.cancel();
-        self.stale = self.has_loaded_results();
+        self.drop_session(cx);
         self.profile = profile.for_database(&self.profile.database());
         self.password = Some(password);
-        self.applied_browse = None;
-        self.parameter_seed = None;
-        self.session_generation += 1;
-        self.operation = Operation::Idle;
-        self.cancel_pending = false;
-        self.session = None;
-        self.completion.set_session(None);
-        if let Some(editor) = self.sql_editor() {
-            editor.update(cx, |editor, cx| editor.dismiss_lsp_overlays(cx));
-        }
-        self.transaction = TransactionStatus::Unknown;
-        self.transaction_started = None;
         self.database_available = true;
     }
     pub fn disconnect(&mut self, cx: &mut Context<Self>) {
+        self.drop_session(cx);
+        self.status = "Disconnected".into();
+        cx.notify();
+    }
+    /// Abandons the current session and every in-flight result bound to it.
+    /// Session-bound state added to `Document` must be reset here.
+    fn drop_session(&mut self, cx: &mut Context<Self>) {
         self.connect_cancel.cancel();
         self.stale = self.has_loaded_results();
         self.applied_browse = None;
@@ -490,8 +499,6 @@ impl Document {
         }
         self.transaction = TransactionStatus::Unknown;
         self.transaction_started = None;
-        self.status = "Disconnected".into();
-        cx.notify();
     }
     pub fn rename_database(&mut self, name: &str, cx: &mut Context<Self>) {
         self.profile = self.profile.for_database(name);
@@ -841,10 +848,7 @@ impl Document {
                     Arc::new(data),
                     *section == Section::Data
                         && page.metadata.editable(table)
-                        && !self
-                            .session
-                            .as_ref()
-                            .is_some_and(|session| session.read_only()),
+                        && !self.session_read_only(),
                     *section == Section::Data,
                 )
             }
@@ -914,7 +918,7 @@ impl Document {
         } else {
             selected
         };
-        match crate::query_plan::explain_sql(&source, self.parameter_dialect(), analyze) {
+        match crate::query_plan::explain_sql(&source, self.profile.config.dialect(), analyze) {
             Ok(sql) => self.execute(sql, window, cx),
             Err(error) => {
                 self.error = format!("{error:#}");
@@ -945,7 +949,7 @@ impl Document {
     }
 
     fn execute(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
-        match crate::parameters::discover(&sql, self.parameter_dialect()) {
+        match crate::parameters::discover(&sql, self.profile.config.dialect()) {
             Ok(parameters) if !parameters.names.is_empty() => {
                 self.enter_parameters(sql, parameters, window, cx)
             }
@@ -968,7 +972,7 @@ impl Document {
         if self.busy() || self.session.is_none() {
             return;
         }
-        let analyze = sql.starts_with("EXPLAIN (ANALYZE,");
+        let analyze = crate::query_plan::is_analyze(&sql);
         let destructive = self.warn_destructive && sql::destructive(&sql);
         if self.profile.policy == ExecutionPolicy::ConfirmExecutions || destructive || analyze {
             let view = cx.entity();
@@ -1130,14 +1134,12 @@ impl Document {
                                 .push_str(&format!(" · History could not be saved: {error}"));
                         }
                         this.plan_view = None;
-                        if (plan_source.starts_with("EXPLAIN (FORMAT JSON)")
-                            || plan_source.starts_with("EXPLAIN (ANALYZE,")
-                            || plan_source.starts_with("EXPLAIN QUERY PLAN"))
+                        if crate::query_plan::is_plan_sql(&plan_source)
                             && let Some(set) = output.sets.first()
                         {
                             match crate::query_plan::QueryPlan::parse(
                                 set,
-                                matches!(this.parameter_dialect(), sql::SqlDialect::Postgres),
+                                matches!(this.profile.config.dialect(), sql::SqlDialect::Postgres),
                             ) {
                                 Ok(plan) => {
                                     let context = format!(
@@ -1231,29 +1233,33 @@ impl Document {
         cx.notify();
     }
 
-    fn transaction_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn transaction_command(
+        &mut self,
+        command: TransactionCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.has_edits(cx) {
-            let command = command.to_owned();
             self.resolve_edits(window, cx, move |this, w, cx| {
-                this.transaction_command(&command, w, cx)
+                this.transaction_command(command, w, cx)
             });
             return;
         }
         let allowed = match command {
-            "BEGIN" => self.transaction == TransactionStatus::Idle,
-            "COMMIT" => self.transaction == TransactionStatus::Open,
-            "ROLLBACK" => matches!(
+            TransactionCommand::Begin => self.transaction == TransactionStatus::Idle,
+            TransactionCommand::Commit => self.transaction == TransactionStatus::Open,
+            TransactionCommand::Rollback => matches!(
                 self.transaction,
                 TransactionStatus::Open | TransactionStatus::Failed
             ),
-            _ => false,
         };
         if allowed && !self.busy() && self.session.is_some() {
-            if command == "ROLLBACK" {
+            let sql = command.sql().to_owned();
+            if command == TransactionCommand::Rollback {
                 // Recovery must remain available without another confirmation.
-                self.execute_confirmed(command.into(), None, window, cx);
+                self.execute_confirmed(sql, None, window, cx);
             } else {
-                self.execute(command.into(), window, cx);
+                self.execute(sql, window, cx);
             }
         }
     }
@@ -1274,10 +1280,16 @@ impl Document {
 
     fn timeout_controls(&self, cx: &mut Context<Self>) -> AnyElement {
         let disabled = self.busy() || self.transaction == TransactionStatus::Failed;
+        #[derive(Clone, Copy, PartialEq)]
+        enum TimeoutMode {
+            Inherit,
+            NoTimeout,
+            Custom,
+        }
         let mode = match self.statement_timeout {
-            StatementTimeout::Inherit => 0,
-            StatementTimeout::NoTimeout => 1,
-            StatementTimeout::Custom(_) => 2,
+            StatementTimeout::Inherit => TimeoutMode::Inherit,
+            StatementTimeout::NoTimeout => TimeoutMode::NoTimeout,
+            StatementTimeout::Custom(_) => TimeoutMode::Custom,
         };
         h_flex().gap_2()
             .child(choice(
@@ -1288,13 +1300,13 @@ impl Document {
                 }).disabled(disabled)
                 .tooltip("Per statement. Inherit uses the initial connection policy; None removes the application limit. Server policies may still apply. Recover a failed transaction before changing this setting."),
                 mode,
-                [(0, "Inherit connection/server".into()), (1, "No application timeout".into()), (2, "Custom duration…".into())],
+                [(TimeoutMode::Inherit, "Inherit connection/server".into()), (TimeoutMode::NoTimeout, "No application timeout".into()), (TimeoutMode::Custom, "Custom duration…".into())],
                 cx.listener(|this, mode, window, cx| {
                     if this.busy() || this.transaction == TransactionStatus::Failed { return; }
                     match mode {
-                        0 => this.set_timeout(StatementTimeout::Inherit, cx),
-                        1 => this.set_timeout(StatementTimeout::NoTimeout, cx),
-                        _ => {
+                        TimeoutMode::Inherit => this.set_timeout(StatementTimeout::Inherit, cx),
+                        TimeoutMode::NoTimeout => this.set_timeout(StatementTimeout::NoTimeout, cx),
+                        TimeoutMode::Custom => {
                             let value = match this.statement_timeout { StatementTimeout::Custom(ms) => ms.to_string(), _ => "30000".into() };
                             this.timeout_input.update(cx, |input, cx| input.set_value(value, window, cx));
                             let input = this.timeout_input.clone();
@@ -1408,7 +1420,7 @@ impl Document {
                         .label("Begin")
                         .tooltip("Begin a transaction")
                         .disabled(unavailable)
-                        .on_click(cx.listener(|this, _, window, cx| this.transaction_command("BEGIN", window, cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.transaction_command(TransactionCommand::Begin, window, cx))),
                 )
             })
             .when(self.transaction == TransactionStatus::Open, |row| {
@@ -1419,7 +1431,7 @@ impl Document {
                         .icon(IconName::Check)
                         .label("Commit")
                         .disabled(unavailable)
-                        .on_click(cx.listener(|this, _, window, cx| this.transaction_command("COMMIT", window, cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.transaction_command(TransactionCommand::Commit, window, cx))),
                 )
             })
             .when(
@@ -1433,7 +1445,7 @@ impl Document {
                             .label("Roll back")
                             .accessibility_label("Rollback")
                             .disabled(unavailable)
-                            .on_click(cx.listener(|this, _, window, cx| this.transaction_command("ROLLBACK", window, cx))),
+                            .on_click(cx.listener(|this, _, window, cx| this.transaction_command(TransactionCommand::Rollback, window, cx))),
                     )
                 },
             )
@@ -1971,6 +1983,13 @@ impl Document {
         self.refresh(window, cx);
     }
 
+    /// True only for a connected session whose policy blocks generated changes.
+    fn session_read_only(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.read_only())
+    }
+
     fn can_insert(&self) -> bool {
         !self.busy()
             && self
@@ -2036,10 +2055,7 @@ impl Document {
             )
             .into_any_element(),
             Section::Data => {
-                let read_only = self
-                    .session
-                    .as_ref()
-                    .is_some_and(|session| session.read_only());
+                let read_only = self.session_read_only();
                 let (title, description) = if !table.is_table() {
                     (
                         "This view has no rows",
@@ -2094,10 +2110,7 @@ impl Document {
             )
             .into_any_element(),
             Section::Indexes | Section::Constraints => {
-                let read_only = self
-                    .session
-                    .as_ref()
-                    .is_some_and(|session| session.read_only());
+                let read_only = self.session_read_only();
                 let (title, description) = if *section == Section::Indexes && !table.is_table() {
                     (
                         "No indexes",
@@ -2166,11 +2179,7 @@ impl Document {
             selection.clone()
         };
         let input = original[range.clone()].to_owned();
-        let dialect = if matches!(self.profile.config, ConnectionConfig::Sqlite { .. }) {
-            sql::SqlDialect::Sqlite
-        } else {
-            sql::SqlDialect::Postgres
-        };
+        let dialect = self.profile.config.dialect();
         self.formatting = true;
         self.error.clear();
         task(
@@ -3226,11 +3235,7 @@ impl Document {
         };
         if self.can_insert() && page.metadata.editable(table) {
             None
-        } else if self
-            .session
-            .as_ref()
-            .is_some_and(|session| session.read_only())
-        {
+        } else if self.session_read_only() {
             Some("Generated changes blocked by connection policy")
         } else if !table.is_table() {
             Some("Views are read-only")
@@ -3465,9 +3470,9 @@ impl Render for Document {
             .on_action(cx.listener(|this, _: &CancelCellEdit, window, cx| { if this.grid.read(cx).delegate().editor.is_some() {this.cancel_cell_edit(window,cx);}else{cx.propagate();} }))
             .on_action(cx.listener(|this, _: &FormatSql, window, cx| this.format_sql(window,cx)))
             .on_action(cx.listener(|this, _: &CopyCells, _, cx| this.copy_cells(crate::export::Format::Tsv, false,cx)))
-            .on_action(cx.listener(|this, _: &BeginTransaction, window, cx| this.transaction_command("BEGIN", window, cx)))
-            .on_action(cx.listener(|this, _: &CommitTransaction, window, cx| this.transaction_command("COMMIT", window, cx)))
-            .on_action(cx.listener(|this, _: &RollbackTransaction, window, cx| this.transaction_command("ROLLBACK", window, cx)))
+            .on_action(cx.listener(|this, _: &BeginTransaction, window, cx| this.transaction_command(TransactionCommand::Begin, window, cx)))
+            .on_action(cx.listener(|this, _: &CommitTransaction, window, cx| this.transaction_command(TransactionCommand::Commit, window, cx)))
+            .on_action(cx.listener(|this, _: &RollbackTransaction, window, cx| this.transaction_command(TransactionCommand::Rollback, window, cx)))
             .on_action(cx.listener(|this, _: &RunQuery, window, cx| this.run(window, cx)))
             .on_action(cx.listener(|this, _: &CancelQuery, window, cx| this.cancel(window, cx)))
             .on_action(cx.listener(|this, _: &Refresh, window, cx| this.refresh(window, cx)))

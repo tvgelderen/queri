@@ -1119,7 +1119,9 @@ async fn transaction_controls_manual_sql_and_error_observation(cx: &mut TestAppC
         window.click("begin-transaction", cx);
         assert!(doc.read(cx).busy());
         // A second action cannot race the pending BEGIN/status observation.
-        doc.update(cx, |doc, cx| doc.transaction_command("COMMIT", window, cx));
+        doc.update(cx, |doc, cx| {
+            doc.transaction_command(super::TransactionCommand::Commit, window, cx)
+        });
     })
     .unwrap();
     cx.wait_for(window, Duration::from_secs(5), |_, cx| !doc.read(cx).busy())
@@ -1232,7 +1234,9 @@ async fn postgres_transaction_failed_recovery_and_unknown_commit_ui(cx: &mut Tes
         .await;
     cx.update_window(window, |_, window, cx| {
         assert_eq!(doc.read(cx).transaction, TransactionStatus::Failed);
-        doc.update(cx, |doc, cx| doc.transaction_command("COMMIT", window, cx));
+        doc.update(cx, |doc, cx| {
+            doc.transaction_command(super::TransactionCommand::Commit, window, cx)
+        });
         assert!(
             !doc.read(cx).busy(),
             "Failed transaction cannot be committed by the toolbar"
