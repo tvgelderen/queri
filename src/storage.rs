@@ -622,6 +622,47 @@ impl Store {
         Ok(())
     }
 
+    pub fn schema_draft(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.connection()?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_drafts (context TEXT PRIMARY KEY, value TEXT NOT NULL)")?;
+        Ok(conn
+            .query_row(
+                "SELECT value FROM schema_drafts WHERE context=?1",
+                [key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn save_schema_draft(&self, key: &str, value: Option<&str>) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_drafts (context TEXT PRIMARY KEY, value TEXT NOT NULL)")?;
+        if let Some(value) = value {
+            conn.execute("INSERT INTO schema_drafts(context,value) VALUES (?1,?2) ON CONFLICT(context) DO UPDATE SET value=excluded.value", [key, value])?;
+        } else {
+            conn.execute("DELETE FROM schema_drafts WHERE context=?1", [key])?;
+        }
+        Ok(())
+    }
+
+    pub fn diagram_layout(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.connection()?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS diagram_layouts (context TEXT PRIMARY KEY, value TEXT NOT NULL)")?;
+        Ok(conn
+            .query_row(
+                "SELECT value FROM diagram_layouts WHERE context=?1",
+                [key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+    pub fn save_diagram_layout(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS diagram_layouts (context TEXT PRIMARY KEY, value TEXT NOT NULL)")?;
+        conn.execute("INSERT INTO diagram_layouts(context,value) VALUES (?1,?2) ON CONFLICT(context) DO UPDATE SET value=excluded.value", [key, value])?;
+        Ok(())
+    }
+
     pub fn preferences(&self) -> Result<Preferences> {
         let value: Option<String> = self
             .connection()?

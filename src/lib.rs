@@ -14,3 +14,5 @@ pub mod row_updates;
 pub mod statistics;
 
 pub mod ssh;
+
+pub mod schema;

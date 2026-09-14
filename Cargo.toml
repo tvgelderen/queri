@@ -37,6 +37,11 @@ name = "dialog_backdrop"
 harness = false
 required-features = ["test-support"]
 
+[[test]]
+name = "schema_screens"
+harness = false
+required-features = ["test-support"]
+
 [patch.crates-io]
 tokio-postgres = { path = "vendor/tokio-postgres-0.7.18" }
 gpui-pre = { path = "vendor/gpui-pre-0.3.10" }

@@ -1,0 +1,7 @@
+ts	phase	decision	why	evidence	result
+2026-11-11T15:45:26.391383+00:00	integration	Integrated incremental schema tools commits; core work remains incomplete	Workers returned partial milestones; retained explicit unsupported guards	git log cbc0458..HEAD	open
+2026-11-11T15:45:26.391396+00:00	verification	Captured native ER screens and corrected integration lint errors	Real rendering exposed layout flaws missed by compilation	tests/schema_screens.rs; /tmp/queri-schema-screens	GPU capture passed; full verification pending
+2026-11-11T16:09:26.870210+00:00	integration	Integrated schema tabs, persisted drafts, reviewed target apply and refresh	Complete ordinary schema workflows while preserving unsupported guards	src/ui/workspace_schema.rs; src/schema; tests/schema.rs	implemented
+2026-11-11T16:09:26.870216+00:00	review	Fixed four independent review findings	Prevent detached apply and semantic loss; make ordinary PK/index creation work	src/ui/schema_review.rs; src/database/schema; src/ui/schema_designer.rs	focused checks passed
+2026-11-11T16:09:26.870219+00:00	verification	Full suite passed with disposable PostgreSQL enabled	Verify actual database outcomes and native UI rendering	dist/schema-tools/check.log; tests/schema_screens.rs	passed
+2026-11-11T16:09:26.870220+00:00	cleanup	Archived and removed 18 completed task worktrees and branches	Preserve recovery while removing temporary checkouts	/tmp/queri-schema-worker-recovery/manifest.json	complete

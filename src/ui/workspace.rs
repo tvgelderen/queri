@@ -1,3 +1,5 @@
+#[path = "workspace_schema.rs"]
+mod workspace_schema;
 use super::{
     ConnectionState, Services,
     admin::{AdminAction, AdminEvent, DatabaseAdmin},
@@ -81,7 +83,16 @@ enum ConnectionAttempt {
     PasswordRequired,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActiveContent {
+    Document,
+    Designer,
+    Comparison,
+    Diagram,
+}
+
 pub struct Workspace {
+    active_content: ActiveContent,
     services: Services,
     preferences: Preferences,
     profiles: Vec<ConnectionProfile>,
@@ -98,6 +109,13 @@ pub struct Workspace {
     expanded: BTreeSet<String>,
     nodes: HashMap<String, Node>,
     tree: Entity<TreeState>,
+    diagram: Option<Entity<super::er_diagram::ErDiagram>>,
+    diagram_request: Uuid,
+    schema_request: Uuid,
+    schema_comparison: Option<Entity<super::schema_compare_setup::SchemaCompareSetup>>,
+    schema_draft_key: Option<String>,
+    schema_designer: Option<Entity<super::schema_designer::SchemaDesigner>>,
+    schema_review: Option<Entity<super::schema_review::SchemaReview>>,
     documents: Vec<Entity<Document>>,
     active: usize,
     draft_search: Option<WeakEntity<DraftSearch>>,
@@ -247,6 +265,14 @@ impl Workspace {
             expanded: BTreeSet::new(),
             nodes: HashMap::new(),
             tree,
+            diagram: None,
+            schema_request: Uuid::new_v4(),
+            schema_comparison: None,
+            active_content: ActiveContent::Document,
+            schema_draft_key: None,
+            schema_designer: None,
+            schema_review: None,
+            diagram_request: Uuid::new_v4(),
             documents: vec![],
             active: 0,
             draft_search: None,
@@ -367,6 +393,7 @@ impl Workspace {
         self.selected = Some(id);
         self.connection_picker
             .update(cx, |picker, cx| picker.set_selected(Some(id), window, cx));
+        self.diagram = None;
         self.generation = Uuid::new_v4();
         let generation = self.generation;
         self.connection_state = ConnectionState::Connecting;
@@ -864,6 +891,7 @@ impl Workspace {
         self.documents.push(doc.clone());
         self.refresh_draft_search(window, cx);
         self.active = self.documents.len() - 1;
+        self.active_content = ActiveContent::Document;
         if !self.history_docked(window) {
             self.history = None;
         }
@@ -1011,6 +1039,7 @@ impl Workspace {
         let Some(doc) = self.documents.get(index).cloned() else {
             return;
         };
+        self.active_content = ActiveContent::Document;
         self.active = index;
         if !self.history_docked(window) {
             self.history = None;
@@ -1037,6 +1066,17 @@ impl Workspace {
         cx: &mut Context<Self>,
         complete: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) {
+        if self.schema_designer.is_some()
+            || self
+                .schema_comparison
+                .as_ref()
+                .is_some_and(|setup| !setup.read(cx).can_close(cx))
+        {
+            self.error =
+                "Close the schema workspace before continuing; pending work is retained.".into();
+            cx.notify();
+            return;
+        }
         // Completed operations include authoritative observation before becoming idle.
         // Preserve immediate tab and form interactions when no transaction can be lost.
         if documents.iter().all(|doc| {
@@ -1052,6 +1092,13 @@ impl Workspace {
     }
 
     pub fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.schema_designer.is_some() || self.schema_comparison.is_some() {
+            self.error =
+                "Close the schema workspace before quitting; pending work is retained.".into();
+            cx.notify();
+            return;
+        }
+
         self.guard_documents(self.documents.clone(), window, cx, |_, _, cx| cx.quit());
     }
 
@@ -1668,12 +1715,123 @@ impl Workspace {
         cx.notify();
     }
 
+    fn open_diagram(
+        &mut self,
+        database: &str,
+        schema: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(branch) = self.branches.get(database) else {
+            return;
+        };
+        let session = branch.session.clone();
+        let namespace = schema.to_owned();
+        let profile = self.selected_profile().map(|p| p.for_database(database));
+        self.diagram_request = Uuid::new_v4();
+        let refresh_database = database.to_owned();
+        let refresh_schema = schema.to_owned();
+        let layout_key = serde_json::to_string(&(self.selected, database, schema)).unwrap();
+        let request = self.diagram_request;
+        let generation = self.generation;
+        self.diagram = None;
+        task(
+            &self.services,
+            window,
+            cx,
+            async move {
+                session
+                    .schema_snapshot(crate::schema::Scope { namespace })
+                    .await
+            },
+            move |this, result, window, cx| {
+                if this.generation != generation || this.diagram_request != request {
+                    return;
+                }
+                match result {
+                    Ok(snapshot) => {
+                        let saved = this
+                            .services
+                            .store
+                            .diagram_layout(&layout_key)
+                            .ok()
+                            .flatten()
+                            .and_then(|value| serde_json::from_str(&value).ok());
+                        let diagram = cx.new(|_| {
+                            let mut diagram = super::er_diagram::ErDiagram::new(snapshot);
+                            if let Some(saved) = saved {
+                                diagram.restore_layout(saved);
+                            }
+                            diagram
+                        });
+                        this.subscriptions
+                            .push(cx.observe(&diagram, move |this, diagram, cx| {
+                                if let Ok(value) =
+                                    serde_json::to_string(&diagram.read(cx).saved_layout())
+                                    && let Err(error) =
+                                        this.services.store.save_diagram_layout(&layout_key, &value)
+                                {
+                                    this.error = error.to_string();
+                                }
+                            }));
+                        if let Some(profile) = profile {
+                            this.subscriptions.push(cx.subscribe_in(
+                                &diagram,
+                                window,
+                                move |this,
+                                      _,
+                                      event: &super::er_diagram::OpenDiagramTable,
+                                      window,
+                                      cx| {
+                                    this.diagram = None;
+                                    this.open_table(profile.clone(), event.0.clone(), window, cx);
+                                },
+                            ));
+                        }
+                        this.subscriptions.push(cx.subscribe_in(
+                            &diagram,
+                            window,
+                            move |this, _, _: &super::er_diagram::RefreshDiagram, window, cx| {
+                                this.open_diagram(&refresh_database, &refresh_schema, window, cx);
+                            },
+                        ));
+                        this.diagram = Some(diagram);
+                        this.active_content = ActiveContent::Diagram;
+                    }
+                    Err(error) => this.error = error.to_string(),
+                }
+                cx.notify();
+            },
+        );
+    }
+
     fn database_menu(
         &self,
         mut menu: PopupMenu,
         database: &str,
         cx: &mut Context<Self>,
     ) -> PopupMenu {
+        let compare_database = database.to_owned();
+        menu = menu.item(
+            menu_item("Compare schemas…", IconName::Layers).on_click(cx.listener(
+                move |this, _, window, cx| {
+                    this.open_schema_comparison(&compare_database, window, cx);
+                },
+            )),
+        );
+        if let Some(branch) = self.branches.get(database) {
+            for schema in branch.schemas.keys() {
+                let database = database.to_owned();
+                let schema = schema.clone();
+                menu = menu.item(
+                    menu_item(format!("Relationships: {schema}"), IconName::Layers).on_click(
+                        cx.listener(move |this, _, window, cx| {
+                            this.open_diagram(&database, &schema, window, cx);
+                        }),
+                    ),
+                );
+            }
+        }
         let database_query = database.to_owned();
         menu = menu.min_w(px(224.)).label(database.to_owned()).item(
             menu_item("New query", IconName::Code).on_click(cx.listener(
@@ -2158,6 +2316,7 @@ impl Render for Workspace {
             let menu_view = view.clone();
             let context_view = view.clone();
             let context_database = database.clone();
+            let context_node = view.read(cx).nodes.get(id.as_ref()).cloned();
             let tooltip = label.clone();
             ListItem::new(index)
                 .rounded(cx.theme().radius)
@@ -2220,6 +2379,58 @@ impl Render for Workspace {
                             if let Some(database) = &context_database {
                                 context_view
                                     .update(cx, |this, cx| this.database_menu(menu, database, cx))
+                            } else if let Some(node) = &context_node {
+                                let scope = match node {
+                                    Node::Schema { database, schema } => {
+                                        Some((database.clone(), schema.clone()))
+                                    }
+                                    Node::Table { database, table } => {
+                                        Some((database.clone(), table.schema.clone()))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some((database, schema)) = scope {
+                                    let edit_view = context_view.clone();
+                                    let edit_database = database.clone();
+                                    let edit_schema = schema.clone();
+                                    let table = match node {
+                                        Node::Table { table, .. } => Some(table.name.clone()),
+                                        _ => None,
+                                    };
+                                    let label = if table.is_some() {
+                                        "Edit structure"
+                                    } else {
+                                        "Create table"
+                                    };
+                                    let menu =
+                                        menu.item(menu_item(label, IconName::Layers).on_click(
+                                            move |_, window, cx| {
+                                                edit_view.update(cx, |this, cx| {
+                                                    this.open_schema_designer(
+                                                        &edit_database,
+                                                        &edit_schema,
+                                                        table.clone(),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                });
+                                            },
+                                        ));
+                                    let view = context_view.clone();
+                                    menu.item(
+                                        menu_item("Show relationships", IconName::Layers).on_click(
+                                            move |_, window, cx| {
+                                                view.update(cx, |this, cx| {
+                                                    this.open_diagram(
+                                                        &database, &schema, window, cx,
+                                                    )
+                                                });
+                                            },
+                                        ),
+                                    )
+                                } else {
+                                    menu
+                                }
                             } else {
                                 menu
                             }
@@ -2459,6 +2670,57 @@ impl Render for Workspace {
                 .flex_shrink_0()
                 .bg(cx.theme().tab_bar)
                 .child(tab_bar_baseline(cx))
+                .when(self.schema_designer.is_some(), |bar| {
+                    bar.child(
+                        document_tab(
+                            usize::MAX - 2,
+                            "Schema draft",
+                            "Schema draft",
+                            IconName::Table2,
+                            self.active_content == ActiveContent::Designer,
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.active_content = ActiveContent::Designer;
+                            this.history = None;
+                            cx.notify();
+                        })),
+                    )
+                })
+                .when(self.schema_comparison.is_some(), |bar| {
+                    bar.child(
+                        document_tab(
+                            usize::MAX - 1,
+                            "Compare schemas",
+                            "Compare schemas",
+                            IconName::Table2,
+                            self.active_content == ActiveContent::Comparison,
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.active_content = ActiveContent::Comparison;
+                            this.history = None;
+                            cx.notify();
+                        })),
+                    )
+                })
+                .when(self.diagram.is_some(), |bar| {
+                    bar.child(
+                        document_tab(
+                            usize::MAX,
+                            "Relationships",
+                            "Relationships",
+                            IconName::Table2,
+                            self.active_content == ActiveContent::Diagram,
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.active_content = ActiveContent::Diagram;
+                            this.history = None;
+                            cx.notify();
+                        })),
+                    )
+                })
                 .when(!self.documents.is_empty(), |bar| {
                     bar.child(
                         div().flex_1().min_w_0().child(
@@ -2481,7 +2743,8 @@ impl Render for Workspace {
                                         } else {
                                             IconName::Code
                                         },
-                                        index == self.active,
+                                        index == self.active
+                                            && self.active_content == ActiveContent::Document,
                                         cx,
                                     )
                                     .set_position(index + 1, self.documents.len())
@@ -2600,6 +2863,71 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .child(self.history_panel(history, cx)),
+            )
+        } else if let Some(comparison) = self
+            .schema_comparison
+            .as_ref()
+            .filter(|_| self.active_content == ActiveContent::Comparison)
+        {
+            body.child(div().flex_1().min_h_0().child(comparison.clone()))
+        } else if let Some(review) = self
+            .schema_review
+            .as_ref()
+            .filter(|_| self.active_content == ActiveContent::Designer)
+        {
+            body.child(
+                v_flex().flex_1().min_h_0().child(review.clone()).child(
+                    Button::new("close-schema")
+                        .label("Close schema draft")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.close_schema_draft(window, cx)),
+                        ),
+                ),
+            )
+        } else if let Some(designer) = self
+            .schema_designer
+            .as_ref()
+            .filter(|_| self.active_content == ActiveContent::Designer)
+        {
+            body.child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(designer.clone())
+                    .child(
+                        Button::new("save-close-schema")
+                            .label("Save draft and close")
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.save_close_schema_draft(cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("close-schema")
+                            .label("Close schema draft")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_schema_draft(window, cx)
+                            })),
+                    ),
+            )
+        } else if let Some(diagram) = self
+            .diagram
+            .as_ref()
+            .filter(|_| self.active_content == ActiveContent::Diagram)
+        {
+            body.child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        Button::new("close-diagram")
+                            .label("Close schema relationships")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.diagram_request = Uuid::new_v4();
+                                this.diagram = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(diagram.clone()),
             )
         } else if let Some(doc) = self.documents.get(self.active) {
             body.child(div().flex_1().min_h_0().child(doc.clone()))

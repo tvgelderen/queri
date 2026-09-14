@@ -1,5 +1,6 @@
 mod completion;
 mod postgres;
+mod schema;
 mod sqlite;
 
 use crate::model::*;
