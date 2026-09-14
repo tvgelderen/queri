@@ -12,6 +12,7 @@ use gpui_kit::component::{
     form::Field,
     h_flex,
     input::{Input, InputEvent, InputState},
+    switch::Switch,
     tab::{Tab, TabBar},
     v_flex,
 };
@@ -69,6 +70,19 @@ pub struct ConnectionForm {
 }
 impl EventEmitter<SavedConnection> for ConnectionForm {}
 
+fn hinted(
+    value: String,
+    placeholder: &'static str,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<InputState> {
+    cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(placeholder)
+            .default_value(value)
+    })
+}
+
 impl ConnectionForm {
     pub fn new(
         services: Services,
@@ -79,12 +93,13 @@ impl ConnectionForm {
     ) -> Self {
         let mut form = Self {
             ssh_enabled: existing.as_ref().is_some_and(|p| p.ssh.is_some()),
-            ssh_host: input(
+            ssh_host: hinted(
                 existing
                     .as_ref()
                     .and_then(|p| p.ssh.as_ref())
                     .map(|s| s.host.clone())
                     .unwrap_or_default(),
+                "bastion.example.com",
                 window,
                 cx,
             ),
@@ -98,16 +113,17 @@ impl ConnectionForm {
                 window,
                 cx,
             ),
-            ssh_user: input(
+            ssh_user: hinted(
                 existing
                     .as_ref()
                     .and_then(|p| p.ssh.as_ref())
                     .map(|s| s.user.clone())
                     .unwrap_or_default(),
+                "user",
                 window,
                 cx,
             ),
-            ssh_key: input(
+            ssh_key: hinted(
                 existing
                     .as_ref()
                     .and_then(|p| p.ssh.as_ref())
@@ -119,10 +135,15 @@ impl ConnectionForm {
                         }
                     })
                     .unwrap_or_default(),
+                "/home/you/.ssh/id_ed25519",
                 window,
                 cx,
             ),
-            ssh_passphrase: cx.new(|cx| InputState::new(window, cx).masked(true)),
+            ssh_passphrase: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .masked(true)
+                    .placeholder("Optional")
+            }),
             ssh_remember: existing
                 .as_ref()
                 .and_then(|p| p.ssh.as_ref())
@@ -792,6 +813,369 @@ impl ConnectionForm {
         .detach();
     }
 
+    fn forget_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let endpoint = SshConfig {
+            host: self.ssh_host.read(cx).value().to_string(),
+            port: self.ssh_port.read(cx).value().parse().unwrap_or(22),
+            user: String::new(),
+            auth: SshAuth::Agent {
+                fingerprint: String::new(),
+            },
+            remember_passphrase: false,
+        }
+        .endpoint();
+        let connector = self.services.connector.clone();
+        task(
+            &self.services,
+            window,
+            cx,
+            async move { tokio::task::spawn_blocking(move || connector.forget_host(&endpoint)).await? },
+            |this, result, _, cx| {
+                this.error = result.is_err();
+                this.message = result
+                    .map(|_| {
+                        "SSH host trust removed. The next handshake requires verification.".into()
+                    })
+                    .unwrap_or_else(|e| format!("{e:#}"));
+                cx.notify();
+            },
+        );
+    }
+
+    fn set_ssh_enabled(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.ssh_enabled = on;
+        if !on {
+            self.ssh_remember = false;
+            self.clear_passphrase(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// The tunnel lives in one card so its settings read as a single, optional route.
+    fn ssh_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let header = h_flex()
+            .id("ssh-section-header")
+            .test_support()
+            .w_full()
+            .gap_3()
+            .px_4()
+            .py_3()
+            .on_click(cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                this.set_ssh_enabled(!this.ssh_enabled, window, cx);
+            }))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .size_8()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(theme.radius)
+                    .bg(if self.ssh_enabled {
+                        super::theme::accent_soft(cx)
+                    } else {
+                        theme.muted
+                    })
+                    .child(Icon::new(IconName::Waypoints).small().text_color(
+                        if self.ssh_enabled {
+                            super::theme::accent_text(cx)
+                        } else {
+                            theme.muted_foreground
+                        },
+                    )),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Connect through SSH"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(relative(1.4))
+                            .text_color(theme.muted_foreground)
+                            .child(
+                                "Tunnel through a bastion. The database host above is resolved from the bastion.",
+                            ),
+                    ),
+            )
+            .child(
+                div().flex_shrink_0().child(
+                    Switch::new("ssh-enabled")
+                        .accessibility_label("Connect through SSH")
+                        .checked(self.ssh_enabled)
+                        .disabled(self.busy)
+                        .on_change(cx.listener(|this, on: &bool, window, cx| {
+                            cx.stop_propagation();
+                            this.set_ssh_enabled(*on, window, cx);
+                        })),
+                ),
+            );
+        let body = self.ssh_enabled.then(|| {
+            let auth = TabBar::new("ssh-auth")
+                .segmented()
+                .selected_index(usize::from(self.ssh_agent))
+                .child(
+                    Tab::new().flex_1().aria_label("Private key").child(
+                        h_flex()
+                            .gap_2()
+                            .child(Icon::new(IconName::FileKey).small())
+                            .child("Private key"),
+                    ),
+                )
+                .child(
+                    Tab::new().flex_1().aria_label("SSH agent").child(
+                        h_flex()
+                            .gap_2()
+                            .child(Icon::new(IconName::KeyRound).small())
+                            .child("SSH agent"),
+                    ),
+                )
+                .on_click(cx.listener(|this, index, window, cx| {
+                    if this.busy {
+                        return;
+                    }
+                    this.ssh_agent = *index == 1;
+                    this.ssh_remember = false;
+                    this.clear_passphrase(window, cx);
+                    if this.ssh_agent {
+                        this.load_agent(window, cx);
+                    }
+                    cx.notify();
+                }));
+            let credentials = if self.ssh_agent {
+                let identity = Field::new()
+                    .label("Agent identity")
+                    .description(
+                        "Queri signs with this identity only and never forwards the agent.",
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                div().flex_1().min_w_0().child(choice(
+                                    Button::new("ssh-agent-identity")
+                                        .outline()
+                                        .w_full()
+                                        .disabled(self.busy)
+                                        .child(
+                                            h_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .gap_2()
+                                                .child(
+                                                    Icon::new(IconName::FingerprintPattern)
+                                                        .small()
+                                                        .text_color(theme.muted_foreground),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .text_ellipsis()
+                                                        .when(
+                                                            self.ssh_identity.is_empty(),
+                                                            |label| {
+                                                                label
+                                                                    .text_color(
+                                                                        theme.muted_foreground,
+                                                                    )
+                                                                    .child("Choose an identity")
+                                                            },
+                                                        )
+                                                        .when(
+                                                            !self.ssh_identity.is_empty(),
+                                                            |label| {
+                                                                label
+                                                                    .font_family(
+                                                                        theme
+                                                                            .mono_font_family
+                                                                            .clone(),
+                                                                    )
+                                                                    .text_xs()
+                                                                    .child(
+                                                                        self.ssh_identity.clone(),
+                                                                    )
+                                                            },
+                                                        ),
+                                                ),
+                                        ),
+                                    self.ssh_identity.clone(),
+                                    self.ssh_identities
+                                        .iter()
+                                        .map(|fp| (fp.clone(), fp.clone().into())),
+                                    cx.listener(|this, fp: &String, _, cx| {
+                                        if this.busy {
+                                            return;
+                                        }
+                                        this.ssh_identity = fp.clone();
+                                        cx.notify();
+                                    }),
+                                )),
+                            )
+                            .child(
+                                Button::new("ssh-agent-refresh")
+                                    .outline()
+                                    .icon(IconName::RefreshCw)
+                                    .accessibility_label("Refresh agent identities")
+                                    .tooltip("Refresh agent identities")
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.load_agent(window, cx)
+                                    })),
+                            ),
+                    );
+                v_flex().gap_4().child(identity)
+            } else {
+                v_flex()
+                    .gap_4()
+                    .child(self.field_with_content(
+                        "SSH private key path",
+                        &self.ssh_key,
+                        |input| {
+                            h_flex()
+                                .gap_2()
+                                .child(div().flex_1().min_w_0().child(input))
+                                .child(
+                                    Button::new("ssh-key-picker")
+                                        .icon(IconName::FolderOpen)
+                                        .label("Browse…")
+                                        .disabled(self.busy)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.browse_ssh_key(window, cx)
+                                        })),
+                                )
+                        },
+                    ))
+                    .child(
+                        self.field_with_content(
+                            "SSH key passphrase",
+                            &self.ssh_passphrase,
+                            |input| input.mask_toggle(),
+                        )
+                        .when(self.field_error.is_none(), |field| {
+                            field.description(
+                                "Leave empty for unencrypted keys. Queri asks when one is needed.",
+                            )
+                        }),
+                    )
+                    .child(setting_switch(
+                        "ssh-remember-passphrase",
+                        "Remember SSH passphrase",
+                        self.ssh_remember,
+                        cx.listener(|this, on, window, cx| {
+                            if this.busy {
+                                return;
+                            }
+                            this.ssh_remember = *on;
+                            if !on {
+                                this.clear_passphrase(window, cx);
+                            }
+                            cx.notify();
+                        }),
+                    ))
+            };
+            v_flex()
+                .child(
+                    v_flex()
+                        .gap_4()
+                        .p_4()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .w(px(148.))
+                                        .child(self.field("SSH user", &self.ssh_user)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(self.field("SSH host", &self.ssh_host)),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(88.))
+                                        .child(self.field("SSH port", &self.ssh_port)),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child("Authentication"),
+                                )
+                                .child(auth),
+                        )
+                        .child(credentials),
+                )
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .justify_between()
+                        .pl_4()
+                        .pr_2()
+                        .py_1p5()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .bg(theme.muted)
+                        .rounded_b(theme.radius_lg)
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .gap_2()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(Icon::new(IconName::ShieldCheck).xsmall())
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .text_ellipsis()
+                                        .child("Host keys are verified before authentication."),
+                                ),
+                        )
+                        .child(
+                            Button::new("ssh-forget-host")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::ShieldOff)
+                                .label("Forget trust for this SSH host")
+                                .disabled(self.busy)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.forget_host(window, cx)),
+                                ),
+                        ),
+                )
+        });
+        v_flex()
+            .id("ssh-section")
+            .rounded(theme.radius_lg)
+            .border_1()
+            .border_color(if self.ssh_enabled {
+                theme.input
+            } else {
+                theme.border
+            })
+            .child(header)
+            .children(body)
+    }
+
     pub fn render_footer(&self, cx: &mut Context<Self>) -> AnyElement {
         h_flex()
             .gap_2()
@@ -950,102 +1334,7 @@ impl Render for ConnectionForm {
                 ));
         }
         if !self.sqlite {
-            form = form.child(setting_switch(
-                "ssh-enabled",
-                "Connect through SSH",
-                self.ssh_enabled,
-                cx.listener(|this, on, window, cx| {
-                    if this.busy {
-                        return;
-                    }
-                    this.ssh_enabled = *on;
-                    if !on {
-                        this.ssh_remember = false;
-                        this.clear_passphrase(window, cx);
-                    }
-                    cx.notify();
-                }),
-            ));
-            if self.ssh_enabled {
-                form = form.child(div().text_sm().child("The database host is resolved on the bastion. Database and SSH credentials are separate."))
-                    .child(h_flex().gap_3().child(div().flex_1().child(self.field("SSH host", &self.ssh_host))).child(div().w(px(110.)).child(self.field("SSH port", &self.ssh_port))))
-                    .child(self.field("SSH user", &self.ssh_user))
-                    .child(TabBar::new("ssh-auth").segmented().selected_index(usize::from(self.ssh_agent))
-                        .child(Tab::new().label("Private key")).child(Tab::new().label("SSH agent"))
-                        .on_click(cx.listener(|this, index, window, cx| { if this.busy { return; } this.ssh_agent = *index == 1; this.ssh_remember = false; this.clear_passphrase(window, cx); if this.ssh_agent { this.load_agent(window, cx); } cx.notify(); })));
-                if self.ssh_agent {
-                    form = form
-                        .child(choice(
-                            Button::new("ssh-agent-identity").disabled(self.busy).label(
-                                if self.ssh_identity.is_empty() {
-                                    "Choose identity".to_owned()
-                                } else {
-                                    self.ssh_identity.clone()
-                                },
-                            ),
-                            self.ssh_identity.clone(),
-                            self.ssh_identities
-                                .iter()
-                                .map(|fp| (fp.clone(), fp.clone().into())),
-                            cx.listener(|this, fp: &String, _, cx| {
-                                if this.busy {
-                                    return;
-                                }
-                                this.ssh_identity = fp.clone();
-                                cx.notify();
-                            }),
-                        ))
-                        .child(
-                            Button::new("ssh-agent-refresh")
-                                .disabled(self.busy)
-                                .label("Refresh agent identities")
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.load_agent(window, cx)),
-                                ),
-                        );
-                } else {
-                    form = form
-                        .child(self.field_with_content(
-                            "SSH private key path",
-                            &self.ssh_key,
-                            |input| {
-                                h_flex().gap_2().child(div().flex_1().child(input)).child(
-                                    Button::new("ssh-key-picker")
-                                        .disabled(self.busy)
-                                        .label("Choose key…")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.browse_ssh_key(window, cx)
-                                        })),
-                                )
-                            },
-                        ))
-                        .child(self.field_with_content(
-                            "SSH key passphrase",
-                            &self.ssh_passphrase,
-                            |input| input.mask_toggle(),
-                        ))
-                        .child(setting_switch(
-                            "ssh-remember-passphrase",
-                            "Remember SSH passphrase",
-                            self.ssh_remember,
-                            cx.listener(|this, on, window, cx| {
-                                if this.busy {
-                                    return;
-                                }
-                                this.ssh_remember = *on;
-                                if !on {
-                                    this.clear_passphrase(window, cx);
-                                }
-                                cx.notify();
-                            }),
-                        ));
-                }
-                form = form.child(Button::new("ssh-forget-host").disabled(self.busy).label("Forget trust for this SSH host").on_click(cx.listener(|this, _, window, cx| {
-                    let endpoint = SshConfig { host: this.ssh_host.read(cx).value().to_string(), port: this.ssh_port.read(cx).value().parse().unwrap_or(22), user: String::new(), auth: SshAuth::Agent { fingerprint: String::new() }, remember_passphrase: false }.endpoint();
-                    let connector = this.services.connector.clone();
-                    task(&this.services, window, cx, async move { tokio::task::spawn_blocking(move || connector.forget_host(&endpoint)).await? }, |this, result, _, cx| { this.error = result.is_err(); this.message = result.map(|_| "SSH host trust removed. The next handshake requires verification.".into()).unwrap_or_else(|e| format!("{e:#}")); cx.notify(); });
-                })));
-            }
+            form = form.child(self.ssh_section(cx));
         }
         form = form
             .child(h_flex().gap_2().flex_wrap()
@@ -1331,6 +1620,18 @@ mod tests {
         cx.update_window(window, |_, window, cx| {
             window.click("ssh-enabled", cx);
             assert!(form.read(cx).config(cx).unwrap().ssh.is_none());
+        })
+        .unwrap();
+        cx.wait_for(window, std::time::Duration::from_secs(5), |_, cx| {
+            !form.read(cx).busy()
+        })
+        .await;
+        cx.update_window(window, |_, window, cx| {
+            window.click("ssh-section-header", cx);
+            assert!(
+                form.read(cx).ssh_enabled,
+                "the whole card header toggles SSH once"
+            );
         })
         .unwrap();
     }

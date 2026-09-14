@@ -2673,6 +2673,12 @@ impl Render for Workspace {
                         .border_t_1()
                         .border_color(cx.theme().border)
                         .child(
+                            Icon::new(IconName::CircleAlert)
+                                .small()
+                                .flex_shrink_0()
+                                .text_color(cx.theme().danger),
+                        )
+                        .child(
                             div()
                                 .id("workspace-error")
                                 .flex_1()
@@ -2684,7 +2690,9 @@ impl Render for Workspace {
                                 .child(self.error.clone()),
                         )
                         .when(
-                            self.selected.is_some() && self.databases.is_empty(),
+                            self.selected.is_some()
+                                && (self.databases.is_empty()
+                                    || self.connection_state == ConnectionState::Failed),
                             |row| {
                                 row.child(
                                     Button::new("edit-failed-connection")
@@ -2701,7 +2709,12 @@ impl Render for Workspace {
                                 .child(
                                     Button::new("retry-connection")
                                         .small()
-                                        .label("Retry")
+                                        .icon(IconName::RefreshCw)
+                                        .label(if self.databases.is_empty() {
+                                            "Retry"
+                                        } else {
+                                            "Reconnect"
+                                        })
                                         .disabled(
                                             self.connection_state == ConnectionState::Connecting,
                                         )

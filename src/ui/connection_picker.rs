@@ -53,7 +53,10 @@ impl From<&ConnectionProfile> for ConnectionItem {
             }
         };
         let subtitle = match &profile.config {
-            ConnectionConfig::Postgres { .. } => format!("{} · {endpoint}", profile.provider()),
+            ConnectionConfig::Postgres { .. } => match &profile.ssh {
+                Some(ssh) => format!("{} · {endpoint} via {}", profile.provider(), ssh.host),
+                None => format!("{} · {endpoint}", profile.provider()),
+            },
             ConnectionConfig::Sqlite { .. } => format!("SQLite · {}", profile.database()),
         };
         Self {

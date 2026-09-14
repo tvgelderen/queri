@@ -1,11 +1,14 @@
-use super::{Services, input};
+use super::Services;
 use crate::ssh::{HostDecision, Prompt};
+use gpui_kit::assets::IconName;
 use gpui_kit::{
     component::{
-        WindowExt,
-        button::{Button, ButtonVariants},
+        ActiveTheme, Icon, WindowExt,
+        button::{Button, ButtonVariant, ButtonVariants},
+        dialog::DialogButtonProps,
         h_flex,
-        input::Input,
+        input::{Input, InputState},
+        v_flex,
     },
     *,
 };
@@ -41,6 +44,73 @@ fn answer<T>(
     done.cancel();
 }
 
+/// A tinted square that carries the dialog's tone before any text is read.
+fn badge(icon: IconName, danger: bool, cx: &App) -> Div {
+    let theme = cx.theme();
+    div()
+        .flex_shrink_0()
+        .size_9()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(theme.radius)
+        .bg(if danger {
+            theme.danger.opacity(0.12)
+        } else {
+            super::theme::accent_soft(cx)
+        })
+        .child(Icon::new(icon).text_color(if danger {
+            theme.danger
+        } else {
+            super::theme::accent_text(cx)
+        }))
+}
+
+/// Labelled, monospaced key facts so fingerprints can be compared character by character.
+fn facts(rows: Vec<(&'static str, String, Option<Hsla>)>, cx: &App) -> Div {
+    let theme = cx.theme();
+    v_flex()
+        .gap_2p5()
+        .p_3()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.muted)
+        .children(rows.into_iter().map(|(label, value, color)| {
+            h_flex()
+                .items_start()
+                .gap_3()
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(84.))
+                        .text_xs()
+                        .line_height(relative(1.6))
+                        .text_color(theme.muted_foreground)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .whitespace_normal()
+                        .text_xs()
+                        .line_height(relative(1.6))
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(color.unwrap_or(theme.foreground))
+                        .child(value),
+                )
+        }))
+}
+
+fn note(text: &'static str, cx: &App) -> Div {
+    div()
+        .text_sm()
+        .line_height(relative(1.5))
+        .text_color(cx.theme().muted_foreground)
+        .child(text)
+}
+
 pub(super) fn show(
     prompt: Prompt,
     window: &mut Window,
@@ -62,38 +132,163 @@ pub(super) fn show(
                 return (done, cancelled);
             }
             let reply = Arc::new(Mutex::new(Some(reply)));
-            window.open_alert_dialog(cx, move |dialog, _, _| {
-                let cancel_done = done.clone(); let close_done = done.clone();
+            window.open_alert_dialog(cx, move |dialog, _, cx| {
+                let cancel_done = done.clone();
+                let close_done = done.clone();
                 let cancel = reply.clone();
                 let close = reply.clone();
-                let mut footer = h_flex().gap_2().child(Button::new("ssh-reject").label("Cancel").on_click(move |_, window, cx| { answer(&cancel, &cancel_done, HostDecision::Reject); window.close_dialog(cx); }));
-                if previous.is_some() {
-                    let reply = reply.clone(); let done = done.clone();
-                    let details = format!("{endpoint}\n{algorithm}\nPrevious: {}\nNew: {fingerprint}", previous.as_deref().unwrap_or_default());
-                    footer = footer.child(Button::new("ssh-replace").label("Replace trusted key…").on_click(move |_, window, cx| {
-                        let reply = reply.clone();
-                        let details = details.clone();
-                        window.close_dialog(cx);
-                        let cancelled = reply.clone(); let done = done.clone();
-                        window.open_alert_dialog(cx, move |dialog, _, _| {
-                            let reply = reply.clone(); let cancelled = cancelled.clone(); let accept_done = done.clone(); let cancel_done = done.clone();
-                            dialog.title("Replace SSH host key?").child(details.clone()).child("Verify the new fingerprint with your server administrator before replacing it.")
-                                .button_props(gpui_kit::component::dialog::DialogButtonProps::default().show_cancel(true).ok_text("Replace key"))
-                                .on_ok(move |_, _, _| { answer(&reply, &accept_done, HostDecision::Replace); true })
-                                .on_cancel(move |_, _, _| { answer(&cancelled, &cancel_done, HostDecision::Reject); true })
-                        });
-                    }));
+                let mut footer = h_flex().w_full().justify_end().gap_2().child(
+                    Button::new("ssh-reject")
+                        .label("Cancel")
+                        .on_click(move |_, window, cx| {
+                            answer(&cancel, &cancel_done, HostDecision::Reject);
+                            window.close_dialog(cx);
+                        }),
+                );
+                let danger = cx.theme().danger;
+                let details = if let Some(old) = &previous {
+                    let reply = reply.clone();
+                    let done = done.clone();
+                    let replacement = (
+                        endpoint.clone(),
+                        algorithm.clone(),
+                        old.clone(),
+                        fingerprint.clone(),
+                    );
+                    footer = footer.child(
+                        Button::new("ssh-replace")
+                            .danger()
+                            .label("Replace trusted key…")
+                            .on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                let reply = reply.clone();
+                                let done = done.clone();
+                                let (endpoint, algorithm, old, new) = replacement.clone();
+                                window.open_alert_dialog(cx, move |dialog, _, cx| {
+                                    let accepted = reply.clone();
+                                    let rejected = reply.clone();
+                                    let accept_done = done.clone();
+                                    let cancel_done = done.clone();
+                                    let danger = cx.theme().danger;
+                                    dialog
+                                        .width(px(540.))
+                                        .icon(badge(IconName::ShieldAlert, true, cx))
+                                        .title("Replace the trusted host key?")
+                                        .description(format!(
+                                            "Queri will trust the new key for {endpoint} from now on."
+                                        ))
+                                        .child(
+                                            v_flex()
+                                                .gap_3()
+                                                .child(facts(
+                                                    vec![
+                                                        ("Key type", algorithm.clone(), None),
+                                                        ("Trusted", old.clone(), None),
+                                                        ("New", new.clone(), Some(danger)),
+                                                    ],
+                                                    cx,
+                                                ))
+                                                .child(note(
+                                                    "Only continue if your server administrator confirmed the new fingerprint.",
+                                                    cx,
+                                                )),
+                                        )
+                                        .button_props(
+                                            DialogButtonProps::default()
+                                                .show_cancel(true)
+                                                .ok_text("Replace key")
+                                                .ok_variant(ButtonVariant::Danger),
+                                        )
+                                        .on_ok(move |_, _, _| {
+                                            answer(&accepted, &accept_done, HostDecision::Replace);
+                                            true
+                                        })
+                                        .on_cancel(move |_, _, _| {
+                                            answer(&rejected, &cancel_done, HostDecision::Reject);
+                                            true
+                                        })
+                                });
+                            }),
+                    );
+                    v_flex()
+                        .gap_3()
+                        .child(facts(
+                            vec![
+                                ("Host", endpoint.clone(), None),
+                                ("Key type", algorithm.clone(), None),
+                                ("Trusted", old.clone(), None),
+                                ("Presented", fingerprint.clone(), Some(danger)),
+                            ],
+                            cx,
+                        ))
+                        .child(note(
+                            "Authentication is blocked. A changed key can mean the server was reinstalled, or that someone is impersonating it.",
+                            cx,
+                        ))
                 } else {
-                    let session = reply.clone(); let persist = reply.clone(); let session_done = done.clone(); let persist_done = done.clone();
-                    footer = footer.child(Button::new("ssh-trust-session").label("Trust for this session").on_click(move |_, window, cx| { answer(&session, &session_done, HostDecision::Session); window.close_dialog(cx); }))
-                        .child(Button::new("ssh-trust-persist").primary().label("Trust and remember").on_click(move |_, window, cx| { answer(&persist, &persist_done, HostDecision::Persist); window.close_dialog(cx); }));
-                }
+                    let session = reply.clone();
+                    let persist = reply.clone();
+                    let session_done = done.clone();
+                    let persist_done = done.clone();
+                    footer = footer
+                        .child(
+                            Button::new("ssh-trust-session")
+                                .label("Trust for this session")
+                                .on_click(move |_, window, cx| {
+                                    answer(&session, &session_done, HostDecision::Session);
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("ssh-trust-persist")
+                                .primary()
+                                .label("Trust and remember")
+                                .on_click(move |_, window, cx| {
+                                    answer(&persist, &persist_done, HostDecision::Persist);
+                                    window.close_dialog(cx);
+                                }),
+                        );
+                    v_flex()
+                        .gap_3()
+                        .child(facts(
+                            vec![
+                                ("Host", endpoint.clone(), None),
+                                ("Key type", algorithm.clone(), None),
+                                ("Fingerprint", fingerprint.clone(), None),
+                            ],
+                            cx,
+                        ))
+                        .child(note(
+                            "Compare the fingerprint with one from your server administrator before allowing authentication.",
+                            cx,
+                        ))
+                };
                 // Explicit buttons own dismissal so a replacement confirmation can retain its reply.
-                dialog.title(if previous.is_some() { "SSH host key changed — connection blocked" } else { "Verify SSH host key" })
-                    .child(format!("Host: {endpoint}\nAlgorithm: {algorithm}\nSHA256 fingerprint: {fingerprint}"))
-                    .child(previous.as_ref().map(|old| format!("Previously trusted: {old}\nA changed key can indicate impersonation. Authentication is blocked until you explicitly replace it.")).unwrap_or_else(|| "Verify this fingerprint through a trusted channel before allowing authentication.".into()))
-                    .keyboard(false).close_button(false).footer(footer)
-                    .on_cancel(move |_, _, _| { answer(&close, &close_done, HostDecision::Reject); true })
+                dialog
+                    .width(px(540.))
+                    .icon(if previous.is_some() {
+                        badge(IconName::ShieldAlert, true, cx)
+                    } else {
+                        badge(IconName::ShieldCheck, false, cx)
+                    })
+                    .title(if previous.is_some() {
+                        "SSH host key changed"
+                    } else {
+                        "Verify SSH host key"
+                    })
+                    .description(if previous.is_some() {
+                        "The bastion presented a different key than the one you trusted."
+                    } else {
+                        "Queri has not connected to this bastion before."
+                    })
+                    .child(details)
+                    .keyboard(false)
+                    .close_button(false)
+                    .footer(footer)
+                    .on_cancel(move |_, _, _| {
+                        answer(&close, &close_done, HostDecision::Reject);
+                        true
+                    })
             });
             (finished, cancelled)
         }
@@ -107,23 +302,32 @@ pub(super) fn show(
                 return (done, cancelled);
             }
             let reply = Arc::new(Mutex::new(Some(reply)));
-            let value = input("", window, cx);
-            value.update(cx, |state, cx| state.set_masked(true, window, cx));
-            window.open_alert_dialog(cx, move |dialog, _, _| {
+            let value = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .masked(true)
+                    .placeholder("Passphrase")
+            });
+            value.read(cx).focus_handle(cx).focus(window, cx);
+            window.open_alert_dialog(cx, move |dialog, _, cx| {
                 let accept_done = done.clone();
                 let cancel_done = done.clone();
                 let value = value.clone();
                 let accepted = reply.clone();
                 let cancelled = reply.clone();
                 dialog
-                    .title(format!("SSH private key passphrase · {name}"))
+                    .width(px(460.))
+                    .icon(badge(IconName::LockKeyhole, false, cx))
+                    .title("Unlock SSH key")
+                    .description(format!(
+                        "{name} uses an encrypted private key. Enter its passphrase to continue."
+                    ))
                     .child(
                         Input::new(&value)
                             .aria_label("SSH key passphrase")
                             .mask_toggle(),
                     )
                     .button_props(
-                        gpui_kit::component::dialog::DialogButtonProps::default()
+                        DialogButtonProps::default()
                             .show_cancel(true)
                             .ok_text("Unlock key"),
                     )

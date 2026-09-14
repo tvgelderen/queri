@@ -3585,7 +3585,32 @@ impl Render for Document {
                             }),
                     ),
             )
-            .when(self.stale, |view| view.child(div().id("stale-session-results").role(Role::Status).px_4().py_2().text_sm().bg(cx.theme().muted).child("Results and local edits are stale after a session change. Refresh the table or run SQL explicitly to load current data.")))
+            .when(self.stale, |view| {
+                view.child(
+                    h_flex()
+                        .id("stale-session-results")
+                        .role(Role::Status)
+                        .gap_2()
+                        .px_4()
+                        .py_2()
+                        .border_y_1()
+                        .border_color(cx.theme().warning.opacity(0.25))
+                        .bg(cx.theme().warning.opacity(0.08))
+                        .text_sm()
+                        .child(
+                            Icon::new(IconName::TriangleAlert)
+                                .small()
+                                .flex_shrink_0()
+                                .text_color(cx.theme().warning),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child("Results and local edits are stale after a session change. Refresh the table or run SQL explicitly to load current data."),
+                        ),
+                )
+            })
             .child(self.grid_search.clone())
             .child(div().flex_1().min_h_0().overflow_hidden().child(content))
             .when(!self.error.is_empty(), |view| {
