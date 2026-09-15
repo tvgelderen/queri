@@ -7,6 +7,21 @@ versions. Original licenses and notices are preserved.
 
 Local changes:
 
+- `gpui-pre/src/window/content_zoom.rs`, `src/window.rs`, and `src/platform.rs`:
+  application content zoom independent of display density. Layout uses a smaller
+  logical viewport while painting uses display density multiplied by zoom, so
+  fixed pixel dimensions and text scale together. Platform pointer, scroll,
+  touch, and native text-input geometry are converted at the window boundary;
+  synthetic GPUI events remain in content coordinates. Resizing retains zoom
+  without changing the native window dimensions.
+- `gpui-component/src/window_border.rs`, `src/menu/`, and `src/input/popovers/`:
+  decorations retain their native shadow inset and resize areas, while menus
+  and editor popovers use the content viewport for placement and clipping.
+  Run `cargo test --locked --features test-support --test ui_zoom` for native
+  geometry and input checks, and `cargo test --locked --features test-support
+  --test ui_zoom_render` for real GPU scaling and small-window dialog checks.
+  Remove these patches together when upstream provides uniform content zoom.
+
 - `gpui-pre/src/scene.rs` and `src/window.rs`: a clipped, opacity-aware backdrop
   paint operation with scene replay and sampling boundaries. The batching approach
   is adapted from the Apache-2.0 [Sailry material port, revision
@@ -44,8 +59,8 @@ Mesa lavapipe works for headless testing. `bash scripts/check.sh` includes it.
 Upstream tracking: [GPUI Kit #3598](https://github.com/longbridge/gpui-kit/issues/3598).
 When upstream provides equivalent backdrop support, remove the three backdrop
 patches together after verifying the rendering tests. Remove the vendored sources
-once upstream also provides destructive menu styling and rectangular table
-selection, and the menu and table interaction tests pass.
+once upstream also provides destructive menu styling, rectangular table
+selection, and uniform content zoom, and their interaction tests pass.
 
 ## PostgreSQL execution foundations
 

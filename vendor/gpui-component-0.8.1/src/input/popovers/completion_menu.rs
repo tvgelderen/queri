@@ -434,10 +434,10 @@ impl Render for CompletionMenu {
             self.editor.clone(),
             move |anchor, window, cx| {
                 // `anchor` is in window coordinates, from the current frame.
-                let max_width = configured_max.min(window.bounds().size.width - anchor.x);
+                let max_width = configured_max.min(window.viewport_size().width - anchor.x);
                 let vertical_layout =
                     anchor.x + configured_max + POPOVER_GAP + configured_max + POPOVER_GAP
-                        > window.bounds().size.width;
+                        > window.viewport_size().width;
 
                 let selected_documentation = list
                     .read(cx)

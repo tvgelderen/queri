@@ -303,7 +303,7 @@ impl Render for CodeActionMenu {
         deferred(CaretAnchoredPopup::new(
             self.state.clone(),
             move |anchor, window, cx| {
-                let max_width = MAX_MENU_WIDTH.min(window.bounds().size.width - anchor.x);
+                let max_width = MAX_MENU_WIDTH.min(window.viewport_size().width - anchor.x);
 
                 // A flex root measures to its contents; a block root would
                 // stretch its outside-click hitbox across the viewport.

@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 mod filter;
+mod ui_zoom;
 pub use filter::{FilterExpression, FilterKind, FilterOperator, FilterPredicate, TableFilter};
+pub use ui_zoom::UiZoom;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TlsMode {
@@ -565,6 +567,7 @@ pub enum Appearance {
 pub struct Preferences {
     pub warn_destructive: bool,
     pub appearance: Appearance,
+    pub ui_zoom_percent: UiZoom,
     pub sidebar_width: f32,
     pub window_width: f32,
     pub window_height: f32,
@@ -578,6 +581,7 @@ impl Default for Preferences {
         Self {
             warn_destructive: true,
             appearance: Appearance::System,
+            ui_zoom_percent: UiZoom::default(),
             sidebar_width: 260.,
             window_width: 1280.,
             window_height: 820.,

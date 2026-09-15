@@ -29,6 +29,7 @@ use gpui_kit::component::{
     list::ListItem,
     menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
     resizable::{h_resizable, resizable_panel},
+    scroll::{Scrollbar, ScrollbarMode},
     tab::{Tab, TabBar},
     tooltip::Tooltip,
     tree::{TreeEvent, TreeItem, TreeState, tree},
@@ -58,6 +59,9 @@ actions!(
         NextDocument,
         FindTable,
         FindDraft,
+        ZoomIn,
+        ZoomOut,
+        ResetZoom,
         Quit
     ]
 );
@@ -118,6 +122,7 @@ pub struct Workspace {
     active: usize,
     draft_search: Option<WeakEntity<DraftSearch>>,
     document_scroll: ScrollHandle,
+    viewport_scroll: ScrollHandle,
     history: Option<Entity<History>>,
     status: String,
     error: String,
@@ -134,9 +139,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        window.set_content_zoom(preferences.ui_zoom_percent.factor());
         Document::init(cx);
         super::ssh_prompt::install(&services, window, cx);
         cx.bind_keys([
+            KeyBinding::new("ctrl-=", ZoomIn, None),
+            KeyBinding::new("ctrl-+", ZoomIn, None),
+            KeyBinding::new("ctrl-shift-+", ZoomIn, None),
+            KeyBinding::new("ctrl-shift-=", ZoomIn, None),
+            KeyBinding::new("ctrl--", ZoomOut, None),
+            KeyBinding::new("ctrl-0", ResetZoom, None),
             KeyBinding::new("ctrl-n", NewQuery, Some("QueriWorkspace")),
             KeyBinding::new("ctrl-p", FindTable, Some("QueriWorkspace")),
             KeyBinding::new("ctrl-shift-s", FindDraft, Some("QueriWorkspace")),
@@ -197,7 +209,7 @@ impl Workspace {
                 },
             ),
             cx.observe_window_bounds(window, |this, window, cx| {
-                let size = window.viewport_size();
+                let size = window.bounds().size;
                 this.preferences.window_width = f32::from(size.width);
                 this.preferences.window_height = f32::from(size.height);
                 this.schedule_save(window, cx);
@@ -238,6 +250,33 @@ impl Workspace {
                 }
             }),
         ];
+        let view = cx.entity().downgrade();
+        App::on_action(cx, move |_: &ZoomIn, cx| {
+            let view = view.clone();
+            cx.defer(move |cx| {
+                let _ = view.update_in(cx, |this, window, cx| {
+                    this.set_zoom(this.preferences.ui_zoom_percent.increase(), window, cx);
+                });
+            });
+        });
+        let view = cx.entity().downgrade();
+        App::on_action(cx, move |_: &ZoomOut, cx| {
+            let view = view.clone();
+            cx.defer(move |cx| {
+                let _ = view.update_in(cx, |this, window, cx| {
+                    this.set_zoom(this.preferences.ui_zoom_percent.decrease(), window, cx);
+                });
+            });
+        });
+        let view = cx.entity().downgrade();
+        App::on_action(cx, move |_: &ResetZoom, cx| {
+            let view = view.clone();
+            cx.defer(move |cx| {
+                let _ = view.update_in(cx, |this, window, cx| {
+                    this.set_zoom(UiZoom::default(), window, cx);
+                });
+            });
+        });
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, Some("QueriWorkspace"))]);
         let focus = cx.focus_handle();
         focus.focus(window, cx);
@@ -273,6 +312,7 @@ impl Workspace {
             active: 0,
             draft_search: None,
             document_scroll: ScrollHandle::new(),
+            viewport_scroll: ScrollHandle::new(),
             history: None,
             status: "Choose a connection to begin".into(),
             error: String::new(),
@@ -1888,6 +1928,16 @@ impl Workspace {
         super::theme::apply(cx);
     }
 
+    fn set_zoom(&mut self, zoom: UiZoom, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preferences.ui_zoom_percent == zoom {
+            return;
+        }
+        self.preferences.ui_zoom_percent = zoom;
+        window.set_content_zoom(zoom.factor());
+        self.schedule_save(window, cx);
+        cx.notify();
+    }
+
     fn welcome(&self, cx: &mut Context<Self>) -> AnyElement {
         let (icon, title, description, action) = match self.connection_state {
             ConnectionState::Connecting => (
@@ -2192,6 +2242,10 @@ impl Workspace {
             let checked = view.read(cx).preferences.warn_destructive;
             let theme_view = view.clone();
             let warning_view = view.clone();
+            let zoom = view.read(cx).preferences.ui_zoom_percent;
+            let zoom_out_view = view.clone();
+            let zoom_in_view = view.clone();
+            let reset_zoom_view = view.clone();
             dialog.title("Preferences").child(
                 v_flex()
                     .gap_5()
@@ -2220,6 +2274,80 @@ impl Workspace {
                                             cx.notify();
                                         })
                                     }),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .flex_wrap()
+                            .gap_4()
+                            .child(div().text_sm().child("Interface zoom"))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        icon_button(
+                                            "ui-zoom-out",
+                                            IconName::Minus,
+                                            "Zoom out (Ctrl+-)",
+                                        )
+                                        .disabled(zoom.decrease() == zoom)
+                                        .on_click(
+                                            move |_, window, cx| {
+                                                zoom_out_view.update(cx, |this, cx| {
+                                                    this.set_zoom(
+                                                        this.preferences.ui_zoom_percent.decrease(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            },
+                                        ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("ui-zoom-percent")
+                                            .role(Role::Status)
+                                            .aria_label(format!(
+                                                "Interface zoom: {}%",
+                                                zoom.percent()
+                                            ))
+                                            .text_sm()
+                                            .w(px(48.))
+                                            .text_center()
+                                            .child(format!("{}%", zoom.percent())),
+                                    )
+                                    .child(
+                                        icon_button(
+                                            "ui-zoom-in",
+                                            IconName::Plus,
+                                            "Zoom in (Ctrl++)",
+                                        )
+                                        .disabled(zoom.increase() == zoom)
+                                        .on_click(
+                                            move |_, window, cx| {
+                                                zoom_in_view.update(cx, |this, cx| {
+                                                    this.set_zoom(
+                                                        this.preferences.ui_zoom_percent.increase(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            },
+                                        ),
+                                    )
+                                    .child(
+                                        Button::new("ui-zoom-reset")
+                                            .label("Reset")
+                                            .accessibility_label("Reset zoom")
+                                            .small()
+                                            .disabled(zoom == UiZoom::default())
+                                            .on_click(move |_, window, cx| {
+                                                reset_zoom_view.update(cx, |this, cx| {
+                                                    this.set_zoom(UiZoom::default(), window, cx);
+                                                });
+                                            }),
+                                    ),
                             ),
                     )
                     .child(setting_switch(
@@ -2266,6 +2394,8 @@ impl Workspace {
                                     ("Query history", "Ctrl + H"),
                                     ("Close tab", "Ctrl + W"),
                                     ("Next tab", "Ctrl + Tab"),
+                                    ("Zoom in / out", "Ctrl + + / −"),
+                                    ("Reset zoom", "Ctrl + 0"),
                                 ]
                                 .map(|(label, keys)| {
                                     h_flex()
@@ -2900,11 +3030,13 @@ impl Render for Workspace {
                     .child(self.history_panel(history, cx)),
             );
         }
-        v_flex()
+        let workspace = v_flex()
             .id("workspace")
             .key_context("QueriWorkspace")
             .track_focus(&self.focus)
             .size_full()
+            .min_w(window.bounds().size.width.min(px(900.)))
+            .min_h(window.bounds().size.height.min(px(600.)))
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(|this, _: &NewQuery, window, cx| this.new_query(window, cx)))
@@ -3033,6 +3165,21 @@ impl Render for Workspace {
                             }
                         )
                     }),
+            );
+        div()
+            .id("workspace-viewport")
+            .test_support()
+            .relative()
+            .size_full()
+            .overflow_scroll()
+            .track_scroll(&self.viewport_scroll)
+            .child(workspace)
+            .child(
+                div().absolute().inset_0().child(
+                    Scrollbar::new(&self.viewport_scroll)
+                        .mode(ScrollbarMode::Always)
+                        .viewport_from_layout(),
+                ),
             )
     }
 }

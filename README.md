@@ -55,6 +55,7 @@ The native file picker uses `xdg-desktop-portal` and your desktop's file-chooser
 - Open **Query history** from the sidebar, search with Enter, and select an entry to open it against its recorded connection and database without executing it. Entry menus offer copying, saving to the query library, and confirmed deletion. On narrower windows, history uses the document area; opening a query returns to the editor.
 - Use **Create** beside Databases for PostgreSQL creation, or a database's **…** / right-click menu to rename, clone, delete, or inspect sessions. Each operation has a focused form; deletion requires the database name. Queri disconnects its affected sessions before administration, and explains that uncommitted transactions will roll back. Renaming updates open tabs and saved defaults; deleting keeps SQL drafts available for copying. Maintenance database and external-session termination are under Connection options.
 - Open application preferences with the gear beside Query history or the **…** menu beside Queri. Document tabs support keyboard navigation, close buttons, and an overflow menu. With no tabs open, use **Browse tables** or **New query** to continue; the tab bar keeps its new-query action available.
+- **Interface zoom** in Preferences enlarges the entire application, including editors, grids, menus, and dialogs. Use `Ctrl++` (or `Ctrl+=`) to zoom in, `Ctrl+-` to zoom out, and `Ctrl+0` to reset to 100%. Zoom ranges from 80% to 200% and survives restart. Small windows show scrollbars when the enlarged workspace needs more room. Relationship-diagram canvas zoom remains separate.
 - SQL drafts, open table tabs, window dimensions, sidebar/editor sizes, appearance, and destructive-SQL preferences survive a restart. Each document has its own database session; temporary objects and uncommitted transactions do not survive a restart.
 
 SQL results are limited to **10,000 rows / 32 MiB per script** and marked when truncated. Table pages hold up to 1,000 rows. These are display limits, not database statement limits; statements still execute in full. SQL errors can follow earlier successful statements in a batch. Use explicit transactions when you need atomic scripts.
@@ -82,6 +83,9 @@ SQL results are limited to **10,000 rows / 32 MiB per script** and marked when t
 | Ctrl+Tab | Next document |
 | Ctrl+W | Close document |
 | Ctrl+Q | Quit with transaction checks |
+| Ctrl++ / Ctrl+= | Zoom in |
+| Ctrl+- | Zoom out |
+| Ctrl+0 | Reset interface zoom to 100% |
 | Arrow keys / Enter | Navigate / open explorer items |
 
 ## Connection safeguards

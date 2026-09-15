@@ -13,6 +13,31 @@ use std::{
 };
 use uuid::Uuid;
 
+#[test]
+fn interface_zoom_survives_restart_and_older_preferences_default_to_100_percent() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("app.db");
+    let store = Store::open(&path)?;
+    store.save_preferences(&Preferences {
+        ui_zoom_percent: UiZoom::from(150),
+        ..Default::default()
+    })?;
+    assert_eq!(
+        Store::open(&path)?.preferences()?.ui_zoom_percent.percent(),
+        150
+    );
+    let connection = Connection::open(&path)?;
+    for json in [
+        r#"{"appearance":"Dark"}"#,
+        r#"{"ui_zoom_percent":0}"#,
+        r#"{"ui_zoom_percent":300}"#,
+    ] {
+        connection.execute("UPDATE preferences SET value=?1 WHERE id=1", [json])?;
+        assert_eq!(store.preferences()?.ui_zoom_percent, UiZoom::default());
+    }
+    Ok(())
+}
+
 fn profile() -> ConnectionProfile {
     ConnectionProfile {
         ssh: None,

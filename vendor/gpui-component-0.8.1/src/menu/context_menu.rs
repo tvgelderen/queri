@@ -181,8 +181,8 @@ impl DeferredMenu {
         deferred(
             anchored().child(
                 div()
-                    .w(window.bounds().size.width)
-                    .h(window.bounds().size.height)
+                    .w(window.viewport_size().width)
+                    .h(window.viewport_size().height)
                     .on_scroll(|_, _, cx| {
                         cx.stop_propagation();
                     })

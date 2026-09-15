@@ -3,10 +3,155 @@ use crate::ui::test_support::click_label;
 use crate::{database::runtime, model::*, storage::Store, ui::Services};
 use gpui_kit::test::{TestAppContextExt, TestEventExt, TestQueryExt, TestWindowExt};
 use gpui_kit::{
-    AppContext, Bounds, MouseButton, TestAppContext, WindowBounds, WindowOptions, px, size,
+    AppContext, Bounds, MouseButton, ParentElement, TestAppContext, WindowBounds, WindowOptions,
+    px, size,
 };
 use std::time::Duration;
 use uuid::Uuid;
+
+#[gpui_kit::test]
+async fn application_zoom_scales_the_viewport_and_restores_it(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let store = Store::open(directory.path().join("app.db")).expect("store");
+    let services = Services::new(runtime().expect("runtime"), store);
+    let (handle, _) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| Workspace::new(services, Preferences::default(), vec![], window, cx))
+        })
+        .expect("workspace")
+    });
+    let (original_size, original_bounds) = cx
+        .update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            (window.viewport_size(), window.bounds())
+        })
+        .unwrap();
+    cx.update_window(handle, |_, window, cx| window.press("ctrl-shift-+", cx))
+        .unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.viewport_size().width < original_size.width);
+        assert_eq!(
+            window.bounds(),
+            original_bounds,
+            "zoom keeps the OS window size"
+        );
+    })
+    .unwrap();
+    cx.update_window(handle, |_, window, cx| window.press("ctrl-0", cx))
+        .unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!((f32::from(window.viewport_size().width - original_size.width)).abs() < 0.01);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+async fn application_zoom_controls_work_in_dialogs_and_save_window_dimensions(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::component::WindowExt;
+    cx.executor().allow_parking();
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path().join("app.db")).unwrap();
+    let services = Services::new(runtime().unwrap(), store.clone());
+    let (handle, workspace) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workspace::new(
+                    services,
+                    Preferences {
+                        ui_zoom_percent: UiZoom::from(125),
+                        ..Default::default()
+                    },
+                    vec![],
+                    window,
+                    cx,
+                )
+            })
+        })
+        .unwrap()
+    });
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(window.content_zoom(), 1.25);
+        window.click("preferences", cx);
+        window.click("ui-zoom-in", cx);
+        assert_eq!(window.content_zoom(), 1.5);
+        window.press("ctrl--", cx);
+    })
+    .unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.content_zoom(), 1.25);
+        assert!(window.find("ui-zoom-reset").visible());
+        window.click("ui-zoom-reset", cx);
+        assert_eq!(window.content_zoom(), 1.);
+    })
+    .unwrap();
+    for key in ["ctrl-+", "ctrl-shift-=", "ctrl-="] {
+        cx.update_window(handle, |_, window, cx| window.press(key, cx))
+            .unwrap();
+    }
+    cx.update_window(handle, |_, window, cx| {
+        assert_eq!(window.content_zoom(), 1.5);
+        click_label(window, "Dark", cx);
+        assert_eq!(window.content_zoom(), 1.5, "appearance preserves zoom");
+        window.close_dialog(cx);
+    })
+    .unwrap();
+    cx.simulate_window_resize(handle, size(px(1100.), px(700.)));
+    cx.wait_for(handle, Duration::from_secs(5), |_, _| {
+        store.preferences().is_ok_and(|p| {
+            p.ui_zoom_percent.percent() == 150 && p.window_width == 1100. && p.window_height == 700.
+        })
+    })
+    .await;
+    let saved = store.preferences().unwrap();
+    assert_eq!(saved.ui_zoom_percent.percent(), 150);
+    assert_eq!((saved.window_width, saved.window_height), (1100., 700.));
+    cx.update_window(handle, |_, window, cx| {
+        workspace.update(cx, |this, cx| this.set_zoom(UiZoom::from(200), window, cx));
+        window.scroll(
+            "workspace-viewport",
+            gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-1000.))),
+            cx,
+        );
+        window.click("preferences", cx);
+        assert_eq!(window.find("ui-zoom-in").disabled(), Some(true));
+        window.click("ui-zoom-in", cx);
+        assert_eq!(window.content_zoom(), 2.);
+    })
+    .unwrap();
+    use gpui_kit::Focusable;
+    use gpui_kit::component::input::{Input, InputState};
+    let input = cx
+        .update_window(handle, |_, window, cx| {
+            window.close_dialog(cx);
+            let input = cx.new(|cx| InputState::new(window, cx).default_value("SELECT 123"));
+            let dialog_input = input.clone();
+            window.open_dialog(cx, move |dialog, _, _| {
+                dialog
+                    .title("Focused input")
+                    .child(Input::new(&dialog_input))
+            });
+            input.read(cx).focus_handle(cx).focus(window, cx);
+            window.render_frame(cx);
+            window.press("ctrl-0", cx);
+            input
+        })
+        .unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.content_zoom(), 1.);
+        assert_eq!(input.read(cx).value().as_str(), "SELECT 123");
+        assert!(input.read(cx).focus_handle(cx).is_focused(window));
+    })
+    .unwrap();
+}
 
 #[gpui_kit::test]
 async fn middle_click_closes_tabs_without_selecting_them(cx: &mut TestAppContext) {
