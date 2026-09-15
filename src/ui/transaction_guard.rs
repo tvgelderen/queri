@@ -1,9 +1,16 @@
 //! One guard for operations that discard document sessions. Documents remain locked
 //! from observation through acknowledgement and rollback, including dialog dismissal.
-use super::{Services, document::Document, task};
+use super::{
+    Services,
+    controls::{Tone, card, dialog_icon},
+    document::Document,
+    task,
+};
 use crate::{database::Session, model::TransactionStatus};
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    component::{WindowExt, dialog::DialogButtonProps},
+    assets::IconName,
+    component::{ActiveTheme, Icon, Sizable, WindowExt, dialog::DialogButtonProps, h_flex},
     *,
 };
 use std::{cell::RefCell, rc::Rc, sync::Arc};
@@ -78,23 +85,62 @@ pub(super) fn release<V: 'static>(
                 .iter()
                 .map(|doc| {
                     let doc = doc.read(cx);
-                    format!("{} — {}", doc.profile.context(), doc.title())
+                    (
+                        SharedString::from(doc.title()),
+                        SharedString::from(doc.profile.context()),
+                    )
                 })
-                .collect::<Vec<_>>()
-                .join("\n");
+                .collect::<Vec<_>>();
             let unknown = states.contains(&TransactionStatus::Unknown);
             let complete = Rc::new(RefCell::new(Some(complete)));
             let view = cx.entity().downgrade();
-            window.open_alert_dialog(cx, move |dialog, _, _| {
+            window.open_alert_dialog(cx, move |dialog, _, cx| {
             let documents = documents.clone();
             let dismissed = documents.clone();
             let sessions = sessions.clone();
             let complete = complete.clone();
             let view = view.clone();
             let services = services.clone();
-            dialog.title("Close database sessions?")
-                .child(affected.clone())
-                .child(if unknown {
+            let muted = cx.theme().muted_foreground;
+            let border = cx.theme().border;
+            dialog
+                .width(px(480.))
+                .icon(dialog_icon(
+                    IconName::TriangleAlert,
+                    if unknown { Tone::Danger } else { Tone::Warning },
+                    cx,
+                ))
+                .title("Close database sessions?")
+                .child(
+                    card(cx).overflow_hidden().children(affected.iter().enumerate().map(
+                        |(index, (title, context))| {
+                            h_flex()
+                                .gap_2p5()
+                                .px_3()
+                                .py_2()
+                                .when(index > 0, |row| row.border_t_1().border_color(border))
+                                .child(Icon::new(IconName::Database).small().text_color(muted))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .text_sm()
+                                        .text_ellipsis()
+                                        .child(title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .text_right()
+                                        .text_ellipsis()
+                                        .text_color(muted)
+                                        .child(context.clone()),
+                                )
+                        },
+                    )),
+                )
+                .description(if unknown {
                     "A transaction outcome is unknown. A COMMIT may already have taken effect. Closing cannot undo or confirm it; Queri will not retry it. Other open transactions will be rolled back."
                 } else {
                     "These sessions have uncommitted changes. Keep them open, or roll back their transactions and continue."
@@ -119,7 +165,7 @@ pub(super) fn release<V: 'static>(
                             unlock(&documents, cx);
                             match result {
                                 Ok(()) => complete(this, window, cx),
-                                Err(error) => { let message = format!("{error:#}"); window.open_alert_dialog(cx, move |dialog, _, _| dialog.title("Sessions kept open").child(message.clone())); }
+                                Err(error) => { let message = format!("{error:#}"); window.open_alert_dialog(cx, move |dialog, _, cx| dialog.icon(dialog_icon(IconName::CircleAlert, Tone::Danger, cx)).title("Sessions kept open").description(message.clone())); }
                             }
                         });
                     });

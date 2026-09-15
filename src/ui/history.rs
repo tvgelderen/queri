@@ -1,6 +1,6 @@
 use super::{
     Services,
-    controls::{destructive_menu_item, empty_state, icon_button, menu_item},
+    controls::{Tone, destructive_menu_item, dialog_icon, empty_state, icon_button, menu_item},
     task,
 };
 use crate::model::{HISTORY_PAGE_SIZE, HistoryEntry};
@@ -137,11 +137,12 @@ impl History {
     fn confirm_delete(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         self.search.read(cx).focus_handle(cx).focus(window, cx);
-        window.open_alert_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, cx| {
             let view = view.clone();
             dialog
+                .icon(dialog_icon(IconName::Trash, Tone::Danger, cx))
                 .title("Delete this query from history?")
-                .child(
+                .description(
                     "The recorded query will be removed. Your database and open SQL tabs are kept.",
                 )
                 .button_props(
@@ -159,11 +160,12 @@ impl History {
     fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search.read(cx).focus_handle(cx).focus(window, cx);
         let view = cx.entity();
-        window.open_alert_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, cx| {
             let view = view.clone();
             dialog
+                .icon(dialog_icon(IconName::Trash, Tone::Danger, cx))
                 .title("Clear connection history?")
-                .child("All recorded queries for this connection will be removed.")
+                .description("All recorded queries for this connection will be removed.")
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Clear history")

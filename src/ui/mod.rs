@@ -40,6 +40,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{App, Context, Entity, Window};
 use std::{future::Future, sync::Arc};
+pub use theme::apply as apply_theme;
 pub use workspace::Workspace;
 
 #[derive(Clone, Copy, PartialEq)]

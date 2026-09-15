@@ -1,5 +1,10 @@
-use super::{Services, controls::choice, input, task};
+use super::{
+    Services,
+    controls::{Tone, choice, dialog_icon},
+    input, task,
+};
 use crate::{database::Session, model::*};
+use gpui_kit::assets::IconName;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Sizable, WindowExt,
@@ -142,12 +147,13 @@ impl RowEditor {
                 "Insert row"
             };
             let table = format!("{}.{}", self.table.schema, self.table.name);
-            window.open_alert_dialog(cx, move |dialog, _, _| {
+            window.open_alert_dialog(cx, move |dialog, _, cx| {
                 let view = view.clone();
                 let change = change.clone();
                 dialog
+                    .icon(dialog_icon(IconName::Save, Tone::Neutral, cx))
                     .title(format!("{operation}?"))
-                    .child(format!(
+                    .description(format!(
                         "{operation} in {table} on {context}. Cancel makes no changes."
                     ))
                     .button_props(

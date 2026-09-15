@@ -101,14 +101,16 @@ impl Workspace {
             return;
         }
         let view = cx.entity();
-        window.open_alert_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, cx| {
             let view = view.clone();
             dialog
+                .icon(dialog_icon(IconName::Trash, Tone::Danger, cx))
                 .title("Discard schema draft?")
-                .child("Unsaved schema edits will be lost.")
+                .description("Unsaved schema edits will be lost.")
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Discard draft")
+                        .ok_variant(ButtonVariant::Danger)
                         .show_cancel(true),
                 )
                 .on_ok(move |_, _, cx| {
@@ -236,6 +238,7 @@ impl Workspace {
                         }
                     }
                     SchemaDesignerEvent::Cancel => this.close_schema_draft(window, cx),
+                    SchemaDesignerEvent::SaveAndClose => this.save_close_schema_draft(cx),
                     SchemaDesignerEvent::Review(intent) => {
                         this.review_schema_draft(intent, session.clone(), window, cx)
                     }

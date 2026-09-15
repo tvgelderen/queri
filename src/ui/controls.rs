@@ -5,6 +5,7 @@ use gpui_kit::component::{
     empty::{Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle},
     h_flex,
     menu::{DropdownMenu, PopupMenuItem},
+    scroll::ScrollableElement,
     switch::Switch,
 };
 use gpui_kit::prelude::FluentBuilder;
@@ -286,4 +287,251 @@ pub fn choice<T: Clone + PartialEq + 'static>(
             }
             menu
         })
+}
+
+/// Title row shared by full-page tools: a title, quiet context, and trailing actions.
+pub fn page_header(
+    title: impl Into<SharedString>,
+    subtitle: impl Into<SharedString>,
+    actions: impl IntoIterator<Item = AnyElement>,
+    cx: &App,
+) -> Div {
+    h_flex()
+        .flex_shrink_0()
+        .min_h_12()
+        .px_4()
+        .py_2()
+        .gap_4()
+        .justify_between()
+        .border_b_1()
+        .border_color(cx.theme().border)
+        .child(
+            gpui_kit::component::v_flex()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_ellipsis()
+                        .child(title.into()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .text_ellipsis()
+                        .child(subtitle.into()),
+                ),
+        )
+        .child(h_flex().flex_shrink_0().gap_1p5().children(actions))
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Tone {
+    Neutral,
+    Success,
+    Warning,
+    Danger,
+}
+
+impl Tone {
+    pub fn color(self, cx: &App) -> Hsla {
+        match self {
+            Self::Neutral => cx.theme().muted_foreground,
+            Self::Success => cx.theme().success,
+            Self::Warning => cx.theme().warning,
+            Self::Danger => cx.theme().danger,
+        }
+    }
+    fn icon(self) -> IconName {
+        match self {
+            Self::Neutral => IconName::Info,
+            Self::Success => IconName::CircleCheck,
+            Self::Warning => IconName::TriangleAlert,
+            Self::Danger => IconName::CircleAlert,
+        }
+    }
+}
+
+/// An inline status message with a tone-tinted icon; errors are announced as alerts.
+pub fn notice(
+    id: impl Into<ElementId>,
+    tone: Tone,
+    message: impl Into<SharedString>,
+    cx: &App,
+) -> Stateful<Div> {
+    let color = tone.color(cx);
+    h_flex()
+        .id(id)
+        .role(if tone == Tone::Danger {
+            Role::Alert
+        } else {
+            Role::Status
+        })
+        .w_full()
+        .items_start()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(if tone == Tone::Neutral {
+            cx.theme().border
+        } else {
+            color.opacity(0.28)
+        })
+        .bg(if tone == Tone::Neutral {
+            cx.theme().muted
+        } else {
+            color.opacity(0.08)
+        })
+        .text_sm()
+        .line_height(relative(1.5))
+        .child(
+            div()
+                .flex_shrink_0()
+                .pt(px(2.))
+                .text_color(color)
+                .child(Icon::new(tone.icon()).small()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .whitespace_normal()
+                .child(message.into()),
+        )
+}
+
+/// A bordered surface for grouped content.
+pub fn card(cx: &App) -> Div {
+    gpui_kit::component::v_flex()
+        .rounded(cx.theme().radius_lg)
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().background)
+}
+
+/// A small tinted label for kinds and states.
+pub fn badge(label: impl Into<SharedString>, color: Hsla) -> Div {
+    div()
+        .flex_shrink_0()
+        .px_1p5()
+        .py(px(1.))
+        .rounded(px(4.))
+        .bg(color.opacity(0.12))
+        .text_color(color)
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .child(label.into())
+}
+
+/// A tinted square that carries the dialog's tone before any text is read.
+pub fn dialog_icon(icon: IconName, tone: Tone, cx: &App) -> Div {
+    let (fg, bg) = match tone {
+        Tone::Neutral => (super::theme::accent_text(cx), super::theme::accent_soft(cx)),
+        tone => (tone.color(cx), tone.color(cx).opacity(0.12)),
+    };
+    div()
+        .flex_shrink_0()
+        .size_9()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(cx.theme().radius)
+        .bg(bg)
+        .text_color(fg)
+        .child(Icon::new(icon))
+}
+
+/// Read-only SQL with editor syntax colors and a line-number gutter.
+pub fn sql_code(sql: &str, cx: &App) -> Div {
+    use gpui_kit::component::{highlighter::SyntaxHighlighter, input::Rope};
+    let mut highlighter = SyntaxHighlighter::new("sql");
+    highlighter.update(None, &Rope::from_str(sql), None);
+    let styles = highlighter.styles(&(0..sql.len()), cx.theme().highlight_theme.as_ref());
+    let muted = cx.theme().muted_foreground;
+    let mut start = 0;
+    let lines = sql.split('\n').enumerate().map(|(index, line)| {
+        let end = start + line.len();
+        let highlights = styles
+            .iter()
+            .filter_map(|(range, style)| {
+                let from = range.start.max(start);
+                let to = range.end.min(end);
+                (from < to).then(|| (from - start..to - start, *style))
+            })
+            .collect::<Vec<_>>();
+        start = end + 1;
+        let text = if line.trim().is_empty() {
+            StyledText::new(" ")
+        } else {
+            StyledText::new(line.to_owned()).with_highlights(highlights)
+        };
+        h_flex()
+            .items_start()
+            .child(
+                div()
+                    .w_10()
+                    .flex_shrink_0()
+                    .pr_3()
+                    .text_right()
+                    .text_color(muted.opacity(0.6))
+                    .child((index + 1).to_string()),
+            )
+            .child(div().flex_1().min_w_0().pr_4().child(text))
+    });
+    gpui_kit::component::v_flex()
+        .py_2p5()
+        .font_family(cx.theme().mono_font_family.clone())
+        .text_size(cx.theme().mono_font_size)
+        .line_height(relative(1.65))
+        .text_color(cx.theme().foreground)
+        .children(lines)
+}
+
+/// A framed SQL preview: a quiet header naming where it runs, then scrollable code.
+pub fn sql_preview(
+    id: impl Into<ElementId>,
+    target: impl Into<SharedString>,
+    meta: impl Into<SharedString>,
+    sql: &str,
+    cx: &App,
+) -> Div {
+    let muted = cx.theme().muted_foreground;
+    card(cx)
+        .w_full()
+        .overflow_hidden()
+        .child(
+            h_flex()
+                .h_9()
+                .px_3()
+                .gap_3()
+                .justify_between()
+                .bg(cx.theme().muted)
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .text_xs()
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_2()
+                        .child(Icon::new(IconName::Database).xsmall().text_color(muted))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .text_ellipsis()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(target.into()),
+                        ),
+                )
+                .child(div().flex_shrink_0().text_color(muted).child(meta.into())),
+        )
+        .child(
+            div()
+                .id(id)
+                .max_h(px(280.))
+                .overflow_y_scrollbar()
+                .child(sql_code(sql, cx)),
+        )
 }

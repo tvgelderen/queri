@@ -1,6 +1,9 @@
 use super::{
     Services,
-    controls::{chip, choice, count_badge, empty_state, icon_button, menu_item, toolbar_divider},
+    controls::{
+        Tone, chip, choice, count_badge, dialog_icon, empty_state, icon_button, menu_item, notice,
+        sql_preview, toolbar_divider,
+    },
     grid::{Grid, GridEvent},
     grid_search::{FindGrid, GridSearch},
     row_editor::{RowEditor, RowSaved},
@@ -10,7 +13,7 @@ use crate::{database::Session, model::*, sql};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, Selectable, Sizable, WindowExt,
-    button::{Button, ButtonVariants},
+    button::{Button, ButtonVariant, ButtonVariants},
     dialog::DialogButtonProps,
     h_flex,
     input::{Editor, EditorState, Input, InputEvent, InputState},
@@ -980,42 +983,69 @@ impl Document {
             let editor_sql = self.submission_snapshot(cx);
             let context = self.profile.context();
             let preview: String = sql.chars().take(2000).collect();
-            let preview = if preview.len() < sql.len() {
-                format!("{preview}… (preview truncated)")
-            } else {
-                preview
+            let truncated = preview.len() < sql.len();
+            let lines = preview.lines().count().max(1);
+            let meta = match (truncated, lines) {
+                (true, _) => "Preview truncated".to_owned(),
+                (false, 1) => "1 line".to_owned(),
+                (false, lines) => format!("{lines} lines"),
             };
-            let message = format!(
-                "Submit SQL to {context}. Cancel sends nothing to the database.\n{}\n{preview}",
-                if analyze {
-                    "Explain and run executes the statement, including its writes and other side effects."
-                } else {
-                    ""
-                }
+            let label = format!(
+                "Submit SQL to {context}. Cancel sends nothing to the database.\n{preview}"
             );
-            window.open_alert_dialog(cx, move |dialog, _, _| {
+            window.open_alert_dialog(cx, move |dialog, _, cx| {
                 let sql = sql.clone();
                 let params = params.clone();
                 let view = view.clone();
                 let editor_sql = editor_sql.clone();
+                let tone = if destructive || analyze { Tone::Warning } else { Tone::Neutral };
                 dialog
+                    .width(px(600.))
+                    .icon(dialog_icon(
+                        if destructive { IconName::TriangleAlert } else { IconName::Play },
+                        tone,
+                        cx,
+                    ))
                     .title(if destructive {
                         "Run destructive SQL?"
                     } else {
                         "Run SQL?"
                     })
+                    .description(if destructive {
+                        "This statement can change or remove data. Cancel sends nothing to the database."
+                    } else {
+                        "Review the statement before it runs. Cancel sends nothing to the database."
+                    })
                     .child(
-                        div()
+                        v_flex()
                             .id("sql-confirmation-context")
+                            .gap_3()
                             .test_support()
-                            .aria_label(message.clone())
-                            .max_h(px(240.))
-                            .overflow_y_scroll()
-                            .child(message.clone()),
+                            .aria_label(label.clone())
+                            .when(analyze, |body| {
+                                body.child(notice(
+                                    "sql-confirmation-analyze",
+                                    Tone::Warning,
+                                    "Explain and run executes the statement, including its writes and other side effects.",
+                                    cx,
+                                ))
+                            })
+                            .child(sql_preview(
+                                "sql-confirmation-preview",
+                                context.clone(),
+                                meta.clone(),
+                                &preview,
+                                cx,
+                            )),
                     )
                     .button_props(
                         DialogButtonProps::default()
                             .ok_text("Run SQL")
+                            .ok_variant(if destructive {
+                                ButtonVariant::Danger
+                            } else {
+                                ButtonVariant::Primary
+                            })
                             .show_cancel(true),
                     )
                     .on_ok(move |_, window, cx| {
@@ -1312,14 +1342,15 @@ impl Document {
                             let input = this.timeout_input.clone();
                             let view = cx.entity().downgrade();
                             let validation = cx.new(|_| TimeoutValidation(String::new()));
-                            window.open_alert_dialog(cx, move |dialog, _, _| {
+                            window.open_alert_dialog(cx, move |dialog, _, cx| {
                                 let input = input.clone();
                                 let view = view.clone();
                                 let validation = validation.clone();
-                                dialog.title("Statement timeout")
-                                    .child("Positive duration in milliseconds (maximum 2147483647). Applies separately to each statement.")
-                                    .child(Input::new(&input))
-                                    .child(validation.clone())
+                                dialog
+                                    .icon(dialog_icon(IconName::Timer, Tone::Neutral, cx))
+                                    .title("Statement timeout")
+                                    .description("Positive duration in milliseconds (maximum 2147483647). Applies separately to each statement.")
+                                    .child(v_flex().gap_2().child(Input::new(&input)).child(validation.clone()))
                                     .button_props(DialogButtonProps::default().ok_text("Apply").show_cancel(true)).on_ok(move |_, window, cx| {
                                         let timeout = input.read(cx).value().parse::<u32>().ok().and_then(|ms| StatementTimeout::custom(ms).ok());
                                         let Some(timeout) = timeout else {
@@ -1898,7 +1929,7 @@ impl Document {
         }
         let table = table.clone();
         let view = cx.entity();
-        window.open_alert_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, cx| {
             let (view, session, table, originals) = (
                 view.clone(),
                 session.clone(),
@@ -1906,8 +1937,9 @@ impl Document {
                 originals.clone(),
             );
             dialog
+                .icon(dialog_icon(IconName::Trash, Tone::Danger, cx))
                 .title(format!("Delete {} rows?", originals.len()))
-                .child(format!(
+                .description(format!(
                     "Delete the selected rows from {}.{} on {}? Cancel makes no changes.",
                     table.schema,
                     table.name,
@@ -1916,6 +1948,7 @@ impl Document {
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Delete rows")
+                        .ok_variant(ButtonVariant::Danger)
                         .show_cancel(true),
                 )
                 .on_ok(move |_, window, cx| {

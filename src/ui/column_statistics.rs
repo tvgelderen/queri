@@ -171,10 +171,12 @@ impl Document {
     fn confirm_statistics(&mut self, column: usize, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let generation = self.session_generation;
-        window.open_alert_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, cx| {
             let view = view.clone();
-            dialog.title("Calculate all matching rows?")
-                .child("This scans the filtered dataset and can be expensive. The tab timeout and Cancel action apply.")
+            dialog
+                .icon(dialog_icon(IconName::Activity, Tone::Warning, cx))
+                .title("Calculate all matching rows?")
+                .description("This scans the filtered dataset and can be expensive. The tab timeout and Cancel action apply.")
                 .button_props(DialogButtonProps::default().show_cancel(true).ok_text("Calculate"))
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |this, cx| {

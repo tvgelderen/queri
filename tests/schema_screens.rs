@@ -72,6 +72,7 @@ fn main() {
         cx.update(|cx| {
             gpui_kit::init(cx);
             Theme::change(mode, None, cx);
+            queri::ui::apply_theme(cx);
         });
         let (handle, diagram) = cx
             .update(|cx| {
@@ -113,26 +114,7 @@ fn main() {
         let layout_before =
             cx.update(|cx| serde_json::to_value(diagram.read(cx).saved_layout()).unwrap());
         cx.update_window(handle, |_, window, cx| {
-            let position = gpui_kit::point(px(250.), px(16.));
-            window.dispatch_event(
-                gpui_kit::PlatformInput::MouseDown(gpui_kit::MouseDownEvent {
-                    position,
-                    button: gpui_kit::MouseButton::Left,
-                    modifiers: Default::default(),
-                    click_count: 1,
-                    first_mouse: false,
-                }),
-                cx,
-            );
-            window.dispatch_event(
-                gpui_kit::PlatformInput::MouseUp(gpui_kit::MouseUpEvent {
-                    position,
-                    button: gpui_kit::MouseButton::Left,
-                    modifiers: Default::default(),
-                    click_count: 1,
-                }),
-                cx,
-            );
+            window.click("er-zoom-in", cx);
             window.render_frame(cx);
         })
         .unwrap();

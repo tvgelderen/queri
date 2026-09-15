@@ -163,7 +163,7 @@ impl Document {
         let view = cx.entity();
         let generation = self.session_generation;
         let editor_sql = self.submission_snapshot(cx);
-        window.open_alert_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, cx| {
             let (view, form, sql, editor_sql) =
                 (view.clone(), form.clone(), sql.clone(), editor_sql.clone());
             let cancel_view = view.clone();
@@ -172,6 +172,7 @@ impl Document {
                     cancel_view.update(cx, |this, cx| this.focus(window, cx));
                     true
                 })
+                .icon(dialog_icon(IconName::Braces, Tone::Neutral, cx))
                 .title("Query parameters")
                 .child(form.clone())
                 .button_props(

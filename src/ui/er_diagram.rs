@@ -1,7 +1,18 @@
 //! Native schema relationship inspector. Relationships are declared constraints only.
+use super::controls::{
+    Tone, count_badge, icon_button, notice, page_header, section_label, toolbar_divider,
+};
+use super::theme::accent_text;
 use crate::schema::{Constraint, Snapshot};
 use gpui_kit::{
-    component::{ActiveTheme, button::Button, h_flex, v_flex},
+    assets::IconName,
+    component::{
+        ActiveTheme, Icon, Sizable,
+        button::{Button, ButtonVariants},
+        h_flex,
+        input::{Input, InputEvent, InputState},
+        v_flex,
+    },
     prelude::*,
     *,
 };
@@ -18,6 +29,9 @@ impl EventEmitter<RefreshDiagram> for ErDiagram {}
 pub struct OpenDiagramTable(pub crate::model::TableRef);
 impl EventEmitter<OpenDiagramTable> for ErDiagram {}
 
+pub struct CloseDiagram;
+impl EventEmitter<CloseDiagram> for ErDiagram {}
+
 pub struct ErDiagram {
     export_message: String,
     search: Option<Entity<gpui_kit::component::input::InputState>>,
@@ -29,6 +43,8 @@ pub struct ErDiagram {
     pan: (f32, f32),
     drag: Option<(Option<usize>, Point<Pixels>)>,
     viewport: std::rc::Rc<std::cell::Cell<(f32, f32)>>,
+    /// Fit the first frame unless a saved layout was restored.
+    pending_fit: bool,
 }
 impl ErDiagram {
     pub fn saved_layout(&self) -> DiagramLayout {
@@ -45,6 +61,7 @@ impl ErDiagram {
         }
     }
     pub fn restore_layout(&mut self, layout: DiagramLayout) {
+        self.pending_fit = false;
         for (table, position) in self.snapshot.tables.iter().zip(&mut self.positions) {
             if let Some(saved) = layout
                 .positions
@@ -72,11 +89,14 @@ impl ErDiagram {
             pan: (20., 20.),
             drag: None,
             viewport: Default::default(),
+            pending_fit: true,
             selected: 0,
         }
     }
 }
 const WIDTH: f32 = 240.;
+/// Source table, destination table and the polyline between their columns.
+type Route = (usize, usize, Vec<(f32, f32)>);
 fn layout(snapshot: &Snapshot) -> Vec<(f32, f32)> {
     let mut order: Vec<_> = (0..snapshot.tables.len()).collect();
     order.sort_by_key(|&i| &snapshot.tables[i].name);
@@ -171,7 +191,25 @@ impl ErDiagram {
             .clamp(0.1, 2.);
         self.pan = (20. - min_x * self.zoom, 20. - min_y * self.zoom);
     }
-    fn edges(&self) -> Vec<Vec<(f32, f32)>> {
+    /// Brings a table into the middle of the visible canvas without changing zoom.
+    fn reveal(&mut self, index: usize) {
+        let (w, h) = self.viewport.get();
+        let (Some(position), Some(table)) =
+            (self.positions.get(index), self.snapshot.tables.get(index))
+        else {
+            return;
+        };
+        if w <= 0. || h <= 0. {
+            return;
+        }
+        let center = (
+            position.0 + WIDTH / 2.,
+            position.1 + height(table.columns.len()) / 2.,
+        );
+        self.pan = (w / 2. - center.0 * self.zoom, h / 2. - center.1 * self.zoom);
+    }
+    /// Each route with its source and destination table indexes.
+    fn routes(&self) -> Vec<Route> {
         let mut edges = Vec::new();
         for (i, table) in self.snapshot.tables.iter().enumerate() {
             for constraint in &table.constraints {
@@ -192,22 +230,72 @@ impl ErDiagram {
                                 .map(|r| 48. + r as f32 * 24.)
                                 .unwrap_or(18.)
                         };
-                        edges.push(route(
-                            (
-                                self.positions[i].0 + WIDTH,
-                                self.positions[i].1 + row(i, source),
-                            ),
-                            (
-                                self.positions[j].0 + WIDTH,
-                                self.positions[j].1 + row(j, dest),
-                            ),
-                            edges.len(),
-                        ));
+                        let lane = edges.len();
+                        let (from, to) = (self.positions[i], self.positions[j]);
+                        let (ya, yb) = (from.1 + row(i, source), to.1 + row(j, dest));
+                        let offset = (lane % 3) as f32 * 8. - 8.;
+                        // Straight elbows only when no other table sits between the ports.
+                        let clear = |x0: f32, x1: f32| {
+                            let (top, bottom) = (ya.min(yb), ya.max(yb));
+                            !self.positions.iter().enumerate().any(|(k, p)| {
+                                k != i
+                                    && k != j
+                                    && p.0 < x1
+                                    && p.0 + WIDTH > x0
+                                    && p.1 < bottom + 12.
+                                    && p.1 + height(self.snapshot.tables[k].columns.len())
+                                        > top - 12.
+                            })
+                        };
+                        let corridor = self
+                            .positions
+                            .iter()
+                            .map(|p| p.1)
+                            .fold(f32::INFINITY, f32::min)
+                            - 24.
+                            - lane as f32 * 8.;
+                        let detour = |a: (f32, f32), out: f32, b: (f32, f32), into: f32| {
+                            let spread = lane as f32 * 6.;
+                            vec![
+                                a,
+                                (a.0 + out * (16. + spread), a.1),
+                                (a.0 + out * (16. + spread), corridor),
+                                (b.0 + into * (16. + spread), corridor),
+                                (b.0 + into * (16. + spread), b.1),
+                                b,
+                            ]
+                        };
+                        let points = if i == j {
+                            route((from.0 + WIDTH, ya), (to.0 + WIDTH, yb), lane)
+                        } else if to.0 > from.0 + WIDTH + 32. {
+                            // Target to the right: leave right, enter left.
+                            if clear(from.0 + WIDTH, to.0) {
+                                let x = (from.0 + WIDTH + to.0) / 2. + offset;
+                                vec![(from.0 + WIDTH, ya), (x, ya), (x, yb), (to.0, yb)]
+                            } else {
+                                detour((from.0 + WIDTH, ya), 1., (to.0, yb), -1.)
+                            }
+                        } else if to.0 + WIDTH + 32. < from.0 {
+                            if clear(to.0 + WIDTH, from.0) {
+                                let x = (to.0 + WIDTH + from.0) / 2. + offset;
+                                vec![(from.0, ya), (x, ya), (x, yb), (to.0 + WIDTH, yb)]
+                            } else {
+                                detour((from.0, ya), -1., (to.0 + WIDTH, yb), 1.)
+                            }
+                        } else {
+                            // Stacked tables: loop around their shared right edge.
+                            let x = from.0.max(to.0) + WIDTH + 24. + lane as f32 * 8.;
+                            vec![(from.0 + WIDTH, ya), (x, ya), (x, yb), (to.0 + WIDTH, yb)]
+                        };
+                        edges.push((i, j, points));
                     }
                 }
             }
         }
         edges
+    }
+    fn edges(&self) -> Vec<Vec<(f32, f32)>> {
+        self.routes().into_iter().map(|(_, _, edge)| edge).collect()
     }
     pub fn svg(&self) -> String {
         let escape = |s: &str| {
@@ -250,19 +338,26 @@ impl ErDiagram {
         svg.push_str("</g></svg>");
         svg
     }
+    fn zoom_by(&mut self, factor: f32) {
+        self.zoom = (self.zoom * factor).clamp(0.1, 3.);
+    }
     fn canvas_view(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let z = self.zoom;
         let pan = self.pan;
-        let edges = self.edges();
-        let color = cx.theme().foreground;
+        let selected = self.selected;
+        let edges = self.routes();
+        let quiet = cx.theme().muted_foreground.opacity(0.55);
+        let accent = accent_text(cx);
+        let dot = cx.theme().muted_foreground.opacity(0.18);
         let viewport = self.viewport.clone();
         let mut surface = div()
             .id("er-canvas")
             .relative()
             .flex_1()
-            .w_full()
+            .min_w_0()
             .min_h(px(200.))
             .overflow_hidden()
+            .bg(cx.theme().sidebar)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, e: &MouseDownEvent, _, _| {
@@ -302,24 +397,79 @@ impl ErDiagram {
                         viewport.set((bounds.size.width.into(), bounds.size.height.into()));
                     },
                     move |bounds, _, window, _| {
-                        for edge in edges {
-                            let mut path = PathBuilder::stroke(px(1.5));
-                            for (i, (x, y)) in edge.iter().enumerate() {
-                                let p = bounds.origin + point(px(x * z + pan.0), px(y * z + pan.1));
+                        // A quiet dot grid that moves with the canvas.
+                        let spacing = 24. * z;
+                        if spacing >= 8. {
+                            let width: f32 = bounds.size.width.into();
+                            let height: f32 = bounds.size.height.into();
+                            let mut x = pan.0.rem_euclid(spacing);
+                            while x < width {
+                                let mut y = pan.1.rem_euclid(spacing);
+                                while y < height {
+                                    window.paint_quad(
+                                        fill(
+                                            Bounds::new(
+                                                bounds.origin + point(px(x - 0.75), px(y - 0.75)),
+                                                size(px(1.5), px(1.5)),
+                                            ),
+                                            dot,
+                                        )
+                                        .corner_radii(px(0.75)),
+                                    );
+                                    y += spacing;
+                                }
+                                x += spacing;
+                            }
+                        }
+                        // Relationships of the selected table are drawn last, on top.
+                        let mut ordered = edges;
+                        ordered.sort_by_key(|(from, to, _)| *from == selected || *to == selected);
+                        for (from, to, edge) in ordered {
+                            let color = if from == selected || to == selected {
+                                accent
+                            } else {
+                                quiet
+                            };
+                            let at = |(x, y): (f32, f32)| {
+                                bounds.origin + point(px(x * z + pan.0), px(y * z + pan.1))
+                            };
+                            let mut path = PathBuilder::stroke(px(1.25));
+                            for (i, &p) in edge.iter().enumerate() {
                                 if i == 0 {
-                                    path.move_to(p);
+                                    path.move_to(at(p));
                                 } else {
-                                    path.line_to(p);
+                                    path.line_to(at(p));
                                 }
                             }
-                            if let Some(&(x, y)) = edge.last() {
-                                let p = bounds.origin + point(px(x * z + pan.0), px(y * z + pan.1));
-                                path.move_to(p + point(px(7.), px(-4.)));
+                            if let [.., before, end] = edge.as_slice() {
+                                // Arrowhead along the final segment.
+                                let (dx, dy) = (end.0 - before.0, end.1 - before.1);
+                                let length = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
+                                let (ux, uy) = (dx / length, dy / length);
+                                let p = at(*end);
+                                path.move_to(
+                                    p + point(px(-ux * 7. - uy * 4.), px(-uy * 7. + ux * 4.)),
+                                );
                                 path.line_to(p);
-                                path.line_to(p + point(px(7.), px(4.)));
+                                path.line_to(
+                                    p + point(px(-ux * 7. + uy * 4.), px(-uy * 7. - ux * 4.)),
+                                );
                             }
                             if let Ok(path) = path.build() {
                                 window.paint_path(path, color);
+                            }
+                            if let Some(&start) = edge.first() {
+                                let p = at(start);
+                                window.paint_quad(
+                                    fill(
+                                        Bounds::new(
+                                            p - point(px(3.), px(3.)),
+                                            size(px(6.), px(6.)),
+                                        ),
+                                        color,
+                                    )
+                                    .corner_radii(px(3.)),
+                                );
                             }
                         }
                     },
@@ -327,7 +477,10 @@ impl ErDiagram {
                 .absolute()
                 .size_full(),
             );
+        let key = cx.theme().warning;
+        let link = accent_text(cx);
         for (i, table) in self.snapshot.tables.iter().enumerate() {
+            let active = i == self.selected;
             let mut node = v_flex()
                 .id(("er-node", i))
                 .absolute()
@@ -336,10 +489,18 @@ impl ErDiagram {
                 .w(px(WIDTH * z))
                 .h(px(height(table.columns.len()) * z))
                 .text_size(px(12. * z))
-                .bg(cx.theme().background)
+                .bg(cx.theme().popover)
+                .rounded(px(8. * z))
                 .border_1()
-                .border_color(color)
+                .border_color(if active {
+                    cx.theme().ring
+                } else {
+                    cx.theme().border
+                })
+                .when(active, |node| node.shadow_md())
+                .when(!active, |node| node.shadow_xs())
                 .overflow_hidden()
+                .cursor_grab()
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, e: &MouseDownEvent, _, cx| {
@@ -349,29 +510,456 @@ impl ErDiagram {
                         cx.notify();
                     }),
                 )
-                .child(div().h(px(36. * z)).child(format!(
-                    "{}{}",
-                    if i == self.selected { "● " } else { "" },
-                    table.name
-                )));
+                .child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .h(px(36. * z))
+                        .px(px(10. * z))
+                        .gap(px(6. * z))
+                        .bg(cx.theme().muted)
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(Icon::new(IconName::Table2).size(px(13. * z)).text_color(
+                            if active {
+                                accent_text(cx)
+                            } else {
+                                cx.theme().muted_foreground
+                            },
+                        ))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .text_ellipsis()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(table.name.clone()),
+                        ),
+                );
             for c in &table.columns {
-                let fk = table.constraints.iter().any(|k| matches!(k, Constraint::ForeignKey { columns, .. } if columns.contains(&c.name)));
-                node = node.child(div().h(px(24. * z)).child(format!(
-                    "{}{}{}  {}",
-                    if primary(table, &c.name, c.primary_key_position) {
-                        "PK "
-                    } else {
-                        ""
-                    },
-                    if fk { "FK " } else { "" },
-                    c.name,
-                    c.data_type
-                )));
+                let pk = primary(table, &c.name, c.primary_key_position);
+                let fk = is_foreign(table, &c.name);
+                node =
+                    node.child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .h(px(24. * z))
+                            .px(px(10. * z))
+                            .gap(px(6. * z))
+                            .child(
+                                div()
+                                    .w(px(13. * z))
+                                    .flex_shrink_0()
+                                    .children((pk || fk).then(|| {
+                                        Icon::new(if pk {
+                                            IconName::KeyRound
+                                        } else {
+                                            IconName::Link
+                                        })
+                                        .size(px(11. * z))
+                                        .text_color(if pk { key } else { link })
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_ellipsis()
+                                    .when(pk, |name| name.font_weight(FontWeight::MEDIUM))
+                                    .child(c.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .text_size(px(11. * z))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(c.data_type.to_lowercase()),
+                            ),
+                    );
             }
             surface = surface.child(node);
         }
-        surface
+        let zoom_label = format!("{:.0}%", self.zoom * 100.);
+        surface.child(
+            h_flex()
+                .id("er-zoom-controls")
+                .absolute()
+                .right_3()
+                .bottom_3()
+                .p_0p5()
+                .gap_0p5()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().popover)
+                .shadow_sm()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    icon_button("er-zoom-out", IconName::ZoomOut, "Zoom out")
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.zoom_by(1. / 1.2);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .w(px(44.))
+                        .text_center()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .font_features(FontFeatures(std::sync::Arc::new(vec![("tnum".into(), 1)])))
+                        .child(zoom_label),
+                )
+                .child(
+                    icon_button("er-zoom-in", IconName::ZoomIn, "Zoom in")
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.zoom_by(1.2);
+                            cx.notify();
+                        })),
+                )
+                .child(toolbar_divider(cx))
+                .child(
+                    icon_button("er-fit", IconName::Maximize, "Fit to view")
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.fit();
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    icon_button("er-arrange", IconName::LayoutGrid, "Arrange tables")
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.positions = layout(&this.snapshot);
+                            this.fit();
+                            cx.notify();
+                        })),
+                ),
+        )
     }
+    fn table_list(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let search = self.search.as_ref().unwrap();
+        let query = search.read(cx).value().to_lowercase();
+        let rows = self
+            .snapshot
+            .tables
+            .iter()
+            .enumerate()
+            .filter(|(_, table)| table.name.to_lowercase().contains(&query))
+            .map(|(index, table)| {
+                let active = index == self.selected;
+                h_flex()
+                    .id(("er-table", index))
+                    .role(Role::Button)
+                    .aria_label(table.name.clone())
+                    .h_8()
+                    .px_2()
+                    .gap_2()
+                    .rounded(cx.theme().radius)
+                    .text_sm()
+                    .cursor_pointer()
+                    .when(active, |row| row.bg(cx.theme().list_active))
+                    .when(!active, |row| {
+                        row.hover(|row| row.bg(cx.theme().list_hover))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected = index;
+                        this.reveal(index);
+                        cx.notify();
+                    }))
+                    .child(Icon::new(IconName::Table2).small().text_color(if active {
+                        accent_text(cx)
+                    } else {
+                        cx.theme().muted_foreground
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_ellipsis()
+                            .when(active, |name| name.font_weight(FontWeight::MEDIUM))
+                            .child(table.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(table.columns.len().to_string()),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let empty = rows.is_empty();
+        v_flex()
+            .w(px(220.))
+            .flex_shrink_0()
+            .h_full()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .child(
+                v_flex()
+                    .gap_2()
+                    .p_3()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(section_label("Tables", cx))
+                            .child(count_badge(self.snapshot.tables.len(), cx)),
+                    )
+                    .child(
+                        Input::new(search)
+                            .small()
+                            .prefix(
+                                Icon::new(IconName::Search)
+                                    .small()
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .cleanable(true)
+                            .aria_label("Search tables"),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("er-table-list")
+                    .flex_1()
+                    .min_h_0()
+                    .px_2()
+                    .pb_2()
+                    .gap_px()
+                    .overflow_y_scroll()
+                    .children(rows)
+                    .when(empty, |list| {
+                        list.child(
+                            div()
+                                .px_2()
+                                .py_4()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("No tables match"),
+                        )
+                    }),
+            )
+    }
+    fn details(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let mut details = v_flex()
+            .id("er-details")
+            .w(px(280.))
+            .flex_shrink_0()
+            .h_full()
+            .border_l_1()
+            .border_color(cx.theme().border)
+            .overflow_y_scroll();
+        let Some(table) = self.snapshot.tables.get(self.selected) else {
+            return details.child(
+                div()
+                    .p_4()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("This schema has no tables."),
+            );
+        };
+        let table_ref = crate::model::TableRef {
+            schema: self.snapshot.scope.namespace.clone(),
+            name: table.name.clone(),
+            kind: crate::model::RelationKind::Table,
+        };
+        let outgoing: Vec<_> = table.constraints.iter().filter_map(link_parts).collect();
+        let incoming: Vec<_> = self
+            .snapshot
+            .tables
+            .iter()
+            .flat_map(|other| {
+                other.constraints.iter().filter_map(move |c| match c {
+                    Constraint::ForeignKey {
+                        columns, target, ..
+                    } if resolve(&self.snapshot, target) == Some(self.selected) => {
+                        Some(format!("{}.{}", other.name, columns.join(", ")))
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
+        let relationships = outgoing.len() + incoming.len();
+        let muted = cx.theme().muted_foreground;
+        details = details.child(
+            v_flex()
+                .gap_3()
+                .p_4()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(
+                    v_flex()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_ellipsis()
+                                .child(table.name.clone()),
+                        )
+                        .child(div().text_xs().text_color(muted).child(format!(
+                            "{} {} · {} {}",
+                            table.columns.len(),
+                            plural(table.columns.len(), "column", "columns"),
+                            relationships,
+                            plural(relationships, "relationship", "relationships"),
+                        ))),
+                )
+                .child(
+                    Button::new("er-open-table")
+                        .outline()
+                        .small()
+                        .icon(IconName::ArrowUpRight)
+                        .label("Open table")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(OpenDiagramTable(table_ref.clone()))
+                        })),
+                ),
+        );
+        let section = |title: &'static str| {
+            v_flex()
+                .gap_1()
+                .px_4()
+                .py_3()
+                .child(div().pb_1().child(section_label(title, cx)))
+        };
+        let mut columns = section("Columns");
+        for column in &table.columns {
+            let pk = primary(table, &column.name, column.primary_key_position);
+            let fk = is_foreign(table, &column.name);
+            columns = columns.child(
+                h_flex()
+                    .h_7()
+                    .gap_2()
+                    .text_sm()
+                    .child(div().w_4().flex_shrink_0().children((pk || fk).then(|| {
+                        Icon::new(if pk {
+                            IconName::KeyRound
+                        } else {
+                            IconName::Link
+                        })
+                        .xsmall()
+                        .text_color(if pk {
+                            cx.theme().warning
+                        } else {
+                            accent_text(cx)
+                        })
+                    })))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_ellipsis()
+                            .child(column.name.clone()),
+                    )
+                    .when(!column.nullable, |row| {
+                        row.child(div().text_xs().text_color(muted).child("not null"))
+                    })
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_xs()
+                            .text_color(muted)
+                            .child(column.data_type.to_lowercase()),
+                    ),
+            );
+        }
+        details = details.child(columns);
+        if relationships > 0 {
+            let mut links = section("Relationships");
+            for (index, (label, from, to, actions)) in outgoing.into_iter().enumerate() {
+                links = links.child(
+                    v_flex()
+                        .id(("er-relationship", index))
+                        .aria_label(label)
+                        .gap_0p5()
+                        .py_1()
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .text_sm()
+                                .child(div().child(from))
+                                .child(Icon::new(IconName::ArrowRight).xsmall().text_color(muted))
+                                .child(div().min_w_0().text_ellipsis().child(to)),
+                        )
+                        .child(div().text_xs().text_color(muted).child(actions)),
+                );
+            }
+            for source in incoming {
+                links = links.child(
+                    h_flex()
+                        .gap_1p5()
+                        .py_1()
+                        .text_sm()
+                        .child(Icon::new(IconName::ArrowLeft).xsmall().text_color(muted))
+                        .child(div().text_color(muted).child("Referenced by"))
+                        .child(div().min_w_0().text_ellipsis().child(source)),
+                );
+            }
+            details = details.child(links);
+        }
+        if !table.unsupported.is_empty() {
+            details = details.child(
+                section("Coverage").children(table.unsupported.iter().enumerate().map(
+                    |(index, warning)| {
+                        notice(("er-coverage", index), Tone::Warning, warning.clone(), cx)
+                    },
+                )),
+            );
+        }
+        let mut nudge = h_flex().gap_1();
+        for (id, label, icon, dx, dy) in [
+            ("left", "Move left", IconName::ArrowLeft, -20., 0.),
+            ("up", "Move up", IconName::ArrowUp, 0., -20.),
+            ("down", "Move down", IconName::ArrowDown, 0., 20.),
+            ("right", "Move right", IconName::ArrowRight, 20., 0.),
+        ] {
+            nudge = nudge.child(icon_button(id, icon, label).small().outline().on_click(
+                cx.listener(move |this, _, _, cx| {
+                    if let Some(p) = this.positions.get_mut(this.selected) {
+                        p.0 += dx;
+                        p.1 += dy;
+                    }
+                    cx.notify();
+                }),
+            ));
+        }
+        details.child(section("Position").child(nudge))
+    }
+}
+fn is_foreign(table: &crate::schema::Table, name: &str) -> bool {
+    table.constraints.iter().any(|k| {
+        matches!(k, Constraint::ForeignKey { columns, .. } if columns.iter().any(|c| c == name))
+    })
+}
+fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
+    if count == 1 { one } else { many }
+}
+/// Accessible summary, source columns, destination and referential actions of a foreign key.
+fn link_parts(constraint: &Constraint) -> Option<(String, String, String, String)> {
+    let label = relationship(constraint)?;
+    let Constraint::ForeignKey {
+        columns,
+        target,
+        referenced_columns,
+        on_delete,
+        on_update,
+        ..
+    } = constraint
+    else {
+        return None;
+    };
+    Some((
+        label,
+        columns.join(", "),
+        format!("{target}.{}", referenced_columns.join(", ")),
+        format!(
+            "On delete {} · on update {}",
+            on_delete.to_lowercase(),
+            on_update.to_lowercase()
+        ),
+    ))
 }
 fn relationship(constraint: &Constraint) -> Option<String> {
     if let Constraint::ForeignKey {
@@ -398,199 +986,105 @@ fn relationship(constraint: &Constraint) -> Option<String> {
 impl Render for ErDiagram {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.search.is_none() {
-            let search = cx.new(|cx| {
-                gpui_kit::component::input::InputState::new(window, cx)
-                    .placeholder("Search tables…")
-            });
-            self.search_subscription = Some(cx.subscribe(
-                &search,
-                |_, _, _: &gpui_kit::component::input::InputEvent, cx| cx.notify(),
-            ));
+            let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search tables"));
+            self.search_subscription =
+                Some(cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify()));
             self.search = Some(search);
         }
-        let query = self
-            .search
-            .as_ref()
-            .unwrap()
-            .read(cx)
-            .value()
-            .to_lowercase();
-        let tables = self
-            .snapshot
-            .tables
-            .iter()
-            .enumerate()
-            .filter(|(_, table)| table.name.to_lowercase().contains(&query))
-            .map(|(index, table)| {
-                Button::new(("er-table", index))
-                    .label(table.name.clone())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.selected = index;
-                        cx.notify();
-                    }))
-            })
-            .collect::<Vec<_>>();
-        let mut details = v_flex().gap_2().p_4();
-        if let Some(table) = self.snapshot.tables.get(self.selected) {
-            let table_ref = crate::model::TableRef {
-                schema: self.snapshot.scope.namespace.clone(),
-                name: table.name.clone(),
-                kind: crate::model::RelationKind::Table,
-            };
-            details = details
-                .child(div().text_xl().child(table.name.clone()))
-                .child(Button::new("er-open-table").label("Open table").on_click(
-                    cx.listener(move |_, _, _, cx| cx.emit(OpenDiagramTable(table_ref.clone()))),
-                ));
-            for column in &table.columns {
-                let fk = table.constraints.iter().any(|c| matches!(c, Constraint::ForeignKey { columns, .. } if columns.contains(&column.name)));
-                details = details.child(
-                    h_flex()
-                        .gap_4()
-                        .child(format!(
-                            "{}{}",
-                            if primary(table, &column.name, column.primary_key_position) {
-                                "PK "
-                            } else {
-                                ""
-                            },
-                            if fk { "FK" } else { "" }
-                        ))
-                        .child(column.name.clone())
-                        .child(column.data_type.clone())
-                        .child(if column.nullable { "NULL" } else { "NOT NULL" }),
-                );
-            }
-            for constraint in &table.constraints {
-                if let Some(label) = relationship(constraint) {
-                    details = details.child(div().child(label));
-                }
-            }
-            for warning in &table.unsupported {
-                details = details.child(div().child(format!("Coverage warning: {warning}")));
-            }
-        }
-        let toolbar =
-            h_flex()
-                .gap_2()
-                .child(
-                    Button::new("er-zoom-in")
-                        .label("Zoom +")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.zoom = (this.zoom * 1.2).min(3.);
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new("er-zoom-out")
-                        .label("Zoom −")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.zoom = (this.zoom / 1.2).max(0.1);
-                            cx.notify();
-                        })),
-                )
-                .child(Button::new("er-fit").label("Fit").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.fit();
-                        cx.notify();
-                    },
-                )))
-                .child(
-                    Button::new("er-arrange")
-                        .label("Arrange")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.positions = layout(&this.snapshot);
-                            this.fit();
-                            cx.notify();
-                        })),
-                );
-        let toolbar = toolbar
-            .child(
-                Button::new("er-refresh")
-                    .label("Refresh")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(RefreshDiagram))),
-            )
-            .child(
-                Button::new("er-export")
-                    .label("Export SVG")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        let svg = this.svg();
-                        let receiver =
-                            cx.prompt_for_new_path(std::path::Path::new("."), Some("schema.svg"));
-                        cx.spawn_in(window, async move |view, cx| {
-                            let result = receiver.await;
-                            let _ = view.update_in(cx, |this, _, cx| {
-                                this.export_message = match result {
-                                    Ok(Ok(Some(path))) => {
-                                        match crate::export::atomic_write(&path, |file| {
-                                            use std::io::Write;
-                                            file.write_all(svg.as_bytes())?;
-                                            Ok(())
-                                        }) {
-                                            Ok(()) => "SVG saved".into(),
-                                            Err(error) => format!("Export failed: {error}"),
-                                        }
-                                    }
-                                    Ok(Err(error)) => format!("Export failed: {error}"),
-                                    _ => String::new(),
-                                };
-                                cx.notify();
-                            });
-                        })
-                        .detach();
-                    })),
-            )
-            .child(self.export_message.clone());
-        let mut controls = h_flex().gap_2();
-        for (id, label, dx, dy) in [
-            ("left", "Move ←", -20., 0.),
-            ("right", "Move →", 20., 0.),
-            ("up", "Move ↑", 0., -20.),
-            ("down", "Move ↓", 0., 20.),
-        ] {
-            controls = controls.child(Button::new(id).label(label).on_click(cx.listener(
-                move |this, _, _, cx| {
-                    if let Some(p) = this.positions.get_mut(this.selected) {
-                        p.0 += dx;
-                        p.1 += dy;
-                    }
+        if self.pending_fit {
+            cx.on_next_frame(window, |this, _, cx| {
+                if this.pending_fit && this.viewport.get().0 > 0. {
+                    this.pending_fit = false;
+                    this.fit();
                     cx.notify();
-                },
-            )));
+                }
+            });
         }
+        let tables = self.snapshot.tables.len();
+        let relationships = self.routes().len();
+        let subtitle = format!(
+            "{} · {} {} · {} {}",
+            self.snapshot.scope.namespace,
+            tables,
+            plural(tables, "table", "tables"),
+            relationships,
+            plural(relationships, "relationship", "relationships"),
+        );
+        let mut actions: Vec<AnyElement> = Vec::new();
+        if !self.export_message.is_empty() {
+            actions.push(
+                div()
+                    .id("er-export-status")
+                    .role(Role::Status)
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(self.export_message.clone())
+                    .into_any_element(),
+            );
+        }
+        actions.push(
+            icon_button("er-refresh", IconName::RefreshCw, "Refresh schema")
+                .small()
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(RefreshDiagram)))
+                .into_any_element(),
+        );
+        actions.push(
+            Button::new("er-export")
+                .ghost()
+                .small()
+                .icon(IconName::Download)
+                .label("Export SVG")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    let svg = this.svg();
+                    let receiver =
+                        cx.prompt_for_new_path(std::path::Path::new("."), Some("schema.svg"));
+                    cx.spawn_in(window, async move |view, cx| {
+                        let result = receiver.await;
+                        let _ = view.update_in(cx, |this, _, cx| {
+                            this.export_message = match result {
+                                Ok(Ok(Some(path))) => {
+                                    match crate::export::atomic_write(&path, |file| {
+                                        use std::io::Write;
+                                        file.write_all(svg.as_bytes())?;
+                                        Ok(())
+                                    }) {
+                                        Ok(()) => "SVG saved".into(),
+                                        Err(error) => format!("Export failed: {error}"),
+                                    }
+                                }
+                                Ok(Err(error)) => format!("Export failed: {error}"),
+                                _ => String::new(),
+                            };
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }))
+                .into_any_element(),
+        );
+        actions.push(toolbar_divider(cx).into_any_element());
+        actions.push(
+            icon_button("close-diagram", IconName::X, "Close schema relationships")
+                .small()
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(CloseDiagram)))
+                .into_any_element(),
+        );
+        let list = self.table_list(cx);
         let canvas = self.canvas_view(cx);
-        h_flex()
-            .items_start()
+        let details = self.details(cx);
+        v_flex()
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .child(page_header("Relationships", subtitle, actions, cx))
             .child(
-                v_flex()
-                    .w(px(220.))
-                    .gap_2()
-                    .p_3()
-                    .child(format!("Schema: {}", self.snapshot.scope.namespace))
-                    .child(
-                        gpui_kit::component::input::Input::new(self.search.as_ref().unwrap())
-                            .aria_label("Search tables"),
-                    )
-                    .children(tables),
-            )
-            .child(
-                v_flex()
+                h_flex()
                     .flex_1()
-                    .h_full()
-                    .child(toolbar)
-                    .child(controls)
-                    .child(canvas)
-                    .child(
-                        div()
-                            .id("er-details")
-                            .flex_1()
-                            .h(px(220.))
-                            .overflow_y_scroll()
-                            .child(details),
-                    ),
+                    .min_h_0()
+                    .items_start()
+                    .child(list)
+                    .child(v_flex().h_full().flex_1().min_w_0().child(canvas))
+                    .child(details),
             )
     }
 }

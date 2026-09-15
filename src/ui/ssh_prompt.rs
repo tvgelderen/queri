@@ -1,9 +1,12 @@
-use super::Services;
+use super::{
+    Services,
+    controls::{Tone, dialog_icon},
+};
 use crate::ssh::{HostDecision, Prompt};
 use gpui_kit::assets::IconName;
 use gpui_kit::{
     component::{
-        ActiveTheme, Icon, WindowExt,
+        ActiveTheme, WindowExt,
         button::{Button, ButtonVariant, ButtonVariants},
         dialog::DialogButtonProps,
         h_flex,
@@ -42,28 +45,6 @@ fn answer<T>(
         let _ = reply.send(value);
     }
     done.cancel();
-}
-
-/// A tinted square that carries the dialog's tone before any text is read.
-fn badge(icon: IconName, danger: bool, cx: &App) -> Div {
-    let theme = cx.theme();
-    div()
-        .flex_shrink_0()
-        .size_9()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(theme.radius)
-        .bg(if danger {
-            theme.danger.opacity(0.12)
-        } else {
-            super::theme::accent_soft(cx)
-        })
-        .child(Icon::new(icon).text_color(if danger {
-            theme.danger
-        } else {
-            super::theme::accent_text(cx)
-        }))
 }
 
 /// Labelled, monospaced key facts so fingerprints can be compared character by character.
@@ -172,7 +153,7 @@ pub(super) fn show(
                                     let danger = cx.theme().danger;
                                     dialog
                                         .width(px(540.))
-                                        .icon(badge(IconName::ShieldAlert, true, cx))
+                                        .icon(dialog_icon(IconName::ShieldAlert, Tone::Danger, cx))
                                         .title("Replace the trusted host key?")
                                         .description(format!(
                                             "Queri will trust the new key for {endpoint} from now on."
@@ -267,9 +248,9 @@ pub(super) fn show(
                 dialog
                     .width(px(540.))
                     .icon(if previous.is_some() {
-                        badge(IconName::ShieldAlert, true, cx)
+                        dialog_icon(IconName::ShieldAlert, Tone::Danger, cx)
                     } else {
-                        badge(IconName::ShieldCheck, false, cx)
+                        dialog_icon(IconName::ShieldCheck, Tone::Neutral, cx)
                     })
                     .title(if previous.is_some() {
                         "SSH host key changed"
@@ -316,7 +297,7 @@ pub(super) fn show(
                 let cancelled = reply.clone();
                 dialog
                     .width(px(460.))
-                    .icon(badge(IconName::LockKeyhole, false, cx))
+                    .icon(dialog_icon(IconName::LockKeyhole, Tone::Neutral, cx))
                     .title("Unlock SSH key")
                     .description(format!(
                         "{name} uses an encrypted private key. Enter its passphrase to continue."

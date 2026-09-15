@@ -6,8 +6,8 @@ use super::{
     connection_form::{ConnectionForm, SavedConnection},
     connection_picker::{ConnectionPicker, ConnectionPickerEvent},
     controls::{
-        brand_logo, brand_mark, destructive_menu_item, icon_button, menu_item, nav_button,
-        section_label, setting_switch, shortcut,
+        Tone, brand_logo, brand_mark, destructive_menu_item, dialog_icon, icon_button, menu_item,
+        nav_button, section_label, setting_switch, shortcut,
     },
     document::{
         ConnectionPasswordRequired, Document, DocumentChanged, NewDocumentQuery, ReconnectRequested,
@@ -23,7 +23,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::resizable::ResizableState;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, Selectable, Sizable, Theme, ThemeMode, WindowExt,
-    button::{Button, ButtonVariants},
+    button::{Button, ButtonVariant, ButtonVariants},
     dialog::DialogButtonProps,
     h_flex,
     list::ListItem,
@@ -1318,15 +1318,17 @@ impl Workspace {
             return;
         }
         let view = cx.entity();
-        window.open_alert_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, cx| {
             let view = view.clone();
             let profile = profile.clone();
             dialog
+                .icon(dialog_icon(IconName::Trash, Tone::Danger, cx))
                 .title(format!("Remove {}?", profile.display_name()))
-                .child("Its saved connection, SQL drafts, and query history will be removed. Saved queries and the database itself are retained.")
+                .description("Its saved connection, SQL drafts, and query history will be removed. Saved queries and the database itself are retained.")
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Remove connection")
+                        .ok_variant(ButtonVariant::Danger)
                         .show_cancel(true),
                 )
                 .on_ok(move |_, window, cx| {
@@ -1771,6 +1773,14 @@ impl Workspace {
                                 },
                             ));
                         }
+                        this.subscriptions.push(cx.subscribe(
+                            &diagram,
+                            |this, _, _: &super::er_diagram::CloseDiagram, cx| {
+                                this.diagram_request = Uuid::new_v4();
+                                this.diagram = None;
+                                cx.notify();
+                            },
+                        ));
                         this.subscriptions.push(cx.subscribe_in(
                             &diagram,
                             window,
@@ -2844,60 +2854,19 @@ impl Render for Workspace {
             .and_then(|draft| draft.review.as_ref())
             .filter(|_| self.active_content == ActiveContent::Designer)
         {
-            body.child(
-                v_flex().flex_1().min_h_0().child(review.clone()).child(
-                    Button::new("close-schema")
-                        .label("Close schema draft")
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.close_schema_draft(window, cx)),
-                        ),
-                ),
-            )
+            body.child(div().flex_1().min_h_0().child(review.clone()))
         } else if let Some(draft) = self
             .schema_draft
             .as_ref()
             .filter(|_| self.active_content == ActiveContent::Designer)
         {
-            body.child(
-                v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(draft.designer.clone())
-                    .child(
-                        Button::new("save-close-schema")
-                            .label("Save draft and close")
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.save_close_schema_draft(cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("close-schema")
-                            .label("Close schema draft")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.close_schema_draft(window, cx)
-                            })),
-                    ),
-            )
+            body.child(div().flex_1().min_h_0().child(draft.designer.clone()))
         } else if let Some(diagram) = self
             .diagram
             .as_ref()
             .filter(|_| self.active_content == ActiveContent::Diagram)
         {
-            body.child(
-                v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
-                        Button::new("close-diagram")
-                            .label("Close schema relationships")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.diagram_request = Uuid::new_v4();
-                                this.diagram = None;
-                                cx.notify();
-                            })),
-                    )
-                    .child(diagram.clone()),
-            )
+            body.child(div().flex_1().min_h_0().child(diagram.clone()))
         } else if let Some(doc) = self.documents.get(self.active) {
             body.child(div().flex_1().min_h_0().child(doc.clone()))
         } else {

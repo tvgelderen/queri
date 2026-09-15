@@ -1,6 +1,6 @@
 use super::{
     Services,
-    controls::{choice, destructive_menu_item, icon_button, menu_item},
+    controls::{Tone, choice, destructive_menu_item, dialog_icon, icon_button, menu_item},
     field, task,
 };
 use crate::model::{ConnectionProfile, SavedQuery};
@@ -203,17 +203,19 @@ impl SavedQueries {
     }
     fn delete(&mut self, query: SavedQuery, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, cx| {
             let view = view.clone();
             dialog
+                .icon(dialog_icon(IconName::Trash, Tone::Danger, cx))
                 .title("Delete saved query?")
-                .child(format!(
+                .description(format!(
                     "“{}” will be removed. Open SQL drafts are kept.",
                     query.name
                 ))
                 .button_props(
                     gpui_kit::component::dialog::DialogButtonProps::default()
                         .ok_text("Delete query")
+                        .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
                         .show_cancel(true),
                 )
                 .on_ok(move |_, window, cx| {

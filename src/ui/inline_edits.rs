@@ -221,11 +221,13 @@ impl Document {
             let view = cx.entity();
             let context = self.profile.context();
             let generation = self.session_generation;
-            window.open_alert_dialog(cx, move |dialog, _, _| {
+            window.open_alert_dialog(cx, move |dialog, _, cx| {
                 let done = done.clone();
                 let view = view.clone();
-                dialog.title("Save cell edits?")
-                    .child(format!("Apply pending updates to {context}. All updates succeed together or are rolled back."))
+                dialog
+                    .icon(dialog_icon(IconName::Save, Tone::Neutral, cx))
+                    .title("Save cell edits?")
+                    .description(format!("Apply pending updates to {context}. All updates succeed together or are rolled back."))
                     .button_props(DialogButtonProps::default().show_cancel(true).ok_text("Save changes"))
                     .on_ok(move |_, window, cx| {
                         if let Some(done) = done.borrow_mut().take() {

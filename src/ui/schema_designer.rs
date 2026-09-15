@@ -1,13 +1,20 @@
+use super::controls::{badge, card, count_badge, icon_button, page_header, setting_switch};
+use super::theme::accent_text;
 use super::{field, input};
 use crate::schema::{Column, Constraint, Index, Snapshot, Table};
 use gpui_kit::{
+    assets::IconName,
     component::{
-        button::Button,
+        ActiveTheme, Sizable,
+        button::{Button, ButtonVariants},
+        checkbox::Checkbox,
         h_flex,
-        input::{InputEvent, InputState},
+        input::{Input, InputEvent, InputState},
+        menu::{DropdownMenu, PopupMenuItem},
         scroll::ScrollableElement,
         v_flex,
     },
+    prelude::FluentBuilder,
     *,
 };
 
@@ -23,6 +30,7 @@ pub struct SchemaEditIntent {
 pub enum SchemaDesignerEvent {
     Review(Box<SchemaEditIntent>),
     Cancel,
+    SaveAndClose,
     Changed,
 }
 impl EventEmitter<SchemaDesignerEvent> for SchemaDesigner {}
@@ -463,154 +471,384 @@ impl SchemaDesigner {
         }
     }
 }
-impl Render for SchemaDesigner {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .id("schema-designer")
-            .size_full()
-            .overflow_y_scrollbar()
-            .gap_3()
-            .p_4()
-            .child("Table designer — changes remain local until reviewed")
-            .child(div().flex_none().child(field("Table name", &self.name)))
-            .children(self.columns.iter().enumerate().map(|(i, f)| {
-                v_flex()
-                    .gap_2()
-                    .child(format!("Column {}", i + 1))
+impl SchemaDesigner {
+    fn blank_column() -> Column {
+        Column {
+            name: String::new(),
+            data_type: "TEXT".into(),
+            nullable: true,
+            default: None,
+            primary_key_position: 0,
+            generated: false,
+            identity: None,
+            collation: None,
+        }
+    }
+    fn columns_section(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let muted = cx.theme().muted_foreground;
+        let head = |label: &'static str| {
+            div()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(muted)
+                .child(label)
+        };
+        let mut table = card(cx).overflow_hidden().child(
+            h_flex()
+                .h_8()
+                .px_3()
+                .gap_3()
+                .bg(cx.theme().muted)
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(div().flex_1().child(head("Name")))
+                .child(div().w(px(180.)).flex_shrink_0().child(head("Type")))
+                .child(div().flex_1().child(head("Default")))
+                .child(div().w(px(64.)).flex().justify_center().child(head("Null")))
+                .child(
+                    div()
+                        .w(px(64.))
+                        .flex()
+                        .justify_center()
+                        .child(head("Primary")),
+                )
+                .child(div().w_7()),
+        );
+        if self.columns.is_empty() {
+            table = table.child(
+                div()
+                    .px_3()
+                    .py_6()
+                    .text_sm()
+                    .text_center()
+                    .text_color(muted)
+                    .child("No columns yet. Add one to get started."),
+            );
+        }
+        for (i, f) in self.columns.iter().enumerate() {
+            let number = i + 1;
+            table = table.child(
+                h_flex()
+                    .px_3()
+                    .py_2()
+                    .gap_3()
+                    .when(i > 0, |row| {
+                        row.border_t_1().border_color(cx.theme().border)
+                    })
                     .child(
-                        h_flex()
-                            .gap_3()
-                            .child(div().flex_1().child(field("Column name", &f.name)))
-                            .child(div().flex_1().child(field("Data type", &f.kind)))
-                            .child(
-                                div().flex_1().child(field(
-                                    "Default expression (empty means none)",
-                                    &f.default,
-                                )),
-                            ),
+                        div().flex_1().min_w_0().child(
+                            Input::new(&f.name)
+                                .small()
+                                .aria_label(format!("Column {number} name")),
+                        ),
                     )
                     .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new(("nullable", i))
-                                    .label(if f.nullable {
-                                        "NULL allowed"
-                                    } else {
-                                        "Value required"
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.columns[i].nullable ^= true;
-                                        cx.emit(SchemaDesignerEvent::Changed);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new(("primary", i))
-                                    .label(if f.primary {
-                                        "Primary key"
-                                    } else {
-                                        "Not a primary key"
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.columns[i].primary ^= true;
-                                        cx.emit(SchemaDesignerEvent::Changed);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(Button::new(("remove", i)).label("Remove column").on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.columns.remove(i);
+                        div().w(px(180.)).flex_shrink_0().min_w_0().child(
+                            Input::new(&f.kind)
+                                .small()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .aria_label(format!("Column {number} data type")),
+                        ),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Input::new(&f.default)
+                                .small()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .aria_label(format!(
+                                    "Column {number} default expression; empty means none"
+                                )),
+                        ),
+                    )
+                    .child(
+                        div().w(px(64.)).flex().justify_center().child(
+                            Checkbox::new(("nullable", i))
+                                .accessibility_label(format!("Column {number} allows NULL"))
+                                .checked(f.nullable)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.columns[i].nullable ^= true;
                                     cx.emit(SchemaDesignerEvent::Changed);
                                     cx.notify();
-                                }),
-                            )),
+                                })),
+                        ),
                     )
-            }))
-            .child(
-                Button::new("add-column")
-                    .label("Add column")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.columns.push(Self::column(
-                            Column {
-                                name: String::new(),
-                                data_type: "TEXT".into(),
-                                nullable: true,
-                                default: None,
-                                primary_key_position: 0,
-                                generated: false,
-                                identity: None,
-                                collation: None,
-                            },
-                            window,
-                            cx,
-                        ));
-                        cx.emit(SchemaDesignerEvent::Changed);
-                        cx.notify();
-                    })),
-            )
-            .children(self.extras.iter().enumerate().map(|(i, e)| {
-                v_flex()
-                    .gap_2()
-                    .child(e.kind().title())
-                    .children(e.inputs().into_iter().map(|(label, f)| field(label, f)))
                     .child(
-                        Button::new(("remove-extra", i))
-                            .label("Remove constraint or index")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.extras.remove(i);
-                                cx.emit(SchemaDesignerEvent::Changed);
-                                cx.notify();
-                            })),
+                        div().w(px(64.)).flex().justify_center().child(
+                            Checkbox::new(("primary", i))
+                                .accessibility_label(format!(
+                                    "Column {number} is in the primary key"
+                                ))
+                                .checked(f.primary)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.columns[i].primary ^= true;
+                                    cx.emit(SchemaDesignerEvent::Changed);
+                                    cx.notify();
+                                })),
+                        ),
                     )
-            }))
-            .child(h_flex().flex_wrap().gap_2().children(
-                ExtraKind::ALL.into_iter().enumerate().map(|(i, kind)| {
-                    Button::new(("add-extra", i))
-                        .label(format!("Add {}", kind.title()))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.extras.push(ExtraFields::blank(kind, window, cx));
+                    .child(
+                        icon_button(
+                            ("remove", i),
+                            IconName::Trash,
+                            format!("Remove column {number}"),
+                        )
+                        .small()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.columns.remove(i);
                             cx.emit(SchemaDesignerEvent::Changed);
                             cx.notify();
-                        }))
-                }),
-            ))
-            .child(
-                Button::new("reset-schema")
-                    .label("Reset draft")
+                        })),
+                    ),
+            );
+        }
+        v_flex()
+            .gap_3()
+            .child(section_header(
+                "Columns",
+                self.columns.len(),
+                Button::new("add-column")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Plus)
+                    .label("Add column")
                     .on_click(cx.listener(|this, _, window, cx| {
-                        *this = Self::new(
-                            this.baseline.clone(),
-                            this.original
-                                .as_ref()
-                                .and_then(|n| this.baseline.tables.iter().find(|t| &t.name == n))
-                                .cloned(),
-                            window,
-                            cx,
-                        );
+                        this.columns
+                            .push(Self::column(Self::blank_column(), window, cx));
                         cx.emit(SchemaDesignerEvent::Changed);
                         cx.notify();
-                    })),
-            )
+                    }))
+                    .into_any_element(),
+                cx,
+            ))
+            .child(table)
+    }
+    fn extras_section(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let add = Button::new("add-extra")
+            .ghost()
+            .small()
+            .icon(IconName::Plus)
+            .label("Add")
+            .dropdown_caret(true)
+            .dropdown_menu({
+                let view = cx.entity().downgrade();
+                move |mut menu, _, _| {
+                    for kind in ExtraKind::ALL {
+                        let view = view.clone();
+                        menu = menu.item(PopupMenuItem::new(capitalize(kind.title())).on_click(
+                            move |_, window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.extras.push(ExtraFields::blank(kind, window, cx));
+                                    cx.emit(SchemaDesignerEvent::Changed);
+                                    cx.notify();
+                                });
+                            },
+                        ));
+                    }
+                    menu
+                }
+            })
+            .into_any_element();
+        let mut list = v_flex().gap_3();
+        if self.extras.is_empty() {
+            list = list.child(
+                card(cx)
+                    .px_3()
+                    .py_6()
+                    .items_center()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("No constraints or indexes. Primary keys are set per column."),
+            );
+        }
+        for (i, extra) in self.extras.iter().enumerate() {
+            let inputs = extra.inputs();
+            let columns = if inputs.len() > 2 { 3 } else { 2 };
+            list =
+                list.child(
+                    card(cx)
+                        .child(
+                            h_flex()
+                                .h_10()
+                                .px_3()
+                                .gap_2()
+                                .justify_between()
+                                .border_b_1()
+                                .border_color(cx.theme().border)
+                                .child(h_flex().gap_2().child(badge(
+                                    capitalize(extra.kind().title()),
+                                    accent_text(cx),
+                                )))
+                                .child(
+                                    icon_button(
+                                        ("remove-extra", i),
+                                        IconName::Trash,
+                                        format!("Remove {}", extra.kind().title()),
+                                    )
+                                    .small()
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.extras.remove(i);
+                                            cx.emit(SchemaDesignerEvent::Changed);
+                                            cx.notify();
+                                        },
+                                    )),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .grid()
+                                .grid_cols(columns)
+                                .gap_x_3()
+                                .gap_y_1()
+                                .p_3()
+                                .children(inputs.into_iter().map(|(label, f)| field(label, f))),
+                        ),
+                );
+        }
+        v_flex()
+            .gap_3()
+            .child(section_header(
+                "Constraints and indexes",
+                self.extras.len(),
+                add,
+                cx,
+            ))
+            .child(list)
+    }
+}
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+fn section_header(
+    title: &'static str,
+    count: usize,
+    action: AnyElement,
+    cx: &App,
+) -> impl IntoElement {
+    h_flex()
+        .justify_between()
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title),
+                )
+                .child(count_badge(count, cx)),
+        )
+        .child(action)
+}
+impl Render for SchemaDesigner {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let subtitle = match &self.original {
+            Some(name) => format!("Editing {name} · changes stay local until you review them"),
+            None => "New table · changes stay local until you review them".into(),
+        };
+        let actions = [
+            Button::new("reset-schema")
+                .ghost()
+                .small()
+                .icon(IconName::RotateCcw)
+                .label("Reset")
+                .tooltip("Discard edits and start from the current schema")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    *this = Self::new(
+                        this.baseline.clone(),
+                        this.original
+                            .as_ref()
+                            .and_then(|n| this.baseline.tables.iter().find(|t| &t.name == n))
+                            .cloned(),
+                        window,
+                        cx,
+                    );
+                    cx.emit(SchemaDesignerEvent::Changed);
+                    cx.notify();
+                }))
+                .into_any_element(),
+            Button::new("close-schema")
+                .ghost()
+                .small()
+                .label("Discard")
+                .tooltip("Close and discard this draft")
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(SchemaDesignerEvent::Cancel)))
+                .into_any_element(),
+            Button::new("save-close-schema")
+                .outline()
+                .small()
+                .label("Save and close")
+                .tooltip("Keep this draft for later, including after restart")
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(SchemaDesignerEvent::SaveAndClose)))
+                .into_any_element(),
+            Button::new("review-schema")
+                .primary()
+                .small()
+                .label("Review changes")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.emit(SchemaDesignerEvent::Review(Box::new(this.intent(cx))));
+                }))
+                .into_any_element(),
+        ];
+        v_flex()
+            .size_full()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(page_header("Design table", subtitle, actions, cx))
             .child(
-                Button::new("allow-destructive-designer")
-                    .label(if self.allow_destructive {
-                        "Destructive changes enabled"
-                    } else {
-                        "Allow destructive changes"
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.allow_destructive ^= true;
-                        cx.emit(SchemaDesignerEvent::Changed);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new("review-schema")
-                    .label("Review changes")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.emit(SchemaDesignerEvent::Review(Box::new(this.intent(cx))));
-                    })),
+                div()
+                    .id("schema-designer")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .max_w(px(1080.))
+                            .mx_auto()
+                            .px_6()
+                            .py_6()
+                            .gap_8()
+                            .child(
+                                div()
+                                    .max_w(px(420.))
+                                    .child(field("Table name", &self.name)),
+                            )
+                            .child(self.columns_section(cx))
+                            .child(self.extras_section(cx))
+                            .child(
+                                v_flex()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child("Safety"),
+                                    )
+                                    .child(
+                                        card(cx).p_4().gap_1().child(setting_switch(
+                                            "allow-destructive-designer",
+                                            "Allow destructive changes",
+                                            self.allow_destructive,
+                                            cx.listener(|this, checked: &bool, _, cx| {
+                                                this.allow_destructive = *checked;
+                                                cx.emit(SchemaDesignerEvent::Changed);
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("Dropping columns, constraints or indexes needs this consent. It resets when a saved draft is reopened."),
+                                        ),
+                                    ),
+                            ),
+                    ),
             )
     }
 }
